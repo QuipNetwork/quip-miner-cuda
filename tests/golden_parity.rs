@@ -19,7 +19,7 @@ use common::cuda_available;
 fn golden() -> Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../conformance/golden_vectors.json"
+        "/conformance/golden_vectors.json"
     );
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
 }

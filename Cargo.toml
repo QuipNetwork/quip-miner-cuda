@@ -3,6 +3,8 @@ name = "quip-miner-cuda"
 version = "0.3.0"
 edition = "2021"
 description = "CUDA Ising miners: simulated annealing and heat-bath Gibbs (v0.3)"
+license = "AGPL-3.0-or-later"
+repository = "https://gitlab.com/quip.network/quip-miner-cuda"
 
 [lib]
 name = "quip_miner_cuda"
@@ -16,10 +18,13 @@ path = "src/bin/quip_cuda_sa.rs"
 name = "quip-cuda-gibbs"
 path = "src/bin/quip_cuda_gibbs.rs"
 
+# Shared protocol crates live in the quip-protocol repo; pinned by tag until
+# they are published to a registry (crates.io / GitLab). Bump the tag to adopt
+# newer shared code.
 [dependencies]
-quip-proto = { path = "../quip-proto" }
-quip-protocol = { path = "../quip-protocol" }
-quip-miner-core = { path = "../quip-miner-core" }
+quip-proto = { git = "https://gitlab.com/quip.network/quip-protocol.git", tag = "shared-v0.3.0" }
+quip-protocol = { git = "https://gitlab.com/quip.network/quip-protocol.git", tag = "shared-v0.3.0" }
+quip-miner-core = { git = "https://gitlab.com/quip.network/quip-protocol.git", tag = "shared-v0.3.0" }
 clap = { version = "4", features = ["derive"] }
 # NVRTC JIT + driver launch; pin CUDA 13.2 bindings to match /usr/local/cuda.
 cudarc = { version = "0.19", default-features = false, features = [
@@ -31,12 +36,12 @@ cudarc = { version = "0.19", default-features = false, features = [
 ] }
 nvml-wrapper = "0.11"
 thiserror = "2"
-tokio = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 [dev-dependencies]
-quip-mock-coordinator = { path = "../quip-mock-coordinator" }
+quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", tag = "shared-v0.3.0" }
 serde_json = "1"
 serial_test = "3.5"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }
