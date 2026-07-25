@@ -1,7 +1,10 @@
 //! Consensus parity: host `energy_milli` matches golden vectors, and live GPU
 //! samples score bit-exactly to consensus `energy_milli`.
 //!
-//! Sampling tests require a CUDA device. Run with `cargo test -p quip-miner-cuda`.
+//! Host/golden tests always run. Live sampling tests are `#[ignore]` so default
+//! `cargo test` on headless CI reports them as ignored, not silently passed
+//! ([quip-miner-cuda-gp2] part b). Run on a GPU host:
+//! `cargo test -p quip-miner-cuda -- --ignored`.
 
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::sampler::sample_ising;
@@ -12,9 +15,6 @@ use serde_json::Value;
 use serial_test::serial;
 use std::fs;
 use std::sync::OnceLock;
-
-mod common;
-use common::cuda_available;
 
 fn golden() -> Value {
     let path = concat!(
@@ -98,11 +98,8 @@ fn truncation_matches_golden() {
 /// Live SA/Gibbs sample: every returned energy equals consensus scoring.
 #[test]
 #[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 fn live_sample_energies_match_energy_milli() {
-    if !cuda_available() {
-        eprintln!("SKIP live_sample_energies_match_energy_milli: no usable CUDA device");
-        return;
-    }
     let dev = device();
     let graph = IsingGraph::new(
         vec![1.0, -0.5, 0.0, 0.25],
@@ -136,11 +133,8 @@ fn live_sample_energies_match_energy_milli() {
 /// SA finds ferro ground state (sanity that the kernel actually anneals).
 #[test]
 #[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 fn sa_finds_ground_state_on_ferro() {
-    if !cuda_available() {
-        eprintln!("SKIP sa_finds_ground_state_on_ferro: no usable CUDA device");
-        return;
-    }
     let dev = device();
     let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
     let params = SampleParams {

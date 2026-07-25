@@ -63,12 +63,15 @@ quip-cuda-sa --check          # probe the backend is runnable
 ## Tests
 
 ```sh
-cargo test --release
+cargo test --release                       # host-only tests
+cargo test --release -- --include-ignored  # adds the CUDA-device tests
 ```
 
 Conformance/golden and handshake tests drive the binary in isolation via
 `quip-mock-coordinator` and check energies against `conformance/golden_vectors.json`.
-Sampling tests that require a live CUDA device self-skip when none is present.
+Tests that need a live CUDA device are marked `#[ignore]`, so a machine without a
+GPU reports them as ignored rather than passed. Run them with `--include-ignored`
+on a CUDA host.
 
 ## License
 

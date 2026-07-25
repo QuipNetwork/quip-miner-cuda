@@ -30,17 +30,3 @@ pub fn ensure_built(package_bins: &[&str]) {
         );
     }
 }
-
-/// Whether a usable CUDA device is present. Probes by running the built
-/// `quip-cuda-sa --check` in a subprocess: a missing driver or NVRTC library
-/// panics inside cudarc, crashing the child (captured here, not this test), so
-/// a non-zero exit means "no usable GPU". CI runners have no GPU, so hardware
-/// tests skip there while still running on GPU machines.
-pub fn cuda_available() -> bool {
-    ensure_built(&["quip-cuda-sa"]);
-    Command::new(profile_bin("quip-cuda-sa"))
-        .args(["--check", "--device", "0"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}

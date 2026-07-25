@@ -17,11 +17,14 @@ cache:
 test:
   stage: test
   script:
-    - rustup component add clippy
+    - rustup component add clippy rustfmt
+    - cargo fmt --all --check
     - cargo test --release
-    - cargo clippy --release --all-targets -- -D warnings
-  # GPU-dependent tests self-skip without a CUDA device; this is expected on
-  # CI runners without a GPU.
+    - cargo clippy --release --all-targets --all-features -- -D warnings
+  # GPU-dependent tests are `#[ignore]`d, so this job reports them as ignored
+  # rather than passed — "no GPU ran" is visible in the output instead of
+  # looking identical to a green run. On a runner with a CUDA device, run them
+  # explicitly with `cargo test --release -- --include-ignored`.
 
 .build:
   stage: build

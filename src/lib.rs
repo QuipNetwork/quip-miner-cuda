@@ -27,6 +27,7 @@ use nvml_gov::UtilGovernor;
 use quip_miner_core::config::{config_override, warn_unknown_fields};
 use quip_miner_core::{BackendIdentity, Sampler, StreamJob, StreamResult};
 use quip_proto::v1::RejectReason;
+use sampler::SampleError;
 use std::collections::BTreeMap;
 
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
@@ -79,6 +80,7 @@ pub const CUDA_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
 };
 
 /// CUDA sampler backend: one GPU device plus an NVML utilization governor.
+#[derive(Debug)]
 pub struct CudaSampler {
     device: CudaDevice,
     gov: UtilGovernor,
@@ -86,6 +88,7 @@ pub struct CudaSampler {
 }
 
 impl CudaSampler {
+    /// Bind an open device and its NVML governor into a sampler for `algorithm`.
     pub fn new(device: CudaDevice, gov: UtilGovernor, algorithm: Algorithm) -> Self {
         Self {
             device,
@@ -101,9 +104,15 @@ impl Sampler for CudaSampler {
         graph: &IsingGraph,
         params: &SampleParams,
     ) -> Result<Vec<SamplerResult>, RejectReason> {
+        // quip-miner-cuda-gp4: GraphTooLarge is permanent (kernel storage);
+        // KernelTimeout and other errors are transient overload.
         sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
             eprintln!("cuda sample failed: {e}");
-            RejectReason::Overloaded
+            match e {
+                SampleError::GraphTooLarge { .. } => RejectReason::TooLarge,
+                SampleError::KernelTimeout => RejectReason::Overloaded,
+                _ => RejectReason::Overloaded,
+            }
         })
     }
 
@@ -134,7 +143,15 @@ impl Sampler for CudaSampler {
     }
 
     fn apply_config(&self, backend_toml: &str) {
-        let cfg: CudaConfig = toml::from_str(backend_toml).unwrap_or_default();
+        // quip-miner-cuda-9yk: log parse errors before collapsing to defaults
+        // so operator typos are visible next to warn_unknown_fields.
+        let cfg: CudaConfig = match toml::from_str(backend_toml) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("cuda backend_toml parse failed, using defaults: {e}");
+                CudaConfig::default()
+            }
+        };
         warn_unknown_fields("cuda", cfg.unknown.keys());
         // config over CLI (the governor holds the CLI-set values until now).
         let ceiling = config_override(
@@ -150,6 +167,7 @@ impl Sampler for CudaSampler {
 #[cfg(test)]
 mod config_tests {
     use super::CudaConfig;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_known_fields_and_collects_unknown() {
@@ -167,6 +185,111 @@ mod config_tests {
     #[test]
     fn empty_config_is_all_none() {
         let cfg: CudaConfig = toml::from_str("").unwrap();
+        assert!(cfg.utilization.is_none());
+        assert!(cfg.yielding.is_none());
+        assert!(cfg.unknown.is_empty());
+    }
+
+    /// Parse path used by `apply_config` must never panic on arbitrary input.
+    #[test]
+    fn parse_never_panics_on_arbitrary_string() {
+        proptest!(|(s in ".*")| {
+            let _cfg: CudaConfig = toml::from_str(&s).unwrap_or_default();
+        });
+    }
+
+    /// Same guarantee for arbitrary TOML tables (structured, not just strings).
+    #[test]
+    fn parse_never_panics_on_arbitrary_toml_table() {
+        proptest!(|(entries in prop::collection::btree_map(
+            "[a-zA-Z_][a-zA-Z0-9_]{0,12}",
+            prop_oneof![
+                Just(toml::Value::Boolean(true)),
+                Just(toml::Value::Boolean(false)),
+                (0i64..10_000).prop_map(toml::Value::Integer),
+                ".*".prop_map(toml::Value::String),
+            ],
+            0..12,
+        ))| {
+            // toml 0.8 stores tables as toml::map::Map, not BTreeMap.
+            let mut map = toml::map::Map::new();
+            for (k, v) in entries {
+                map.insert(k, v);
+            }
+            let s = toml::to_string(&toml::Value::Table(map)).unwrap_or_default();
+            let _cfg: CudaConfig = toml::from_str(&s).unwrap_or_default();
+        });
+    }
+
+    /// Known fields round-trip through TOML parse.
+    #[test]
+    fn utilization_yielding_round_trip() {
+        proptest!(|(
+            util in prop::option::of(0u32..=100u32),
+            yielding in prop::option::of(any::<bool>()),
+        )| {
+            let mut parts = Vec::new();
+            if let Some(u) = util {
+                parts.push(format!("utilization = {u}"));
+            }
+            if let Some(y) = yielding {
+                parts.push(format!("yielding = {y}"));
+            }
+            let s = parts.join("\n");
+            let cfg: CudaConfig = toml::from_str(&s).expect("valid constructed toml");
+            prop_assert_eq!(cfg.utilization, util);
+            prop_assert_eq!(cfg.yielding, yielding);
+        });
+    }
+
+    /// Unrecognized keys always land in `unknown` and never vanish.
+    #[test]
+    fn unrecognized_keys_land_in_unknown() {
+        proptest!(|(
+            key in "[a-z][a-z0-9_]{0,15}",
+            val in -1000i64..1000i64,
+        )| {
+            prop_assume!(key != "utilization" && key != "yielding");
+            let s = format!("{key} = {val}");
+            let cfg: CudaConfig = toml::from_str(&s).expect("valid constructed toml");
+            prop_assert!(
+                cfg.unknown.contains_key(&key),
+                "key {key:?} vanished from unknown"
+            );
+            prop_assert_eq!(cfg.unknown.get(&key), Some(&toml::Value::Integer(val)));
+            // Known fields stay unset when only unknowns are present.
+            prop_assert_eq!(cfg.utilization, None);
+            prop_assert_eq!(cfg.yielding, None);
+        });
+    }
+
+    /// Parse failure collapses to a full Default, never a partial config.
+    #[test]
+    fn parse_failure_collapses_to_default() {
+        proptest!(|(s in ".*")| {
+            if toml::from_str::<CudaConfig>(&s).is_err() {
+                {
+                    let cfg: CudaConfig = toml::from_str(&s).unwrap_or_default();
+                    prop_assert_eq!(cfg.utilization, None);
+                    prop_assert_eq!(cfg.yielding, None);
+                    prop_assert!(cfg.unknown.is_empty());
+                    // Explicitly equal to a fresh Default (no partial fields).
+                    let def = CudaConfig::default();
+                    prop_assert_eq!(cfg.utilization, def.utilization);
+                    prop_assert_eq!(cfg.yielding, def.yielding);
+                    prop_assert_eq!(cfg.unknown, def.unknown);
+                }
+            }
+        });
+    }
+
+    /// Malformed known-field types must not partially apply siblings.
+    #[test]
+    fn type_mismatch_is_full_default_not_partial() {
+        // utilization valid type would be int; string forces whole-document Err.
+        let s = "utilization = \"nope\"\nyielding = true\n";
+        assert!(toml::from_str::<CudaConfig>(s).is_err());
+        let cfg: CudaConfig = toml::from_str(s).unwrap_or_default();
         assert!(cfg.utilization.is_none());
         assert!(cfg.yielding.is_none());
         assert!(cfg.unknown.is_empty());
