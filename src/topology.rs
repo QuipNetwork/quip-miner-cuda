@@ -60,6 +60,16 @@ pub struct ColorBlocks {
 /// degree-descending order, assign the smallest color unused by any
 /// already-colored neighbor. Not the Zephyr-optimal 4-coloring, but valid
 /// for any graph and typically close to it for sparse Ising topologies.
+///
+/// Working types stay `usize` for the traversal; convert to `i32` only when
+/// packing `ColorBlocks` for the kernel ABI. CSR `row_ptr`/`col_ind` values
+/// are non-negative and in-range by construction of [`SelfFeedingTopology::build`]
+/// (out-of-range endpoints are skipped; self-loops and sorted adj stay ≥ 0).
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn greedy_color(n: usize, row_ptr: &[i32], col_ind: &[i32]) -> ColorBlocks {
     if n == 0 {
         return ColorBlocks {
@@ -69,38 +79,49 @@ fn greedy_color(n: usize, row_ptr: &[i32], col_ind: &[i32]) -> ColorBlocks {
             num_colors: 0,
         };
     }
+    // CSR i32 → usize for host indexing; values non-negative by construction.
     let degree = |i: usize| (row_ptr[i + 1] - row_ptr[i]) as usize;
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_unstable_by_key(|&i| std::cmp::Reverse(degree(i)));
 
-    let mut color_of = vec![-1i32; n];
+    // `usize::MAX` = uncolored; colors otherwise in `0..n`.
+    let mut color_of = vec![usize::MAX; n];
     let mut used = vec![false; n]; // reused scratch, cleared per node
     for &node in &order {
         let start = row_ptr[node] as usize;
         let end = row_ptr[node + 1] as usize;
         let mut touched: Vec<usize> = Vec::with_capacity(end - start);
         for &nbr in &col_ind[start..end] {
+            // nbr is a node id written by build; always in 0..n.
             let c = color_of[nbr as usize];
-            if c >= 0 {
-                used[c as usize] = true;
-                touched.push(c as usize);
+            if c != usize::MAX {
+                used[c] = true;
+                touched.push(c);
             }
         }
         let mut c = 0usize;
         while c < n && used[c] {
             c += 1;
         }
-        color_of[node] = c as i32;
+        color_of[node] = c;
         for t in touched {
             used[t] = false;
         }
     }
 
-    let num_colors = color_of.iter().copied().max().unwrap_or(-1) + 1;
-    let mut groups: Vec<Vec<i32>> = vec![Vec::new(); num_colors.max(0) as usize];
+    let num_colors = color_of
+        .iter()
+        .copied()
+        .filter(|&c| c != usize::MAX)
+        .max()
+        .map_or(0, |m| m + 1);
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); num_colors];
     for (i, &c) in color_of.iter().enumerate() {
-        groups[c as usize].push(i as i32);
+        if c != usize::MAX {
+            groups[c].push(i);
+        }
     }
+    // Pack ColorBlocks: host usize → kernel i32 only at this boundary.
     let mut starts = Vec::with_capacity(groups.len());
     let mut counts = Vec::with_capacity(groups.len());
     let mut nodes = Vec::with_capacity(n);
@@ -108,14 +129,14 @@ fn greedy_color(n: usize, row_ptr: &[i32], col_ind: &[i32]) -> ColorBlocks {
     for g in &groups {
         starts.push(cur);
         counts.push(g.len() as i32);
-        nodes.extend_from_slice(g);
+        nodes.extend(g.iter().map(|&i| i as i32));
         cur += g.len() as i32;
     }
     ColorBlocks {
         starts,
         counts,
         nodes,
-        num_colors,
+        num_colors: num_colors as i32,
     }
 }
 
@@ -169,6 +190,13 @@ impl SelfFeedingTopology {
     /// assert_eq!(j_csr.iter().filter(|&&v| v == 2).count(), 2);
     /// assert_eq!(j_csr.iter().filter(|&&v| v == -3).count(), 2);
     /// ```
+    ///
+    /// Host-side adjacency is built entirely in `usize`. Casts to `i32`/`u32`
+    /// happen only when packing the CUDA kernel ABI arrays (`row_ptr`,
+    /// `col_ind`, `edge_pos`); graph size is bounded well below `i32::MAX` by
+    /// session limits (`DEFAULT_MAX_EDGES` / `max_nodes`).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn build(graph: &IsingGraph) -> Self {
         let n = graph.h.len();
         // Per-node list of (neighbor, edge_index, is_forward_half): carries
@@ -195,6 +223,7 @@ impl SelfFeedingTopology {
         // since `fill_h_j` skips those edges too (matches the guard above).
         let mut edge_pos = vec![(0u32, 0u32); graph.edges.len()];
         for i in 0..n {
+            // Pack kernel ABI: host length/index → i32/u32 at write boundary.
             row_ptr[i] = col_ind.len() as i32;
             for &(nbr, k, is_forward) in &adj[i] {
                 let pos = col_ind.len() as u32;
@@ -226,6 +255,7 @@ impl SelfFeedingTopology {
 /// since 1.45). Matches numpy's `dtype=np.int8` cast for the in-range
 /// values consensus actually produces (h in {-1,0,1}, J in {-1,1}, milli
 /// units); saturates instead of wrapping for out-of-range test fixtures.
+#[allow(clippy::cast_possible_truncation)] // intentional f64→i8 quantize
 fn quantize_i8(v: f64) -> i8 {
     v as i8
 }
@@ -266,6 +296,7 @@ fn quantize_i8(v: f64) -> i8 {
 /// assert_eq!(h_i8, vec![1, -1]);
 /// assert_eq!(j_csr, vec![5, 5]); // both directed halves
 /// ```
+#[must_use]
 pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>, Vec<i8>) {
     let mut j_csr = vec![0i8; topology.nnz];
     for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
@@ -289,6 +320,14 @@ pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>,
 
 #[cfg(test)]
 mod tests {
+    // Test fixtures use literal constants whose values are visible at the
+    // call site; host↔kernel ABI casts in assertions are not production risk.
+    #![allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     use super::*;
     use proptest::prelude::*;
 

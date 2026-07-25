@@ -42,11 +42,11 @@ fn best_fallback_arch(driver_version: i32) -> i32 {
 fn driver_version() -> Result<i32, CudaError> {
     let mut v: std::ffi::c_int = 0;
     // SAFETY: `v` is a live, initialized `c_int` owned by this frame, so
-    // `&mut v` is a valid, aligned, uniquely-borrowed pointer for the whole
-    // call — nothing else can alias it. `cuDriverGetVersion` only writes the
-    // version through the pointer and does not read or retain it past return,
-    // so no obligation outlives this statement.
-    unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut v) }.result()?;
+    // `from_mut(&mut v)` is a valid, aligned, uniquely-borrowed pointer for the
+    // whole call — nothing else can alias it. `cuDriverGetVersion` only writes
+    // the version through the pointer and does not read or retain it past
+    // return, so no obligation outlives this statement.
+    unsafe { cudarc::driver::sys::cuDriverGetVersion(std::ptr::from_mut(&mut v)) }.result()?;
     Ok(v)
 }
 
@@ -160,7 +160,10 @@ impl CudaDevice {
     /// # Ok::<(), quip_miner_cuda::cuda_device::CudaError>(())
     /// ```
     pub fn open(device_index: usize) -> Result<Self, CudaError> {
-        let n = CudaContext::device_count()? as usize;
+        // CUDA reports counts as i32; reject a negative driver response rather
+        // than silent truncation into usize.
+        let n = usize::try_from(CudaContext::device_count()?)
+            .map_err(|_| CudaError::Driver("CUDA reported a negative device count".into()))?;
         if device_index >= n {
             return Err(CudaError::NoDevice(device_index));
         }
@@ -185,8 +188,10 @@ impl CudaDevice {
 
         let stream = ctx.default_stream();
 
-        let max_sms =
-            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+        let max_sms = usize::try_from(
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        )
+        .map_err(|_| CudaError::Driver("CUDA reported a negative SM count".into()))?;
 
         let sa_ptx = compile_with_fallback(SA_SRC)?;
         let gibbs_ptx = compile_with_fallback(GIBBS_SRC)?;
@@ -223,7 +228,9 @@ impl CudaDevice {
     /// # Ok::<(), quip_miner_cuda::cuda_device::CudaError>(())
     /// ```
     pub fn device_count() -> Result<usize, CudaError> {
-        Ok(CudaContext::device_count()? as usize)
+        // CUDA reports the count as i32; reject negative rather than truncate.
+        usize::try_from(CudaContext::device_count()?)
+            .map_err(|_| CudaError::Driver("CUDA reported a negative device count".into()))
     }
 
     /// Probe that a device can open and compile kernels (`--check`).

@@ -34,7 +34,14 @@ fn main() -> ExitCode {
     run(CUDA_GIBBS_IDENTITY, &cli.common, || {
         let device = CudaDevice::open(cli.device)
             .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
-        let gov = UtilGovernor::start(cli.device as u32, cli.utilization, cli.yielding);
+        // NVML device index is u32; CLI takes usize to match CudaDevice::open.
+        let nvml_index = u32::try_from(cli.device).map_err(|_| {
+            OpenError(format!(
+                "device index {} exceeds u32 range for NVML",
+                cli.device
+            ))
+        })?;
+        let gov = UtilGovernor::start(nvml_index, cli.utilization, cli.yielding);
         Ok(CudaSampler::new(device, gov, Algorithm::Gibbs))
     })
 }
