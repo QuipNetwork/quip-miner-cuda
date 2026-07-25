@@ -2,6 +2,7 @@
 name = "quip-miner-cuda"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.97"
 description = "CUDA Ising miners: simulated annealing and heat-bath Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
 repository = "https://gitlab.com/quip.network/quip-miner-cuda"
@@ -42,6 +43,59 @@ toml = "0.8"
 
 [dev-dependencies]
 quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", tag = "shared-v0.3.0" }
+proptest = "1"
 serde_json = "1"
 serial_test = "3.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }
+
+# STRUCT-2 (quip-miner-cuda-1qr): crate-local lint policy. `unsafe_code` is deliberately not
+# denied — the crate makes four cudarc FFI/launch calls that have no safe equivalent, and a
+# crate-wide deny would need four scattered `#[allow]`s, the pattern STRUCT-2 prohibits. The
+# guarantee comes from `clippy::undocumented_unsafe_blocks = "deny"` instead.
+[lints.rust]
+missing_docs = "warn"
+let_underscore_drop = "warn"
+
+# Policy note: `cargo clippy -- -D warnings` (STRUCT-1, and .gitlab-ci.yml) promotes every
+# `warn` here to a hard error, so a lint set to `warn` is effectively `deny`. Anything left at
+# `allow` below was audited on 2026-07-25 and deliberately not adopted; the reason is recorded
+# per line so a later pass does not "correct" it. Adopting any of them is tracked as its own
+# bead, not a silent flip.
+[lints.clippy]
+# --- enforced: the crate is clean on these and must stay clean ---
+undocumented_unsafe_blocks = "deny"
+todo = "deny"
+unimplemented = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+let_underscore_must_use = "warn"
+mem_forget = "deny"
+from_over_into = "warn"
+ptr_arg = "warn"
+redundant_clone = "warn"
+wildcard_imports = "warn"
+enum_glob_use = "warn"
+needless_range_loop = "warn"
+derivable_impls = "warn"
+new_without_default = "warn"
+wrong_self_convention = "warn"
+non_send_fields_in_send_ty = "warn"
+
+# --- audited, deliberately not adopted ---
+# 89 hits, of which 30 were confirmed provably in-bounds CSR/loop-invariant lookups and 3 were
+# fixed (bead quip-miner-cuda-2sg). `.get().unwrap()` on the rest would be strictly worse.
+indexing_slicing = "allow"
+# 37 hits, every one inside `#[cfg(test)]` or `tests/`, where unwrap is the correct idiom.
+# Zero production hits. Cargo's [lints] cannot scope a lint to non-test targets.
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+# ~90 hits. This crate converts between host `usize` and device `i32`/`u32` on every kernel
+# argument by design; the kernel ABI fixes the widths. Adopting these needs a checked-cast
+# strategy, not per-site allows.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+# The remaining `pedantic` group was never audited against the 31 mandates. Adopting it is
+# tracked separately rather than enabled wholesale.

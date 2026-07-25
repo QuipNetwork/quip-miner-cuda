@@ -13,12 +13,29 @@ use crate::streaming;
 use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
 
+/// Failures from running one sampling job on the GPU.
 #[derive(Debug, Error)]
 pub enum SampleError {
+    /// Opening the device or compiling its kernels failed.
     #[error(transparent)]
     Cuda(#[from] crate::cuda_device::CudaError),
+    /// A CUDA driver call failed during upload, launch, or download.
     #[error("CUDA driver: {0}")]
     Driver(String),
+    /// The graph has more nodes than the chosen kernel's fixed-size
+    /// per-thread/shared state supports. Permanent for this backend: the
+    /// limit is compiled into the kernel, so retrying cannot help.
+    #[error("graph N={n} exceeds self-feeding kernel limit {limit}")]
+    GraphTooLarge {
+        /// Node count of the rejected graph.
+        n: usize,
+        /// The kernel's compiled-in node ceiling.
+        limit: usize,
+    },
+    /// The persistent kernel never marked the slot COMPLETE before the
+    /// driver's deadline. Transient: the device is wedged or oversubscribed.
+    #[error("self-feeding kernel timed out")]
+    KernelTimeout,
 }
 
 impl From<cudarc::driver::DriverError> for SampleError {
@@ -28,6 +45,16 @@ impl From<cudarc::driver::DriverError> for SampleError {
 }
 
 /// Run `num_reads` independent anneals on the GPU for one explicit problem.
+///
+/// # Errors
+///
+/// - [`SampleError::GraphTooLarge`] if `graph` has more nodes than the chosen
+///   kernel's fixed-size state supports. Permanent — retrying cannot help.
+/// - [`SampleError::KernelTimeout`] if the persistent kernel never marks the
+///   slot complete before the driver's deadline.
+/// - [`SampleError::Cuda`] if opening the device or compiling its kernels failed.
+/// - [`SampleError::Driver`] if a CUDA driver call failed while allocating the
+///   session buffers, uploading the problem, launching, or downloading results.
 pub fn sample_ising(
     device: &CudaDevice,
     graph: &IsingGraph,

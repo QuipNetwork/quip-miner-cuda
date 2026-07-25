@@ -1,4 +1,8 @@
 //! Protocol conformance: spawn SA and Gibbs miners against quip-mock-coordinator.
+//!
+//! GPU-backed drive tests are `#[ignore]` so default `cargo test` on headless CI
+//! never confuses "self-skipped" with "passed" ([quip-miner-cuda-gp2] part b).
+//! Run them on a GPU host: `cargo test -p quip-miner-cuda -- --ignored`.
 
 use quip_mock_coordinator::driver::drive_miner;
 use quip_proto::v1::RejectReason;
@@ -6,15 +10,12 @@ use serial_test::serial;
 use std::process::Command;
 
 mod common;
-use common::{cuda_available, ensure_built, profile_bin};
+use common::{ensure_built, profile_bin};
 
 #[tokio::test]
 #[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 async fn quip_cuda_sa_passes_conformance() {
-    if !cuda_available() {
-        eprintln!("SKIP quip_cuda_sa_passes_conformance: no usable CUDA device");
-        return;
-    }
     ensure_built(&["quip-cuda-sa"]);
     let miner = profile_bin("quip-cuda-sa");
     let socket = format!(
@@ -67,11 +68,8 @@ async fn quip_cuda_sa_passes_conformance() {
 
 #[tokio::test]
 #[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 async fn quip_cuda_gibbs_passes_conformance() {
-    if !cuda_available() {
-        eprintln!("SKIP quip_cuda_gibbs_passes_conformance: no usable CUDA device");
-        return;
-    }
     ensure_built(&["quip-cuda-gibbs"]);
     let miner = profile_bin("quip-cuda-gibbs");
     let socket = format!(
@@ -98,12 +96,11 @@ async fn quip_cuda_gibbs_passes_conformance() {
     assert_eq!(report.exit_code, 0, "clean shutdown expected");
 }
 
+/// `--capabilities` / `--version` are headless (no CUDA).
 #[test]
 #[serial]
-fn capabilities_and_version_and_check() {
+fn capabilities_and_version_headless() {
     ensure_built(&["quip-cuda-sa", "quip-cuda-gibbs"]);
-    // --capabilities and --version are headless (no CUDA); --check needs a GPU.
-    let gpu = cuda_available();
 
     for (bin, algo) in [("quip-cuda-sa", "sa"), ("quip-cuda-gibbs", "gibbs")] {
         let path = profile_bin(bin);
@@ -120,18 +117,26 @@ fn capabilities_and_version_and_check() {
         let out = Command::new(&path).arg("--version").output().unwrap();
         assert!(out.status.success());
         assert!(String::from_utf8(out.stdout).unwrap().contains("protocol"));
+    }
+}
 
-        // --check opens the GPU and compiles kernels; only meaningful with hardware.
-        if gpu {
-            let status = Command::new(&path)
-                .arg("--check")
-                .arg("--device")
-                .arg("0")
-                .status();
-            assert!(
-                status.unwrap().success(),
-                "{bin} --check must succeed when a GPU is present"
-            );
-        }
+/// `--check` opens the GPU and compiles kernels.
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+fn check_succeeds_with_gpu() {
+    ensure_built(&["quip-cuda-sa", "quip-cuda-gibbs"]);
+
+    for bin in ["quip-cuda-sa", "quip-cuda-gibbs"] {
+        let path = profile_bin(bin);
+        let status = Command::new(&path)
+            .arg("--check")
+            .arg("--device")
+            .arg("0")
+            .status();
+        assert!(
+            status.unwrap().success(),
+            "{bin} --check must succeed when a GPU is present"
+        );
     }
 }

@@ -26,7 +26,7 @@ use quip_miner_core::{
 use quip_proto::v1::RejectReason;
 use quip_protocol::scoring::energy_milli;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -71,6 +71,17 @@ fn algo_limits(algorithm: Algorithm) -> AlgoLimits {
 /// hardcoded directly on [`crate::CUDA_SA_IDENTITY`] /
 /// [`crate::CUDA_GIBBS_IDENTITY`] (kept next to `algo_limits` in spirit —
 /// `BackendIdentity` is a `const`, so it can't call a non-`const fn` here).
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_cuda::streaming::max_reads;
+/// use quip_miner_cuda::Algorithm;
+///
+/// // Both kernels are held to one 256-thread block's worth of reads.
+/// assert_eq!(max_reads(Algorithm::Sa), 256);
+/// assert_eq!(max_reads(Algorithm::Gibbs), 256);
+/// ```
 pub fn max_reads(algorithm: Algorithm) -> u32 {
     algo_limits(algorithm).max_reads as u32
 }
@@ -194,10 +205,10 @@ impl<'a> SelfFeedingSession<'a> {
         // the kernel's actual fixed-size array bounds before it becomes a
         // kernel-side buffer overrun instead of a clean error.
         if n > limits.max_nodes {
-            return Err(SampleError::Driver(format!(
-                "graph N={n} exceeds self-feeding kernel limit {}",
-                limits.max_nodes
-            )));
+            return Err(SampleError::GraphTooLarge {
+                n,
+                limit: limits.max_nodes,
+            });
         }
         let nnz_alloc = topology.nnz.max(1);
         let max_packed_size = n.div_ceil(8).max(1);
@@ -329,6 +340,19 @@ impl<'a> SelfFeedingSession<'a> {
         let nnz = self.topology.nnz;
         let n = self.topology.n;
 
+        // `stage_h` is sized from `self.topology.n`, but the `h` produced
+        // below is sized from `graph.h`. `SessionKey::matches` guarantees
+        // they agree for every job that reaches here, and `sample_one`
+        // builds the topology from this very graph — but that guarantee
+        // lives in other functions, so restate it here rather than let a
+        // future caller turn it into an out-of-bounds `copy_from_slice`.
+        if graph.h.len() != n {
+            return Err(SampleError::Driver(format!(
+                "upload_slot: job graph N={} does not match session topology N={n}",
+                graph.h.len()
+            )));
+        }
+
         self.stage_j[..nnz.max(1)].fill(0);
         self.stage_h[..n.max(1)].fill(0);
         let (j, h) = fill_h_j(&self.topology, graph);
@@ -438,6 +462,21 @@ impl<'a> SelfFeedingSession<'a> {
                 b.arg(&seed);
                 b.arg(d_delta_energy);
                 b.arg(&n);
+                // SAFETY: `launch_builder` pushes arguments positionally with
+                // no compile-time check against the device-side signature, so
+                // the obligation is that the 18 `b.arg` calls above mirror
+                // `cuda_sa_self_feeding` in `kernels/sa.cu` in order, type and
+                // count — they do, ending in the `delta_energy_workspace` /
+                // `max_N` pair. Every device buffer the kernel indexes is
+                // bounded by scalars it also receives: `n`, `nnz`,
+                // `max_packed`, `num_nonces` and `reads_per_nonce` are the
+                // exact values `build` sized `d_h`/`d_j`/`d_samples`/
+                // `d_energies`/`d_ctrl`/`d_delta_energy` from, and `build`
+                // rejected `n > limits.max_nodes` (see the `GraphTooLarge`
+                // guard), which is what keeps the kernel's fixed-size
+                // `unpacked_state[5000]` in range. The buffers outlive the
+                // launch: `Drop` signals exit and synchronizes
+                // `stream_compute` before any `CudaSlice` field is freed.
                 unsafe { b.launch(cfg) }?;
             }
             AlgoState::Gibbs {
@@ -475,6 +514,18 @@ impl<'a> SelfFeedingSession<'a> {
                 b.arg(&seed);
                 let update_mode = 0i32; // heat-bath Gibbs (no metropolis knob on this wire path)
                 b.arg(&update_mode);
+                // SAFETY: same obligation as the SA arm above. The 24 `b.arg`
+                // calls mirror `cuda_gibbs_self_feeding` in `kernels/gibbs.cu`
+                // in order, type and count, ending in `base_seed` /
+                // `update_mode`. `n`, `nnz`, `max_packed`, `num_nonces` and
+                // `reads_per_nonce` are the values `build` sized the slot
+                // buffers from; `num_colors`, `chunks_per_model` and
+                // `reads_per_chunk` likewise bound the color-block arrays
+                // `build` tiled per nonce. `build` rejected
+                // `n > limits.max_nodes`, keeping the kernel's fixed-size
+                // `shared_state[4800]` in range. The buffers outlive the
+                // launch: `Drop` signals exit and synchronizes
+                // `stream_compute` before any `CudaSlice` field is freed.
                 unsafe { b.launch(cfg) }?;
             }
         }
@@ -509,8 +560,31 @@ impl Drop for SelfFeedingSession<'_> {
         // Kernel must genuinely exit before any CudaSlice field is freed:
         // event tracking is disabled for this device (see CudaDevice::open),
         // so there is no automatic wait built into the Drop of those fields.
-        let _ = self.signal_exit();
-        let _ = self.wait_exit();
+        //
+        // That makes a failed synchronize unrecoverable rather than
+        // ignorable. If we return without establishing that the kernel has
+        // stopped, the `CudaSlice` fields are freed immediately afterwards
+        // and a still-running persistent kernel keeps writing into
+        // `d_samples`/`d_ctrl`/`d_energies` — a use-after-free on the device,
+        // the exact scenario `CudaDevice::open`'s safety note rules out.
+        // Leaking device memory is sound and aborting is sound; freeing
+        // memory that is still in use is not. So escalate instead of giving
+        // up: drain the compute stream, then the whole context, then abort.
+        drop(self.signal_exit());
+        let Err(e) = self.wait_exit() else {
+            return;
+        };
+        eprintln!("cuda self-feeding teardown: stream sync failed: {e}");
+        // A whole-context synchronize also covers work the per-stream sync
+        // could not observe, so it is a genuine second chance rather than a
+        // retry of the same call.
+        if let Err(e) = self.device.ctx.synchronize() {
+            eprintln!(
+                "cuda self-feeding teardown: context sync also failed: {e}; aborting rather than \
+                 freeing device buffers the persistent kernel may still be writing"
+            );
+            std::process::abort();
+        }
     }
 }
 
@@ -555,6 +629,43 @@ impl SessionKey {
 /// upload to slot 0, launch, poll to completion, download, tear down.
 /// Used by [`crate::sampler::sample_ising`] (the `Sampler::sample` path)
 /// and as the streaming loop's oversized/incompatible-job fallback.
+///
+/// A graph with no nodes is answered directly with empty reads and never
+/// touches the device.
+///
+/// # Errors
+///
+/// - [`SampleError::GraphTooLarge`] if `graph` has more nodes than the
+///   chosen kernel's fixed-size per-thread/shared state supports. This is
+///   permanent for this backend — the limit is compiled into the kernel, so
+///   the caller should reject the job rather than retry it.
+/// - [`SampleError::KernelTimeout`] if the kernel has not marked slot 0
+///   COMPLETE within 120 seconds of launch.
+/// - [`SampleError::Cuda`] or [`SampleError::Driver`] for a CUDA driver
+///   fault at any stage: creating the session's streams and device buffers,
+///   uploading the beta schedule or the job's `h`/`J`, launching the kernel,
+///   polling the ctrl mailbox, or downloading the packed samples.
+///
+/// # Examples
+///
+/// ```no_run
+/// use quip_miner_cuda::cuda_device::CudaDevice;
+/// use quip_miner_cuda::streaming::sample_one;
+/// use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let device = CudaDevice::open(0)?;
+/// let graph = IsingGraph::new(vec![1.0, -1.0], vec![1.0], vec![(0, 1)]);
+/// let params = SampleParams {
+///     num_reads: 8,
+///     ..SampleParams::default()
+/// };
+/// let reads = sample_one(&device, &graph, &params, Algorithm::Sa)?;
+/// let best = reads.iter().map(|r| r.energy_milli).min();
+/// # let _ = best;
+/// # Ok(())
+/// # }
+/// ```
 pub fn sample_one(
     device: &CudaDevice,
     graph: &IsingGraph,
@@ -597,7 +708,7 @@ pub fn sample_one(
             break;
         }
         if Instant::now() > deadline {
-            return Err(SampleError::Driver("self-feeding kernel timed out".into()));
+            return Err(SampleError::KernelTimeout);
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -612,69 +723,98 @@ pub fn sample_one(
         .collect())
 }
 
+/// The job a nonce is currently annealing, the device slot holding it, and
+/// when it was handed to the kernel (for `device_access_time_us`).
+struct ActiveSlot {
+    slot: u8,
+    job: StreamJob,
+    started: Instant,
+}
+
 /// Per-nonce ACTIVE/NEXT slot bookkeeping. Port of `GPU/slot_rotation.py`.
+///
+/// Occupancy is encoded exactly once, by the `Option`s: an idle nonce has a
+/// single representation (`None`), and a slot index only exists where a job
+/// exists. There is no `-1` sentinel to cast into a buffer index, so
+/// "occupied" and "which slot" cannot disagree.
+#[derive(Default)]
 struct SlotState {
-    active_slot: i32,
-    active_job: Option<StreamJob>,
-    active_started: Option<Instant>,
-    next_slot: i32,
-    next_job: Option<StreamJob>,
+    active: Option<ActiveSlot>,
+    next: Option<(u8, StreamJob)>,
 }
 
 impl SlotState {
-    fn new() -> Self {
-        Self {
-            active_slot: -1,
-            active_job: None,
-            active_started: None,
-            next_slot: -1,
-            next_job: None,
-        }
-    }
-
     fn is_idle(&self) -> bool {
-        self.active_job.is_none()
+        self.active.is_none()
     }
 
     fn needs_next(&self) -> bool {
-        self.active_job.is_some() && self.next_job.is_none()
+        self.active.is_some() && self.next.is_none()
     }
 
-    fn free_slot(&self) -> i32 {
-        for i in 0..SLOTS_PER_NONCE as i32 {
-            if i != self.active_slot && i != self.next_slot {
-                return i;
-            }
+    /// A slot index this nonce is not already using, or `None` if ACTIVE and
+    /// NEXT between them account for every slot.
+    fn free_slot(&self) -> Option<u8> {
+        let active = self.active.as_ref().map(|a| a.slot);
+        let next = self.next.as_ref().map(|(slot, _)| *slot);
+        (0..SLOTS_PER_NONCE as u8).find(|i| Some(*i) != active && Some(*i) != next)
+    }
+
+    fn assign_active(&mut self, slot: u8, job: StreamJob) {
+        self.active = Some(ActiveSlot {
+            slot,
+            job,
+            started: Instant::now(),
+        });
+    }
+
+    fn assign_next(&mut self, slot: u8, job: StreamJob) {
+        self.next = Some((slot, job));
+    }
+
+    /// Retire the ACTIVE job and promote NEXT (if any) into its place.
+    /// Returns the retired job, or `None` if this nonce was already idle.
+    fn rotate_on_completion(&mut self) -> Option<ActiveSlot> {
+        let done = self.active.take()?;
+        self.active = self.next.take().map(|(slot, job)| ActiveSlot {
+            slot,
+            job,
+            started: Instant::now(),
+        });
+        Some(done)
+    }
+
+    /// Take every job this nonce still holds (ACTIVE then NEXT), leaving it
+    /// idle. Used to reject in-flight work when a session aborts, so no job
+    /// is dropped without a `StreamResult`.
+    fn drain_jobs(&mut self) -> Vec<StreamJob> {
+        let mut jobs = Vec::new();
+        if let Some(active) = self.active.take() {
+            jobs.push(active.job);
         }
-        -1
-    }
-
-    fn assign_active(&mut self, slot: i32, job: StreamJob) {
-        self.active_slot = slot;
-        self.active_started = Some(Instant::now());
-        self.active_job = Some(job);
-    }
-
-    fn assign_next(&mut self, slot: i32, job: StreamJob) {
-        self.next_slot = slot;
-        self.next_job = Some(job);
-    }
-
-    fn rotate_on_completion(&mut self) {
-        if self.next_job.is_some() {
-            self.active_slot = self.next_slot;
-            self.active_started = Some(Instant::now());
-            self.active_job = self.next_job.take();
-        } else {
-            self.active_slot = -1;
-            self.active_started = None;
-            self.active_job = None;
+        if let Some((_, job)) = self.next.take() {
+            jobs.push(job);
         }
-        self.next_slot = -1;
+        jobs
     }
 }
 
 /// `Sampler::stream_width()` for the CUDA backend: `max_sms / sms_per_nonce`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use quip_miner_cuda::cuda_device::CudaDevice;
+/// use quip_miner_cuda::streaming::stream_width;
+/// use quip_miner_cuda::Algorithm;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let device = CudaDevice::open(0)?;
+/// // Gibbs spends 4 SMs per nonce, so it runs a quarter of SA's width.
+/// assert!(stream_width(&device, Algorithm::Sa) >= stream_width(&device, Algorithm::Gibbs));
+/// # Ok(())
+/// # }
+/// ```
 pub fn stream_width(device: &CudaDevice, algorithm: Algorithm) -> usize {
     (device.max_sms / algo_limits(algorithm).sms_per_nonce).max(1)
 }
@@ -696,17 +836,87 @@ fn try_pull(jobs: &mut Receiver<StreamJob>, key: &SessionKey) -> Pull {
 }
 
 fn send_reject(out: &Sender<StreamResult>, job: StreamJob, reason: RejectReason) {
-    let _ = out.blocking_send(StreamResult {
+    // Discarded deliberately: `blocking_send` only fails once the result
+    // channel is closed, i.e. the consumer is gone and no result of any kind
+    // can still be delivered. Every caller either follows this with a send of
+    // its own (see `emit_completion`, which does set `exhausted` on that same
+    // condition) or is already on an abort path, so there is nothing a
+    // rejection could recover here.
+    drop(out.blocking_send(StreamResult {
         job_id: job.job_id,
         result: Err(reason),
         device_access_time_us: 0,
-    });
+    }));
+}
+
+/// Score one completed job's downloaded reads and emit its `StreamResult`.
+///
+/// A failed download is reported as `Overloaded` rather than banked as an
+/// empty success: telling the coordinator a job succeeded with zero reads
+/// loses the work permanently, whereas a rejection lets it retry.
+///
+/// Returns `false` once the result channel has closed.
+fn emit_completion(
+    out: &Sender<StreamResult>,
+    done: ActiveSlot,
+    reads: Result<Vec<Vec<i8>>, SampleError>,
+) -> bool {
+    let device_access_time_us = done.started.elapsed().as_micros() as u64;
+    let reads = match reads {
+        Ok(reads) => reads,
+        Err(e) => {
+            eprintln!("cuda streaming slot download failed: {e}");
+            send_reject(out, done.job, RejectReason::Overloaded);
+            return true;
+        }
+    };
+    let results: Vec<SamplerResult> = reads
+        .into_iter()
+        .take(done.job.params.num_reads.max(1))
+        .map(|spins| score_spins(&spins, &done.job.graph))
+        .collect();
+    out.blocking_send(StreamResult {
+        job_id: done.job.job_id,
+        result: Ok(results),
+        device_access_time_us,
+    })
+    .is_ok()
 }
 
 /// Drive the self-feeding streaming loop for the lifetime of `jobs`: keep up
 /// to [`stream_width`] models in flight across one (or, on a topology/param
 /// change, successive) persistent kernel launches, emitting results in
 /// completion order.
+///
+/// Returns once `jobs` is closed and every job it delivered has produced a
+/// [`StreamResult`] — success, or a `RejectReason` if the device failed.
+///
+/// # Examples
+///
+/// ```no_run
+/// use quip_miner_core::{StreamJob, StreamResult};
+/// use quip_miner_cuda::cuda_device::CudaDevice;
+/// use quip_miner_cuda::streaming::run_stream;
+/// use quip_miner_cuda::Algorithm;
+/// use tokio::sync::mpsc::channel;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let device = CudaDevice::open(0)?;
+/// let (job_tx, job_rx) = channel::<StreamJob>(16);
+/// let (res_tx, _res_rx) = channel::<StreamResult>(16);
+///
+/// // A real caller feeds `job_tx` from another task; closing it is what
+/// // eventually lets `run_stream` return.
+/// drop(job_tx);
+/// run_stream(&device, Algorithm::Sa, job_rx, res_tx);
+/// # Ok(())
+/// # }
+/// ```
+// OWN-4: `out` is taken by value deliberately. Dropping the `Sender` when this function
+// returns is what closes the results channel and signals stream termination to the coordinator;
+// taking `&Sender` would move that drop point to the caller and weaken the contract. The
+// signature also mirrors the `Sampler::sample_stream` trait method it implements.
+#[allow(clippy::needless_pass_by_value)]
 pub fn run_stream(
     device: &CudaDevice,
     algorithm: Algorithm,
@@ -715,33 +925,36 @@ pub fn run_stream(
 ) {
     let width = stream_width(device, algorithm);
     let limits = algo_limits(algorithm);
-    let mut pending_seed: Option<StreamJob> = match jobs.blocking_recv() {
-        Some(j) => Some(j),
-        None => return,
-    };
+    let mut pending_seed: Option<StreamJob> = jobs.blocking_recv();
 
     'session: while let Some(seed) = pending_seed.take() {
         if seed.graph.num_nodes() == 0 {
             // Degenerate empty-graph job: no kernel needed, answer directly.
             let reads = seed.params.num_reads.max(1);
-            let _ = out.blocking_send(StreamResult {
-                job_id: seed.job_id,
-                result: Ok((0..reads)
-                    .map(|_| SamplerResult {
-                        spins: vec![],
-                        energy_milli: 0,
-                    })
-                    .collect()),
-                device_access_time_us: 0,
-            });
-            pending_seed = match jobs.blocking_recv() {
-                Some(j) => Some(j),
-                None => return,
-            };
+            if out
+                .blocking_send(StreamResult {
+                    job_id: seed.job_id,
+                    result: Ok((0..reads)
+                        .map(|_| SamplerResult {
+                            spins: vec![],
+                            energy_milli: 0,
+                        })
+                        .collect()),
+                    device_access_time_us: 0,
+                })
+                .is_err()
+            {
+                // Result channel closed: nothing we produce from here on can
+                // reach anyone. Same condition the completion path treats as
+                // `exhausted`, and here there is no in-flight work to drain.
+                return;
+            }
+            pending_seed = jobs.blocking_recv();
             continue 'session;
         }
 
         let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
+        let job_seed = seed.params.seed;
         let key = SessionKey::seed(&seed, reads_per_nonce);
         let (beta, sweeps_per_beta) = build_beta_schedule(
             &seed.graph,
@@ -774,7 +987,7 @@ pub fn run_stream(
             continue 'session;
         }
 
-        let mut slots: Vec<SlotState> = (0..width).map(|_| SlotState::new()).collect();
+        let mut slots: Vec<SlotState> = (0..width).map(|_| SlotState::default()).collect();
 
         // Cold start: the first job is already in hand; drain whatever else
         // shows up so the launch starts with as much concurrency as
@@ -826,14 +1039,37 @@ pub fn run_stream(
             }
             slots[nonce_id].assign_active(0, job);
         }
-        let seed_val = (Instant::now().elapsed().as_nanos() as u32) ^ 0x9E3779B9;
+        // The kernel's RNG seed must actually differ per session, or every
+        // session anneals the same trajectories. Wall-clock nanoseconds are
+        // the entropy (`Instant::now().elapsed()` is not — it measures the
+        // few nanoseconds between its own two calls), mixed with the seed
+        // job's own `params.seed` so two sessions starting in the same clock
+        // tick still diverge. Multiply-and-take-the-high-word spreads both
+        // inputs across the whole u32 rather than exposing raw low bits.
+        let wall_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos() as u64;
+        let seed_val = ((wall_nanos ^ job_seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32;
         if sess
             .launch(active_nonces, num_betas, sweeps_per_beta as i32, seed_val)
             .is_err()
         {
-            // Every cold-start job already handed off; nothing more to reject
-            // here beyond what upload_slot rejected above.
-            pending_seed = if closed { None } else { jobs.blocking_recv() };
+            // The cold-start jobs are held in `slots`, not handed off: with
+            // no kernel running none of them can ever complete, so reject
+            // them here rather than drop them and leave the coordinator
+            // waiting on results that will never come.
+            for slot in slots.iter_mut().take(active_nonces) {
+                for job in slot.drain_jobs() {
+                    send_reject(&out, job, RejectReason::Overloaded);
+                }
+            }
+            // A cold-start mismatch is a real job too: carry it to the next
+            // session instead of dropping it with the failed launch.
+            pending_seed =
+                mismatch
+                    .take()
+                    .or_else(|| if closed { None } else { jobs.blocking_recv() });
             continue 'session;
         }
 
@@ -844,13 +1080,15 @@ pub fn run_stream(
             if !exhausted {
                 'nonces: for (nonce_id, slot) in slots.iter_mut().enumerate().take(active_nonces) {
                     while slot.is_idle() || slot.needs_next() {
-                        let free = slot.free_slot();
-                        if free < 0 {
+                        let Some(free) = slot.free_slot() else {
                             break;
-                        }
+                        };
                         match try_pull(&mut jobs, &key) {
                             Pull::Job(j) => {
-                                if sess.upload_slot(nonce_id, free as usize, &j.graph).is_err() {
+                                if sess
+                                    .upload_slot(nonce_id, usize::from(free), &j.graph)
+                                    .is_err()
+                                {
                                     send_reject(&out, j, RejectReason::Overloaded);
                                     continue;
                                 }
@@ -878,55 +1116,48 @@ pub fn run_stream(
             if exhausted
                 && slots[..active_nonces]
                     .iter()
-                    .all(|s| s.is_idle() && s.next_job.is_none())
+                    .all(|s| s.is_idle() && s.next.is_none())
             {
                 break;
             }
 
             let ctrl = match sess.poll_ctrl() {
-                Ok(c) => c,
-                Err(_) => break,
+                Ok(ctrl) => ctrl,
+                Err(e) => {
+                    // The ctrl mailbox is what tells us a slot finished, so
+                    // once it is unreadable no in-flight job can ever be
+                    // observed as COMPLETE. Reject everything still held
+                    // instead of breaking out and dropping it silently — the
+                    // coordinator is blocked on a StreamResult per job.
+                    eprintln!("cuda streaming ctrl poll failed: {e}");
+                    for slot in slots.iter_mut().take(active_nonces) {
+                        for job in slot.drain_jobs() {
+                            send_reject(&out, job, RejectReason::Overloaded);
+                        }
+                    }
+                    break;
+                }
             };
             let mut found = false;
             for (nonce_id, slot) in slots.iter_mut().enumerate().take(active_nonces) {
-                if slot.is_idle() {
+                // `active` carries the slot index only when a job occupies
+                // it, so there is no idle sentinel to cast and `idx` cannot
+                // wrap into another nonce's ctrl word.
+                let Some(active) = slot.active.as_ref() else {
                     continue;
-                }
-                let active_slot = slot.active_slot as usize;
+                };
+                let active_slot = usize::from(active.slot);
                 let idx = nonce_id * CTRL_STRIDE + active_slot;
                 if ctrl[idx] != SLOT_COMPLETE {
                     continue;
                 }
-                // `!slot.is_idle()` above guarantees `active_job.is_some()`;
-                // fall through gracefully instead of asserting it, so a
-                // future refactor that breaks the invariant degrades to a
-                // skipped completion rather than a panic.
-                let Some(completed) = slot.active_job.take() else {
+                found = true;
+                let reads = sess.download_slot(nonce_id, active_slot);
+                // Always `Some`: `active` was matched immediately above.
+                let Some(done) = slot.rotate_on_completion() else {
                     continue;
                 };
-                found = true;
-                let reads = sess
-                    .download_slot(nonce_id, active_slot)
-                    .unwrap_or_default();
-                let device_access_time_us = slot
-                    .active_started
-                    .map(|t| t.elapsed().as_micros() as u64)
-                    .unwrap_or(0);
-                slot.rotate_on_completion();
-
-                let results: Vec<SamplerResult> = reads
-                    .into_iter()
-                    .take(completed.params.num_reads.max(1))
-                    .map(|spins| score_spins(&spins, &completed.graph))
-                    .collect();
-                if out
-                    .blocking_send(StreamResult {
-                        job_id: completed.job_id,
-                        result: Ok(results),
-                        device_access_time_us,
-                    })
-                    .is_err()
-                {
+                if !emit_completion(&out, done, reads) {
                     exhausted = true;
                 }
             }
@@ -938,5 +1169,270 @@ pub fn run_stream(
         drop(sess); // signals exit + synchronizes stream_compute (Drop impl)
 
         pending_seed = mismatch.or_else(|| if closed { None } else { jobs.blocking_recv() });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 4-node ring, unit couplings — small enough to reason about by hand.
+    fn graph() -> IsingGraph {
+        IsingGraph::new(
+            vec![1.0, -1.0, 0.0, 1.0],
+            vec![1.0, -1.0, 1.0, -1.0],
+            vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+        )
+    }
+
+    fn job(id: u8) -> StreamJob {
+        StreamJob {
+            job_id: vec![id],
+            graph: graph(),
+            params: SampleParams::default(),
+        }
+    }
+
+    #[test]
+    fn unpack_spins_reads_bits_lsb_first() {
+        // 0b0000_0101: bits 0 and 2 set -> those spins are -1, rest +1.
+        let spins = unpack_spins(&[0b0000_0101], 8);
+        assert_eq!(spins, vec![-1, 1, -1, 1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn unpack_spins_reads_the_sign_bit_as_a_bit() {
+        // 0x80 is -128 as i8; the cast back to u8 must not lose bit 7.
+        let spins = unpack_spins(&[-128i8], 8);
+        assert_eq!(spins, vec![1, 1, 1, 1, 1, 1, 1, -1]);
+    }
+
+    #[test]
+    fn unpack_spins_spans_bytes_and_stops_at_n() {
+        // n=9 reaches into the second byte for exactly one bit.
+        let spins = unpack_spins(&[0b0000_0000, 0b0000_0001], 9);
+        assert_eq!(spins, vec![1, 1, 1, 1, 1, 1, 1, 1, -1]);
+    }
+
+    #[test]
+    fn slot_state_starts_idle() {
+        let slot = SlotState::default();
+        assert!(slot.is_idle());
+        assert!(!slot.needs_next());
+        assert_eq!(slot.free_slot(), Some(0));
+    }
+
+    #[test]
+    fn slot_state_rotates_without_active_and_next_colliding() {
+        let mut slot = SlotState::default();
+
+        slot.assign_active(0, job(1));
+        assert!(!slot.is_idle());
+        assert!(
+            slot.needs_next(),
+            "an occupied nonce with no NEXT wants one"
+        );
+        assert_eq!(slot.free_slot(), Some(1));
+
+        slot.assign_next(1, job(2));
+        assert!(!slot.needs_next());
+        // ACTIVE and NEXT hold two of three slots, so the free one is the third.
+        assert_eq!(slot.free_slot(), Some(2));
+        let active = slot.active.as_ref().expect("active");
+        let (next_slot, _) = slot.next.as_ref().expect("next");
+        assert_ne!(active.slot, *next_slot, "ACTIVE and NEXT must not collide");
+
+        // Completing ACTIVE hands back job 1 and promotes job 2 in place.
+        let done = slot.rotate_on_completion().expect("a job was active");
+        assert_eq!(done.slot, 0);
+        assert_eq!(done.job.job_id, vec![1]);
+        assert!(!slot.is_idle());
+        assert_eq!(slot.active.as_ref().map(|a| a.slot), Some(1));
+        assert!(slot.next.is_none());
+        assert_eq!(slot.free_slot(), Some(0));
+
+        // Completing again with no NEXT queued leaves the nonce idle.
+        let done = slot.rotate_on_completion().expect("job 2 was promoted");
+        assert_eq!(done.job.job_id, vec![2]);
+        assert!(slot.is_idle());
+        assert!(slot.rotate_on_completion().is_none());
+    }
+
+    #[test]
+    fn slot_state_free_slot_avoids_both_held_slots() {
+        // ACTIVE and NEXT hold at most two slots, so with three per nonce the
+        // remaining one is always offered — whichever two are in use.
+        for (active, next, free) in [(0u8, 1u8, 2u8), (2, 0, 1), (1, 2, 0)] {
+            let mut slot = SlotState::default();
+            slot.assign_active(active, job(1));
+            slot.assign_next(next, job(2));
+            assert_eq!(slot.free_slot(), Some(free));
+        }
+    }
+
+    #[test]
+    fn slot_state_drain_jobs_yields_active_then_next() {
+        let mut slot = SlotState::default();
+        slot.assign_active(0, job(1));
+        slot.assign_next(1, job(2));
+
+        let drained = slot.drain_jobs();
+        assert_eq!(
+            drained.iter().map(|j| j.job_id.clone()).collect::<Vec<_>>(),
+            vec![vec![1], vec![2]]
+        );
+        assert!(slot.is_idle());
+        assert!(slot.next.is_none());
+        assert!(slot.drain_jobs().is_empty());
+    }
+
+    #[test]
+    fn session_key_matches_an_identical_job() {
+        let seed = job(1);
+        let key = SessionKey::seed(&seed, 8);
+        assert!(key.matches(&seed));
+    }
+
+    #[test]
+    fn session_key_rejects_a_different_node_count() {
+        let key = SessionKey::seed(&job(1), 8);
+        let mut other = job(2);
+        other.graph.h.push(0.5);
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn session_key_rejects_different_edges() {
+        let key = SessionKey::seed(&job(1), 8);
+        let mut other = job(2);
+        other.graph.edges = vec![(0, 1), (1, 2), (2, 3), (0, 2)];
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn session_key_rejects_a_different_sweep_count() {
+        let key = SessionKey::seed(&job(1), 8);
+        let mut other = job(2);
+        other.params.num_sweeps += 1;
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn session_key_rejects_a_different_sweeps_per_beta() {
+        let key = SessionKey::seed(&job(1), 8);
+        let mut other = job(2);
+        other.params.sweeps_per_beta = 4;
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn session_key_rejects_a_different_beta_range() {
+        let key = SessionKey::seed(&job(1), 8);
+        let mut other = job(2);
+        other.params.beta_range = Some((0.1, 10.0));
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn session_key_rejects_more_reads_than_the_session_allocated() {
+        let key = SessionKey::seed(&job(1), 8);
+        let mut other = job(2);
+        other.params.num_reads = 8;
+        assert!(key.matches(&other), "exactly the capacity still fits");
+        other.params.num_reads = 9;
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn session_key_treats_zero_and_one_sweeps_per_beta_alike() {
+        // Both sides apply `.max(1)`, so 0 and 1 are the same session.
+        let mut seed = job(1);
+        seed.params.sweeps_per_beta = 0;
+        let key = SessionKey::seed(&seed, 8);
+        let mut other = job(2);
+        other.params.sweeps_per_beta = 1;
+        assert!(key.matches(&other));
+    }
+
+    #[test]
+    fn beta_schedule_length_is_sweeps_over_sweeps_per_beta() {
+        let (sched, sweeps_per) = build_beta_schedule(&graph(), 100, 10, Some((0.1, 10.0)));
+        assert_eq!(sweeps_per, 10);
+        assert_eq!(sched.len(), 10);
+    }
+
+    #[test]
+    fn beta_schedule_floors_sweeps_per_beta_at_one() {
+        // A zero would divide by zero; the floor turns it into one beta per sweep.
+        let (sched, sweeps_per) = build_beta_schedule(&graph(), 64, 0, Some((0.1, 10.0)));
+        assert_eq!(sweeps_per, 1);
+        assert_eq!(sched.len(), 64);
+    }
+
+    #[test]
+    fn beta_schedule_always_has_at_least_one_beta() {
+        // Zero sweeps, or fewer sweeps than sweeps_per_beta, must not yield an
+        // empty schedule — the kernel would have nothing to anneal against.
+        let (sched, _) = build_beta_schedule(&graph(), 0, 1, Some((0.1, 10.0)));
+        assert_eq!(sched.len(), 1);
+        let (sched, _) = build_beta_schedule(&graph(), 4, 64, Some((0.1, 10.0)));
+        assert_eq!(sched.len(), 1);
+    }
+
+    #[test]
+    fn beta_schedule_runs_hot_to_cold() {
+        let (sched, _) = build_beta_schedule(&graph(), 40, 10, Some((0.1, 10.0)));
+        assert_eq!(sched.len(), 4);
+        // Beta rises as temperature falls, so the schedule is increasing.
+        for pair in sched.windows(2) {
+            assert!(pair[1] > pair[0], "beta schedule must cool monotonically");
+        }
+    }
+
+    #[test]
+    fn tile_i32_repeats_the_whole_slice() {
+        assert_eq!(tile_i32(&[1, 2, 3], 2), vec![1, 2, 3, 1, 2, 3]);
+        assert_eq!(tile_i32(&[1, 2, 3], 1), vec![1, 2, 3]);
+        assert!(tile_i32(&[1, 2, 3], 0).is_empty());
+        assert!(tile_i32(&[], 4).is_empty());
+    }
+
+    #[test]
+    fn algo_limits_match_the_kernels_fixed_size_arrays() {
+        // SA: one block per nonce, `unpacked_state[5000]`.
+        let sa = algo_limits(Algorithm::Sa);
+        assert_eq!(sa.sms_per_nonce, 1);
+        assert_eq!(sa.max_nodes, 5000);
+        assert_eq!(sa.max_reads, 256);
+
+        // Gibbs: four blocks per nonce, `shared_state[4800]`.
+        let gibbs = algo_limits(Algorithm::Gibbs);
+        assert_eq!(gibbs.sms_per_nonce, 4);
+        assert_eq!(gibbs.max_nodes, 4800);
+        assert_eq!(gibbs.max_reads, 256);
+    }
+
+    #[test]
+    fn max_reads_reports_the_per_algorithm_cap() {
+        assert_eq!(
+            max_reads(Algorithm::Sa),
+            algo_limits(Algorithm::Sa).max_reads as u32
+        );
+        assert_eq!(
+            max_reads(Algorithm::Gibbs),
+            algo_limits(Algorithm::Gibbs).max_reads as u32
+        );
+    }
+
+    #[test]
+    fn score_spins_uses_consensus_energy() {
+        let g = graph();
+        let spins = vec![1i8, 1, 1, 1];
+        let scored = score_spins(&spins, &g);
+        assert_eq!(scored.spins, spins);
+        assert_eq!(
+            scored.energy_milli,
+            energy_milli(&spins, &g.h, &g.j, &g.edges)
+        );
     }
 }
