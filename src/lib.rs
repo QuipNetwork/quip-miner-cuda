@@ -89,6 +89,7 @@ pub struct CudaSampler {
 
 impl CudaSampler {
     /// Bind an open device and its NVML governor into a sampler for `algorithm`.
+    #[must_use]
     pub fn new(device: CudaDevice, gov: UtilGovernor, algorithm: Algorithm) -> Self {
         Self {
             device,
@@ -108,10 +109,15 @@ impl Sampler for CudaSampler {
         // KernelTimeout and other errors are transient overload.
         sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
             eprintln!("cuda sample failed: {e}");
+            // TYPE-4: name every SampleError variant so a new one cannot
+            // silently map to Overloaded via a wildcard. Identical Overloaded
+            // arms are intentional — reasons differ even when the reject does.
+            #[allow(clippy::match_same_arms)]
             match e {
                 SampleError::GraphTooLarge { .. } => RejectReason::TooLarge,
                 SampleError::KernelTimeout => RejectReason::Overloaded,
-                _ => RejectReason::Overloaded,
+                SampleError::Cuda(_) => RejectReason::Overloaded,
+                SampleError::Driver(_) => RejectReason::Overloaded,
             }
         })
     }
@@ -131,7 +137,7 @@ impl Sampler for CudaSampler {
     }
 
     fn utilization(&self) -> f64 {
-        self.gov.utilization() as f64
+        f64::from(self.gov.utilization())
     }
 
     fn should_throttle(&self) -> bool {

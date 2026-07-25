@@ -6,6 +6,9 @@
 //! ([quip-miner-cuda-gp2] part b). Run on a GPU host:
 //! `cargo test -p quip-miner-cuda -- --ignored`.
 
+// Test fixtures parse golden-vector literals; casts are intentional and values are call-site visible.
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::sampler::sample_ising;
 use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};

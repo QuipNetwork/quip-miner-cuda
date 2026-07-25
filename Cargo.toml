@@ -62,24 +62,21 @@ let_underscore_drop = "warn"
 # per line so a later pass does not "correct" it. Adopting any of them is tracked as its own
 # bead, not a silent flip.
 [lints.clippy]
-# --- enforced: the crate is clean on these and must stay clean ---
+# The pedantic group is adopted (bead quip-miner-cuda-f5u). The cast family it brings in was
+# resolved by validating host->device widths once at the boundary — `KernelDims` in `streaming`
+# and the CSR pack points in `topology` — rather than by per-site allows. The few casts that
+# genuinely cannot be checked carry a function-scoped allow naming the invariant.
+pedantic = { level = "warn", priority = -1 }
+
+# --- enforced beyond pedantic ---
 undocumented_unsafe_blocks = "deny"
 todo = "deny"
 unimplemented = "deny"
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
 let_underscore_must_use = "warn"
 mem_forget = "deny"
-from_over_into = "warn"
-ptr_arg = "warn"
-redundant_clone = "warn"
-wildcard_imports = "warn"
-enum_glob_use = "warn"
-needless_range_loop = "warn"
-derivable_impls = "warn"
-new_without_default = "warn"
-wrong_self_convention = "warn"
 non_send_fields_in_send_ty = "warn"
+# nursery-group, so not covered by pedantic; OWN-2 (bead quip-miner-cuda-wu9) was a finding here.
+redundant_clone = "warn"
 
 # --- audited, deliberately not adopted ---
 # 89 hits, of which 30 were confirmed provably in-bounds CSR/loop-invariant lookups and 3 were
@@ -90,12 +87,3 @@ indexing_slicing = "allow"
 unwrap_used = "allow"
 expect_used = "allow"
 panic = "allow"
-# ~90 hits. This crate converts between host `usize` and device `i32`/`u32` on every kernel
-# argument by design; the kernel ABI fixes the widths. Adopting these needs a checked-cast
-# strategy, not per-site allows.
-cast_possible_truncation = "allow"
-cast_possible_wrap = "allow"
-cast_sign_loss = "allow"
-cast_precision_loss = "allow"
-# The remaining `pedantic` group was never audited against the 31 mandates. Adopting it is
-# tracked separately rather than enabled wholesale.

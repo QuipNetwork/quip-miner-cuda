@@ -63,6 +63,7 @@ impl UtilGovernor {
     /// assert_eq!(UtilGovernor::start(0, 0, false).utilization_ceiling(), 1);
     /// assert_eq!(UtilGovernor::start(0, 200, false).utilization_ceiling(), 100);
     /// ```
+    #[must_use]
     pub fn start(device_index: u32, utilization_ceiling: u32, yielding: bool) -> Self {
         let knobs = Arc::new(Knobs {
             ceiling: AtomicU32::new(utilization_ceiling.clamp(1, 100)),
@@ -72,7 +73,7 @@ impl UtilGovernor {
         });
         let knobs_thread = Arc::clone(&knobs);
         let handle = Some(thread::spawn(move || {
-            poll_loop(device_index, &knobs_thread)
+            poll_loop(device_index, &knobs_thread);
         }));
         Self { knobs, handle }
     }
@@ -113,6 +114,7 @@ impl UtilGovernor {
     /// gov.reconfigure(40, false);
     /// assert_eq!(gov.utilization_ceiling(), 40);
     /// ```
+    #[must_use]
     pub fn utilization_ceiling(&self) -> u32 {
         self.knobs.ceiling.load(Ordering::Relaxed)
     }
@@ -128,13 +130,18 @@ impl UtilGovernor {
     /// gov.reconfigure(75, true);
     /// assert!(gov.yielding());
     /// ```
+    #[must_use]
     pub fn yielding(&self) -> bool {
         self.knobs.yielding.load(Ordering::Relaxed)
     }
 
     /// Last NVML GPU util percent (0–100), or 0 if not yielding / unavailable.
+    #[must_use]
     pub fn utilization(&self) -> f32 {
-        self.knobs.last_util.load(Ordering::Relaxed) as f32
+        // Invariant: last_util is NVML GPU util percent 0–100 (or 0 when not
+        // yielding). Clamped so the u8 path is always exact in f32.
+        let util = self.knobs.last_util.load(Ordering::Relaxed).min(100);
+        f32::from(u8::try_from(util).unwrap_or(0))
     }
 
     /// True when yielding and the last util sample exceeds the ceiling.
@@ -147,6 +154,7 @@ impl UtilGovernor {
     /// let gov = UtilGovernor::start(0, 50, false);
     /// assert!(!gov.should_throttle());
     /// ```
+    #[must_use]
     pub fn should_throttle(&self) -> bool {
         self.knobs.yielding.load(Ordering::Relaxed)
             && self.knobs.last_util.load(Ordering::Relaxed)
