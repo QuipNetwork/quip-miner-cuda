@@ -21,7 +21,8 @@ use crate::topology::{fill_h_j, SelfFeedingTopology};
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 use quip_miner_core::{
-    Algorithm, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamResult,
+    Algorithm, CancelGuard, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome,
+    StreamResult,
 };
 use quip_proto::v1::RejectReason;
 use quip_protocol::scoring::energy_milli;
@@ -951,7 +952,7 @@ fn send_reject(out: &Sender<StreamResult>, job: StreamJob, reason: RejectReason)
     // rejection could recover here.
     drop(out.blocking_send(StreamResult {
         job_id: job.job_id,
-        result: Err(reason),
+        outcome: StreamOutcome::Completed(Err(reason)),
         device_access_time_us: 0,
     }));
 }
@@ -988,7 +989,7 @@ fn emit_completion(
         .collect();
     out.blocking_send(StreamResult {
         job_id: done.job.job_id,
-        result: Ok(results),
+        outcome: StreamOutcome::Completed(Ok(results)),
         device_access_time_us,
     })
     .is_ok()
@@ -1019,6 +1020,21 @@ struct Feed<'a> {
     jobs: &'a mut Receiver<StreamJob>,
     key: &'a SessionKey,
     out: &'a Sender<StreamResult>,
+    /// Watermark for generations the coordinator abandoned on reseed. Jobs at or
+    /// below it are emitted as `Cancelled` at dequeue rather than sampled.
+    cancel: &'a CancelGuard,
+}
+
+/// Emit a `Cancelled` result for a job from an abandoned generation so the
+/// coordinator refunds its credit and the pipeline keeps depth. Returns `false`
+/// once the result channel has closed.
+fn emit_cancelled(out: &Sender<StreamResult>, job: StreamJob) -> bool {
+    out.blocking_send(StreamResult {
+        job_id: job.job_id,
+        outcome: StreamOutcome::Cancelled,
+        device_access_time_us: 0,
+    })
+    .is_ok()
 }
 
 /// The seed job for the next session: one carried over from this session, or
@@ -1041,12 +1057,12 @@ fn answer_empty_graph(out: &Sender<StreamResult>, job: StreamJob) -> bool {
     let reads = job.params.num_reads.max(1);
     out.blocking_send(StreamResult {
         job_id: job.job_id,
-        result: Ok((0..reads)
+        outcome: StreamOutcome::Completed(Ok((0..reads)
             .map(|_| SamplerResult {
                 spins: vec![],
                 energy_milli: 0,
             })
-            .collect()),
+            .collect())),
         device_access_time_us: 0,
     })
     .is_ok()
@@ -1100,8 +1116,12 @@ fn drain_cold_start(feed: &mut Feed<'_>, seed: StreamJob, width: usize) -> (Vec<
     while cold.len() < width && Instant::now() < hard_cap {
         match try_pull(feed.jobs, feed.key) {
             Pull::Job(j) => {
-                cold.push(j);
-                last_arrival = Instant::now();
+                if feed.cancel.is_cancelled(j.generation) {
+                    let _ = emit_cancelled(feed.out, j);
+                } else {
+                    cold.push(j);
+                    last_arrival = Instant::now();
+                }
             }
             Pull::Mismatch(j) => return (cold, Halt::Mismatch(j)),
             Pull::Empty => {
@@ -1127,6 +1147,12 @@ fn refill_slots(
         while let Some(free) = slot.open_slot() {
             match try_pull(feed.jobs, feed.key) {
                 Pull::Job(j) => {
+                    if feed.cancel.is_cancelled(j.generation) {
+                        if !emit_cancelled(feed.out, j) {
+                            return Halt::Closed;
+                        }
+                        continue;
+                    }
                     if sess
                         .upload_slot(nonce_id, usize::from(free), &j.graph)
                         .is_err()
@@ -1244,10 +1270,21 @@ fn run_session(
     seed: StreamJob,
     jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
+    cancel: &CancelGuard,
 ) -> Option<StreamJob> {
     if seed.graph.num_nodes() == 0 {
         // Degenerate empty-graph job: no kernel needed, answer directly.
         if !answer_empty_graph(out, seed) {
+            return None;
+        }
+        return jobs.blocking_recv();
+    }
+
+    // Seed from a generation the coordinator abandoned on reseed: emit Cancelled
+    // (refunds the credit) and advance to the next seed rather than spinning up a
+    // kernel for stale work.
+    if cancel.is_cancelled(seed.generation) {
+        if !emit_cancelled(out, seed) {
             return None;
         }
         return jobs.blocking_recv();
@@ -1269,6 +1306,7 @@ fn run_session(
         jobs,
         key: &key,
         out,
+        cancel,
     };
 
     let mut sess = match SelfFeedingSession::build(
@@ -1340,7 +1378,7 @@ fn run_session(
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_core::{StreamJob, StreamResult};
+/// use quip_miner_core::{CancelGuard, StreamJob, StreamResult};
 /// use quip_miner_cuda::cuda_device::CudaDevice;
 /// use quip_miner_cuda::streaming::run_stream;
 /// use quip_miner_cuda::Algorithm;
@@ -1354,7 +1392,7 @@ fn run_session(
 /// // A real caller feeds `job_tx` from another task; closing it is what
 /// // eventually lets `run_stream` return.
 /// drop(job_tx);
-/// run_stream(&device, Algorithm::Sa, job_rx, res_tx);
+/// run_stream(&device, Algorithm::Sa, job_rx, res_tx, CancelGuard::default());
 /// # Ok(())
 /// # }
 /// ```
@@ -1368,10 +1406,11 @@ pub fn run_stream(
     algorithm: Algorithm,
     mut jobs: Receiver<StreamJob>,
     out: Sender<StreamResult>,
+    cancel: CancelGuard,
 ) {
     let mut pending = jobs.blocking_recv();
     while let Some(seed) = pending.take() {
-        pending = run_session(device, algorithm, seed, &mut jobs, &out);
+        pending = run_session(device, algorithm, seed, &mut jobs, &out, &cancel);
     }
 }
 
@@ -1399,6 +1438,7 @@ mod tests {
             job_id: vec![id],
             graph: graph(),
             params: SampleParams::default(),
+            generation: 0,
         }
     }
 
@@ -1672,10 +1712,12 @@ mod tests {
         job_tx.try_send(job(2)).expect("queue a second job");
         drop(job_tx);
 
+        let cancel = CancelGuard::default();
         let mut feed = Feed {
             jobs: &mut job_rx,
             key: &key,
             out: &res_tx,
+            cancel: &cancel,
         };
         let (cold, halt) = drain_cold_start(&mut feed, seed, 8);
 
@@ -1694,10 +1736,12 @@ mod tests {
         other.params.num_sweeps += 1;
         job_tx.try_send(other).expect("queue a mismatched job");
 
+        let cancel = CancelGuard::default();
         let mut feed = Feed {
             jobs: &mut job_rx,
             key: &key,
             out: &res_tx,
+            cancel: &cancel,
         };
         let (cold, halt) = drain_cold_start(&mut feed, seed, 8);
 
@@ -1717,10 +1761,12 @@ mod tests {
         job_tx.try_send(job(2)).expect("queue a second job");
         job_tx.try_send(job(3)).expect("queue a third job");
 
+        let cancel = CancelGuard::default();
         let mut feed = Feed {
             jobs: &mut job_rx,
             key: &key,
             out: &res_tx,
+            cancel: &cancel,
         };
         let (cold, halt) = drain_cold_start(&mut feed, seed, 2);
 
@@ -1736,10 +1782,12 @@ mod tests {
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let key = SessionKey::seed(&job(1), 8);
         drop(job_tx);
+        let cancel = CancelGuard::default();
         let mut feed = Feed {
             jobs: &mut job_rx,
             key: &key,
             out: &res_tx,
+            cancel: &cancel,
         };
 
         let carried = next_seed(&mut feed, Halt::Mismatch(job(9)));
@@ -1763,7 +1811,10 @@ mod tests {
         let sent = res_rx.try_recv().expect("a result was emitted");
         assert_eq!(sent.job_id, vec![7]);
         assert_eq!(sent.device_access_time_us, 0);
-        let reads = sent.result.expect("an empty graph still succeeds");
+        let StreamOutcome::Completed(result) = sent.outcome else {
+            panic!("an empty graph completes, is never cancelled");
+        };
+        let reads = result.expect("an empty graph still succeeds");
         assert_eq!(reads.len(), 3);
         assert!(reads
             .iter()

@@ -25,7 +25,7 @@ pub use sampler::sample_ising;
 use cuda_device::CudaDevice;
 use nvml_gov::UtilGovernor;
 use quip_miner_core::config::{config_override, warn_unknown_fields};
-use quip_miner_core::{BackendIdentity, Sampler, StreamJob, StreamResult};
+use quip_miner_core::{BackendIdentity, CancelGuard, Sampler, StreamJob, StreamResult};
 use quip_proto::v1::RejectReason;
 use sampler::SampleError;
 use std::collections::BTreeMap;
@@ -128,8 +128,9 @@ impl Sampler for CudaSampler {
         &self,
         jobs: tokio::sync::mpsc::Receiver<StreamJob>,
         out: tokio::sync::mpsc::Sender<StreamResult>,
+        cancel: CancelGuard,
     ) {
-        streaming::run_stream(&self.device, self.algorithm, jobs, out);
+        streaming::run_stream(&self.device, self.algorithm, jobs, out, cancel);
     }
 
     fn stream_width(&self) -> usize {
