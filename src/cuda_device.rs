@@ -2,6 +2,7 @@
 //!
 //! One process owns one device (`[cuda.N]` → device N / miner id `cuda-N`).
 
+use crate::jit_cache;
 use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
@@ -194,16 +195,27 @@ impl CudaDevice {
         )
         .map_err(|_| CudaError::Driver("CUDA reported a negative SM count".into()))?;
 
-        let (sa_ptx, gibbs_ptx) = {
+        // Cache key components: GPU arch + driver/NVRTC version. The compiled
+        // PTX is topology-independent, so these plus the source text fully
+        // determine a cache entry (see `jit_cache`).
+        let cc_major =
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+        let cc_minor =
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let arch = format!("sm_{cc_major}{cc_minor}");
+        let driver_ver = driver_version()?;
+
+        let (sa_mod, gibbs_mod) = {
             let _span = trace_span!("jit", kernels = 2).entered();
             (
-                compile_with_fallback(SA_SRC)?,
-                compile_with_fallback(GIBBS_SRC)?,
+                jit_cache::load_or_compile(&ctx, "sa", SA_SRC, &arch, driver_ver, || {
+                    compile_with_fallback(SA_SRC)
+                })?,
+                jit_cache::load_or_compile(&ctx, "gibbs", GIBBS_SRC, &arch, driver_ver, || {
+                    compile_with_fallback(GIBBS_SRC)
+                })?,
             )
         };
-
-        let sa_mod = ctx.load_module(sa_ptx)?;
-        let gibbs_mod = ctx.load_module(gibbs_ptx)?;
 
         let sa = sa_mod.load_function("cuda_sa_self_feeding")?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;

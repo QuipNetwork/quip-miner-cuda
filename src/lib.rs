@@ -16,6 +16,7 @@
 pub mod bench;
 pub mod corpus;
 pub mod cuda_device;
+mod jit_cache;
 pub mod nsight;
 pub mod nvml_gov;
 pub mod sampler;
