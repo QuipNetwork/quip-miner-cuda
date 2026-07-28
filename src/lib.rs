@@ -14,6 +14,7 @@
 //! loop lives in `quip-miner-core`.
 
 pub mod bench;
+pub mod corpus;
 pub mod cuda_device;
 pub mod nsight;
 pub mod nvml_gov;

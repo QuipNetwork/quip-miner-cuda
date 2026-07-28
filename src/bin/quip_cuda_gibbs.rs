@@ -70,7 +70,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{Cli, Command};
+    use super::{BenchAction, Cli, Command};
     use clap::Parser;
 
     #[test]
@@ -110,5 +110,51 @@ mod cli_tests {
             "/tmp/folded.jsonl",
         ]);
         assert!(matches!(cli.command, Some(Command::Bench(_))));
+    }
+
+    #[test]
+    fn parses_bench_run_with_source_topology_and_limit() {
+        let cli = Cli::parse_from([
+            "quip-cuda-gibbs",
+            "bench",
+            "run",
+            "--source",
+            "/tmp/corpus.jsonl",
+            "--topology",
+            "/tmp/spec.json",
+            "--limit",
+            "2",
+            "--out",
+            "/tmp/x",
+        ]);
+        let Some(Command::Bench(BenchAction::Run(args))) = cli.command else {
+            panic!("expected a parsed `bench run`");
+        };
+        assert_eq!(
+            args.source.as_deref(),
+            Some(std::path::Path::new("/tmp/corpus.jsonl"))
+        );
+        assert_eq!(
+            args.topology.as_deref(),
+            Some(std::path::Path::new("/tmp/spec.json"))
+        );
+        assert_eq!(args.limit, Some(2));
+    }
+
+    #[test]
+    fn bench_run_source_without_topology_fails_to_parse() {
+        let result = Cli::try_parse_from([
+            "quip-cuda-gibbs",
+            "bench",
+            "run",
+            "--source",
+            "/tmp/corpus.jsonl",
+            "--out",
+            "/tmp/x",
+        ]);
+        assert!(
+            result.is_err(),
+            "clap `requires` must reject --source without --topology"
+        );
     }
 }

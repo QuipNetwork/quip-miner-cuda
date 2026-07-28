@@ -38,6 +38,7 @@
 //!     --out out/cuda-sa_n512_s1024.folded.jsonl
 //! ```
 
+use crate::corpus;
 use crate::cuda_device::CudaDevice;
 use crate::nsight;
 use crate::schema::{BenchRecord, Part, Scope, Source};
@@ -84,10 +85,23 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 4)]
     pub sweeps_per_beta: u64,
     /// Node count of the synthetic ring problem (`h=0`, `j=1`, ring edges).
-    /// A corpus-backed run is sub-project C's responsibility (it redraws
-    /// `(h, J)` from a nonce and passes the graph elsewhere).
+    /// Ignored when `--source` is given (the real corpus topology's node
+    /// count is used instead). Useful on its own for micro checks.
     #[arg(long, default_value_t = 64)]
     pub nodes: u64,
+    /// Corpus JSONL to bench real models (one `{"nonce":"<64hex>", ...}`
+    /// line per model, unknown fields ignored); requires `--topology`.
+    /// Redraws each nonce's real `(h, J)` and benches that graph instead of
+    /// the synthetic ring.
+    #[arg(long, requires = "topology")]
+    pub source: Option<PathBuf>,
+    /// Topology spec (`{nodes, edges, allowed_h_milli, allowed_j_milli}`)
+    /// matching `--source`'s corpus; required together with `--source`.
+    #[arg(long, requires = "source")]
+    pub topology: Option<PathBuf>,
+    /// Cap the number of `--source` corpus records benched.
+    #[arg(long)]
+    pub limit: Option<usize>,
     /// Measured repeats per grid cell.
     #[arg(long, default_value_t = 5)]
     pub repeats: u64,
@@ -153,6 +167,9 @@ pub enum BenchError {
     /// Nsight report parse/fold failure (see [`crate::nsight`]).
     #[error("bench fold: {0}")]
     Fold(String),
+    /// `--source`/`--topology` corpus load or redraw failure (see [`crate::corpus`]).
+    #[error("bench corpus: {0}")]
+    Corpus(String),
 }
 
 /// One point in the bench config grid.
@@ -274,9 +291,9 @@ pub fn assemble_record(
 }
 
 /// A deterministic synthetic ring Ising problem (`h=0`, `j=1`, ring edges),
-/// used when `bench run` is not given a corpus model. Sub-project C's driver
-/// is responsible for redrawing a corpus model's `(h, J)` from its nonce and
-/// benching that graph instead.
+/// used when `bench run` is not given `--source`/`--topology`. Not
+/// timing-representative of the real corpus topology (degree 2 vs. ~18) —
+/// useful for micro checks only.
 #[allow(clippy::cast_possible_truncation)] // n bounded well under u32::MAX by CLI/kernel limits
 fn ring_graph(n: u64) -> IsingGraph {
     let n = n as usize;
@@ -284,6 +301,61 @@ fn ring_graph(n: u64) -> IsingGraph {
     let j = vec![1.0; n];
     let edges = (0..n).map(|i| (i, (i + 1) % n.max(1))).collect();
     IsingGraph::new(h, j, edges)
+}
+
+/// One graph to bench in the grid: either the synthetic ring problem or a
+/// `--source` corpus record redrawn from its nonce. All models in one `bench
+/// run` invocation share a topology (the synthetic ring's `--nodes`, or
+/// `--topology`'s node/edge set), so [`run_cell`] can name its output file
+/// from the first model alone.
+struct BenchModel {
+    /// The graph to bench.
+    graph: IsingGraph,
+    /// Passed through into the emitted [`BenchRecord::nonce`].
+    nonce: String,
+    /// Passed through into the emitted [`BenchRecord::topology_hash`].
+    topology_hash: String,
+}
+
+impl BenchModel {
+    /// The synthetic ring model, tagged with `--nonce`/`--topology-hash`
+    /// metadata passthrough (synthetic problems have no real identity).
+    fn synthetic(args: &RunArgs) -> Self {
+        Self {
+            graph: ring_graph(args.nodes),
+            nonce: args.nonce.clone().unwrap_or_else(|| "0x0".to_owned()),
+            topology_hash: args
+                .topology_hash
+                .clone()
+                .unwrap_or_else(|| "0x0".to_owned()),
+        }
+    }
+}
+
+/// Build the bench grid's models: a `--source` corpus (redrawn per nonce
+/// against `--topology`) when given, else the single synthetic ring problem.
+fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
+    let Some(source) = &args.source else {
+        return Ok(vec![BenchModel::synthetic(args)]);
+    };
+    // clap's `requires` makes this infallible from the CLI, but stay
+    // defensive against direct `RunArgs` construction (e.g. from tests).
+    let topology = args
+        .topology
+        .as_ref()
+        .ok_or_else(|| BenchError::Corpus("--source requires --topology".to_owned()))?;
+    let spec =
+        corpus::load_topology_spec(topology).map_err(|e| BenchError::Corpus(e.to_string()))?;
+    let records = corpus::load_corpus(source, &spec, args.limit)
+        .map_err(|e| BenchError::Corpus(e.to_string()))?;
+    Ok(records
+        .into_iter()
+        .map(|(record, graph)| BenchModel {
+            graph,
+            nonce: record.nonce,
+            topology_hash: record.topology_hash,
+        })
+        .collect())
 }
 
 fn backend_name(algorithm: Algorithm) -> &'static str {
@@ -359,7 +431,8 @@ struct BenchContext<'a> {
 ///
 /// [`BenchError::Device`] if the device fails to open or a `bench_one` call
 /// fails; [`BenchError::Io`] for any output file/directory failure;
-/// [`BenchError::Fold`] if a Nsight report fails to parse.
+/// [`BenchError::Fold`] if a Nsight report fails to parse; [`BenchError::Corpus`]
+/// if `--source`/`--topology` fail to load or a nonce fails to redraw.
 pub fn run_bench(
     device_index: usize,
     algorithm: Algorithm,
@@ -378,6 +451,7 @@ fn run_run(device_index: usize, algorithm: Algorithm, args: &RunArgs) -> Result<
     } else {
         args.sweeps.clone()
     };
+    let models = load_models(args)?;
 
     let (agg_layer, totals) = SpanAggregator::new();
     let flame = args
@@ -410,7 +484,7 @@ fn run_run(device_index: usize, algorithm: Algorithm, args: &RunArgs) -> Result<
             totals,
         };
         for &num_sweeps in &sweeps {
-            run_cell(&ctx, args, num_sweeps, &mut jit_ns)?;
+            run_cell(&ctx, args, num_sweeps, &models, &mut jit_ns)?;
         }
         Ok(())
     })?;
@@ -421,16 +495,44 @@ fn run_run(device_index: usize, algorithm: Algorithm, args: &RunArgs) -> Result<
     Ok(())
 }
 
-/// Warm up, then measure `args.repeats` isolated single-shot runs at one
-/// `(nodes, num_sweeps)` grid cell, appending one JSON line per measured
-/// repeat to `<out>/<backend>_n<nodes>_s<num_sweeps>.jsonl`.
+/// Run every model at one `num_sweeps` grid cell, appending one JSON line
+/// per (model, measured repeat) to a single
+/// `<out>/<backend>_n<nodes>_s<num_sweeps>.jsonl` file. `nodes` is read off
+/// the first model: every model in a `bench run` invocation shares one
+/// topology (the synthetic ring's `--nodes`, or `--topology`'s node set).
 fn run_cell(
     ctx: &BenchContext<'_>,
     args: &RunArgs,
     num_sweeps: u64,
+    models: &[BenchModel],
     jit_ns: &mut Option<u64>,
 ) -> Result<(), BenchError> {
-    let graph = ring_graph(args.nodes);
+    let nodes = models
+        .first()
+        .and_then(|m| u64::try_from(m.graph.num_nodes()).ok())
+        .unwrap_or(args.nodes);
+    let path = args
+        .out
+        .join(format!("{}_n{nodes}_s{num_sweeps}.jsonl", ctx.backend));
+    let mut file = File::create(&path).map_err(|e| BenchError::Io(e.to_string()))?;
+    for model in models {
+        run_model(ctx, args, num_sweeps, model, &mut file, jit_ns)?;
+    }
+    Ok(())
+}
+
+/// Warm up, then measure `args.repeats` isolated single-shot runs of one
+/// model at one `num_sweeps` grid cell, appending each measured repeat's
+/// JSON line to `file`.
+fn run_model(
+    ctx: &BenchContext<'_>,
+    args: &RunArgs,
+    num_sweeps: u64,
+    model: &BenchModel,
+    file: &mut File,
+    jit_ns: &mut Option<u64>,
+) -> Result<(), BenchError> {
+    let graph = &model.graph;
     let params = SampleParams {
         num_reads: usize::try_from(args.reads).unwrap_or(usize::MAX),
         num_sweeps: usize::try_from(num_sweeps).unwrap_or(usize::MAX),
@@ -438,7 +540,7 @@ fn run_cell(
         ..SampleParams::default()
     };
     let (beta, sweeps_per_beta) = crate::streaming::build_beta_schedule(
-        &graph,
+        graph,
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
@@ -448,24 +550,14 @@ fn run_cell(
         num_sweeps,
         sweeps_per_beta: u64::try_from(sweeps_per_beta).unwrap_or(1),
         num_betas: u64::try_from(beta.len()).unwrap_or(1),
-        nodes: args.nodes,
+        nodes: u64::try_from(graph.num_nodes()).unwrap_or(args.nodes),
         edges: u64::try_from(graph.edges.len()).unwrap_or(0),
     };
-    let path = args.out.join(format!(
-        "{}_n{}_s{num_sweeps}.jsonl",
-        ctx.backend, args.nodes
-    ));
-    let mut file = File::create(&path).map_err(|e| BenchError::Io(e.to_string()))?;
-    let nonce = args.nonce.clone().unwrap_or_else(|| "0x0".to_owned());
-    let topology_hash = args
-        .topology_hash
-        .clone()
-        .unwrap_or_else(|| "0x0".to_owned());
 
     for i in 0..(args.warmup + args.repeats) {
         take_cell(&ctx.totals); // clear stale totals before the measured call
         let model_start = Instant::now();
-        let (_reads, dev) = bench_one(ctx.device, &graph, &params, ctx.algorithm)
+        let (_reads, dev) = bench_one(ctx.device, graph, &params, ctx.algorithm)
             .map_err(|e| BenchError::Device(e.to_string()))?;
         let model_total_ns = u64::try_from(model_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let spans = take_cell(&ctx.totals);
@@ -481,8 +573,8 @@ fn run_cell(
         let record = assemble_record(
             ctx.backend,
             &ctx.device_name,
-            &nonce,
-            &topology_hash,
+            &model.nonce,
+            &model.topology_hash,
             &cfg,
             &dev,
             &host,
