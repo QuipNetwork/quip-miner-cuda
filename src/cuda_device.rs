@@ -8,6 +8,7 @@ use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::trace_span;
 
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
@@ -193,8 +194,13 @@ impl CudaDevice {
         )
         .map_err(|_| CudaError::Driver("CUDA reported a negative SM count".into()))?;
 
-        let sa_ptx = compile_with_fallback(SA_SRC)?;
-        let gibbs_ptx = compile_with_fallback(GIBBS_SRC)?;
+        let (sa_ptx, gibbs_ptx) = {
+            let _span = trace_span!("jit", kernels = 2).entered();
+            (
+                compile_with_fallback(SA_SRC)?,
+                compile_with_fallback(GIBBS_SRC)?,
+            )
+        };
 
         let sa_mod = ctx.load_module(sa_ptx)?;
         let gibbs_mod = ctx.load_module(gibbs_ptx)?;
@@ -253,6 +259,16 @@ impl CudaDevice {
         // The probe is the open itself; the device is dropped straight away.
         drop(Self::open(device_index)?);
         Ok(())
+    }
+
+    /// The GPU's marketing name (e.g. "NVIDIA H100 80GB HBM3"), for the
+    /// `bench` subcommand's `BenchRecord.device` field.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Driver`] if the driver cannot report the device name.
+    pub fn name(&self) -> Result<String, CudaError> {
+        Ok(self.ctx.name()?)
     }
 }
 

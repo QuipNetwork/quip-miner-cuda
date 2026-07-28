@@ -18,7 +18,8 @@
 use crate::cuda_device::CudaDevice;
 use crate::sampler::SampleError;
 use crate::topology::{fill_h_j, SelfFeedingTopology};
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::sys::CUevent_flags;
+use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 use quip_miner_core::{
     Algorithm, CancelGuard, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome,
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tracing::trace_span;
 
 const CTRL_STRIDE: usize = 8;
 const CTRL_EXIT_NOW: usize = 6;
@@ -135,6 +137,7 @@ pub(crate) fn build_beta_schedule(
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
 ) -> (Vec<f32>, usize) {
+    let _span = trace_span!("beta_build", num_sweeps).entered();
     let sweeps_per = sweeps_per_beta.max(1);
     let num_betas = (num_sweeps / sweeps_per).max(1);
     let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
@@ -146,6 +149,7 @@ pub(crate) fn build_beta_schedule(
 }
 
 pub(crate) fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
+    let _span = trace_span!("energy_score", n = graph.h.len()).entered();
     let energy = energy_milli(spins, &graph.h, &graph.j, &graph.edges);
     SamplerResult {
         spins: spins.to_vec(),
@@ -298,6 +302,7 @@ impl<'a> SelfFeedingSession<'a> {
         reads_per_nonce: usize,
         max_num_betas: usize,
     ) -> Result<Self, SampleError> {
+        let _span = trace_span!("problem_setup", n = topology.n, nnz = topology.nnz).entered();
         let limits = algo_limits(algorithm);
         let n = topology.n;
         // Defense in depth: `CUDA_SA_IDENTITY`/`CUDA_GIBBS_IDENTITY.max_nodes`
@@ -399,6 +404,7 @@ impl<'a> SelfFeedingSession<'a> {
     }
 
     fn upload_beta_schedule(&mut self, sched: &[f32]) -> Result<(), SampleError> {
+        let _span = trace_span!("upload", kind = "beta").entered();
         if sched.is_empty() {
             return Ok(());
         }
@@ -416,6 +422,7 @@ impl<'a> SelfFeedingSession<'a> {
         slot_id: usize,
         graph: &IsingGraph,
     ) -> Result<(), SampleError> {
+        let _span = trace_span!("upload", kind = "slot", nonce_id, slot_id).entered();
         let slot_idx = nonce_id * usize::from(SLOTS_PER_NONCE) + slot_id;
         let nnz = self.topology.nnz;
         let n = self.topology.n;
@@ -474,6 +481,7 @@ impl<'a> SelfFeedingSession<'a> {
 
     /// Download and unpack one COMPLETE slot's samples into per-read spins.
     fn download_slot(&self, nonce_id: usize, slot_id: usize) -> Result<Vec<Vec<i8>>, SampleError> {
+        let _span = trace_span!("download", nonce_id, slot_id).entered();
         let slot_idx = nonce_id * usize::from(SLOTS_PER_NONCE) + slot_id;
         let sample_start = slot_idx * self.reads_per_nonce * self.max_packed_size;
         let sample_len = self.reads_per_nonce * self.max_packed_size;
@@ -502,6 +510,7 @@ impl<'a> SelfFeedingSession<'a> {
         sweeps_per_beta: usize,
         seed: u32,
     ) -> Result<(), SampleError> {
+        let _span = trace_span!("launch", active_nonces).entered();
         self.active_nonces = active_nonces;
         let limits = algo_limits(self.algorithm);
         let blocks = active_nonces * limits.sms_per_nonce;
@@ -616,6 +625,17 @@ impl<'a> SelfFeedingSession<'a> {
             }
         }
         self.launched = true;
+        Ok(())
+    }
+
+    /// Pre-arm one nonce's `CTRL_EXIT_NOW` before launch, so the kernel
+    /// processes exactly one model and returns instead of spinning for the
+    /// next slot. Used only by the isolated bench path ([`bench_one`]); the
+    /// streaming path arms exit at teardown via [`Self::signal_exit`].
+    fn set_exit_now(&mut self, nonce_id: usize) -> Result<(), SampleError> {
+        let off = nonce_id * CTRL_STRIDE + CTRL_EXIT_NOW;
+        self.stream_transfer
+            .memcpy_htod(&[1i32], &mut self.d_ctrl.slice_mut(off..=off))?;
         Ok(())
     }
 
@@ -806,6 +826,157 @@ pub fn sample_one(
         .take(params.num_reads.max(1))
         .map(|spins| score_spins(&spins, graph))
         .collect())
+}
+
+/// Device-facing durations measured for one isolated single-shot bench run.
+///
+/// `kernel_ns` is the pure single-model launch time from a `CudaEvent` pair on
+/// the compute stream (no persistent-kernel spin — the exit flag is pre-set).
+/// `upload_ns`/`download_ns` are event-bracketed transfers on the transfer
+/// stream (true transfer time, not host enqueue — async device work needs an
+/// event pair rather than a bare `Instant`, since a `memcpy_htod`/`clone_dtoh`
+/// call only enqueues work and returns immediately). `poll_wait_ns` is host
+/// wall spent polling the ctrl mailbox for completion.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceTimings {
+    /// Single-model kernel execution time (ns), CUDA-event measured.
+    pub kernel_ns: u64,
+    /// `h`/`J`/ctrl upload time (ns), event-bracketed on the transfer stream.
+    pub upload_ns: u64,
+    /// Sample download time (ns), event-bracketed on the transfer stream.
+    pub download_ns: u64,
+    /// Host wall (ns) spent polling ctrl for `SLOT_COMPLETE`.
+    pub poll_wait_ns: u64,
+}
+
+/// Milliseconds (cudarc's `elapsed_ms`) → nanoseconds, saturating.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ms_to_ns(ms: f32) -> u64 {
+    (f64::from(ms.max(0.0)) * 1.0e6) as u64
+}
+
+/// Create a timing-enabled CUDA event on `device`'s context.
+///
+/// `CU_EVENT_DEFAULT` (value 0) keeps timing enabled; `new_event(None)`
+/// defaults to `CU_EVENT_DISABLE_TIMING`, which cannot feed `elapsed_ms`.
+fn timing_event(device: &CudaDevice) -> Result<CudaEvent, SampleError> {
+    Ok(device
+        .ctx
+        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?)
+}
+
+/// Poll `sess`'s slot-0 ctrl mailbox until `SLOT_COMPLETE`, returning the host
+/// wall time spent waiting. Extracted from [`bench_one`] to keep it under the
+/// crate's complexity cap.
+fn poll_until_complete(
+    sess: &SelfFeedingSession<'_>,
+    deadline: Instant,
+) -> Result<u64, SampleError> {
+    let poll_start = Instant::now();
+    loop {
+        if sess.poll_ctrl()?[0] == SLOT_COMPLETE {
+            return Ok(u64::try_from(poll_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+        if Instant::now() > deadline {
+            return Err(SampleError::KernelTimeout);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Run ONE model through an isolated, non-persistent single-shot launch and
+/// return its scored reads plus CUDA-event device timings.
+///
+/// Unlike [`sample_one`], this pre-arms `CTRL_EXIT_NOW` before launch so the
+/// kernel anneals exactly one model and returns with no persistent spin,
+/// making the launch a discrete instance `nsys`/`ncu` attribute cleanly.
+/// Reuses both `.cu` kernels unchanged — no device code is added.
+///
+/// # Errors
+///
+/// Same set as [`sample_one`]: [`SampleError::GraphTooLarge`] for an oversized
+/// graph, [`SampleError::KernelTimeout`] if the slot never completes within
+/// the deadline, and [`SampleError::Cuda`]/[`SampleError::Driver`] for any
+/// driver fault while building the session, creating events, uploading,
+/// launching, polling, or downloading.
+pub fn bench_one(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    algorithm: Algorithm,
+) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
+    let n = graph.num_nodes();
+    if n == 0 {
+        let reads = params.num_reads.max(1);
+        let empty = (0..reads)
+            .map(|_| SamplerResult {
+                spins: vec![],
+                energy_milli: 0,
+            })
+            .collect();
+        return Ok((empty, DeviceTimings::default()));
+    }
+    let limits = algo_limits(algorithm);
+    let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
+    let (beta, sweeps_per_beta) = build_beta_schedule(
+        graph,
+        params.num_sweeps,
+        params.sweeps_per_beta,
+        params.beta_range,
+    );
+    let topology = SelfFeedingTopology::build(graph);
+    let mut sess =
+        SelfFeedingSession::build(device, algorithm, topology, 1, reads_per_nonce, beta.len())?;
+
+    // --- Timed upload (beta + slot 0 + exit flag) on the transfer stream. ---
+    let up0 = timing_event(device)?;
+    let up1 = timing_event(device)?;
+    up0.record(&sess.stream_transfer)?;
+    sess.upload_beta_schedule(&beta)?;
+    sess.upload_slot(0, 0, graph)?;
+    sess.set_exit_now(0)?;
+    up1.record(&sess.stream_transfer)?;
+    sess.stream_transfer.synchronize()?; // commit setup before timing the launch
+    let upload_ns = ms_to_ns(up0.elapsed_ms(&up1)?);
+
+    // --- Timed launch on the compute stream (one model, then kernel returns). ---
+    let k0 = timing_event(device)?;
+    let k1 = timing_event(device)?;
+    let seed = seed_low_u32(params.seed).wrapping_add(1);
+    k0.record(&sess.stream_compute)?;
+    sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
+    k1.record(&sess.stream_compute)?;
+
+    // --- Poll to completion (host wall), then timed download. ---
+    let deadline = Instant::now() + Duration::from_mins(2);
+    let poll_wait_ns = poll_until_complete(&sess, deadline)?;
+    let kernel_ns = ms_to_ns(k0.elapsed_ms(&k1)?);
+
+    let dl0 = timing_event(device)?;
+    let dl1 = timing_event(device)?;
+    dl0.record(&sess.stream_transfer)?;
+    let reads = sess.download_slot(0, 0)?;
+    dl1.record(&sess.stream_transfer)?;
+    sess.stream_transfer.synchronize()?;
+    let download_ns = ms_to_ns(dl0.elapsed_ms(&dl1)?);
+
+    sess.signal_exit()?;
+    sess.wait_exit()?;
+
+    let scored = reads
+        .into_iter()
+        .take(params.num_reads.max(1))
+        .map(|spins| score_spins(&spins, graph))
+        .collect();
+    Ok((
+        scored,
+        DeviceTimings {
+            kernel_ns,
+            upload_ns,
+            download_ns,
+            poll_wait_ns,
+        },
+    ))
 }
 
 /// The job a nonce is currently annealing, the device slot holding it, and
@@ -1440,6 +1611,20 @@ mod tests {
             params: SampleParams::default(),
             generation: 0,
         }
+    }
+
+    /// Behavior test: the `energy_score` span added around `score_spins` is
+    /// an implementation detail (folded by `tracing-flame` in the `bench`
+    /// path), so this only checks it does not alter the observable result.
+    #[test]
+    fn score_spins_span_does_not_change_result() {
+        let graph = IsingGraph::new(vec![1.0, -1.0], vec![1.0], vec![(0, 1)]);
+        let r = score_spins(&[1i8, -1], &graph);
+        assert_eq!(r.spins, vec![1i8, -1]);
+        assert_eq!(
+            r.energy_milli,
+            energy_milli(&[1i8, -1], &graph.h, &graph.j, &graph.edges)
+        );
     }
 
     #[test]

@@ -13,9 +13,12 @@
 //! its internal annealing accept/reject decisions. The coordinator session
 //! loop lives in `quip-miner-core`.
 
+pub mod bench;
 pub mod cuda_device;
+pub mod nsight;
 pub mod nvml_gov;
 pub mod sampler;
+pub mod schema;
 pub mod streaming;
 pub mod topology;
 
