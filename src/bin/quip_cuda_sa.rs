@@ -3,8 +3,9 @@
 //! One process per GPU: `--device N` binds CUDA device N and defaults
 //! `--miner-id` to `cuda-N` (matching `[cuda.N]` config sections).
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use quip_miner_core::{run, CommonArgs, OpenError};
+use quip_miner_cuda::bench::{run_bench, BenchAction};
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::nvml_gov::UtilGovernor;
 use quip_miner_cuda::{Algorithm, CudaSampler, CUDA_SA_IDENTITY};
@@ -13,6 +14,8 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[command(flatten)]
     common: CommonArgs,
     /// CUDA device index (one process per GPU). Default 0 → miner id `cuda-0`.
@@ -26,8 +29,27 @@ struct Cli {
     yielding: bool,
 }
 
+/// Top-level subcommands. Absent → the ordinary coordinator-driven miner
+/// session (unchanged behavior).
+#[derive(Subcommand)]
+enum Command {
+    /// Fine-grained per-part timing for one model (isolated single-shot
+    /// launch); see `quip-cuda-sa bench run --help` / `bench fold --help`.
+    #[command(subcommand)]
+    Bench(BenchAction),
+}
+
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
+    if let Some(Command::Bench(action)) = &cli.command {
+        return match run_bench(cli.device, Algorithm::Sa, action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("bench failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("cuda-{}", cli.device));
     }
@@ -44,4 +66,49 @@ fn main() -> ExitCode {
         let gov = UtilGovernor::start(nvml_index, cli.utilization, cli.yielding);
         Ok(CudaSampler::new(device, gov, Algorithm::Sa))
     })
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn parses_plain_session_invocation() {
+        let cli = Cli::parse_from(["quip-cuda-sa", "--device", "1"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.device, 1);
+    }
+
+    #[test]
+    fn parses_bench_run_subcommand() {
+        let cli = Cli::parse_from([
+            "quip-cuda-sa",
+            "bench",
+            "run",
+            "--nodes",
+            "64",
+            "--sweeps",
+            "1024",
+            "--out",
+            "/tmp/x",
+        ]);
+        assert!(matches!(cli.command, Some(Command::Bench(_))));
+    }
+
+    #[test]
+    fn parses_bench_fold_subcommand() {
+        let cli = Cli::parse_from([
+            "quip-cuda-sa",
+            "bench",
+            "fold",
+            "--host-json",
+            "/tmp/host.jsonl",
+            "--nsys-kern-sum",
+            "/tmp/kern.csv",
+            "--out",
+            "/tmp/folded.jsonl",
+        ]);
+        assert!(matches!(cli.command, Some(Command::Bench(_))));
+    }
 }
