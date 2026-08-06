@@ -63,27 +63,43 @@ const CUDA_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt::
     reads_solution_floor_factor: 0,
 };
 
-/// Backend identity for `quip-cuda-sa`. `max_nodes` is the self-feeding SA
-/// kernel's hard limit (`unpacked_state[5000]` thread-local array in
-/// `kernels/sa.cu`) — a job over this would overrun kernel-local storage,
-/// not just run slowly, so it must reject `TooLarge` rather than clamp.
-pub const CUDA_SA_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cuda",
-    algorithm: "sa",
-    max_nodes: 5000,
-    max_edges: DEFAULT_MAX_EDGES,
-    adapt: CUDA_ADAPT,
-};
+/// Narrow a resolved capacity to the wire type.
+///
+/// Saturating is safe: every value reaching here has passed
+/// [`capacity::resolve`], which bounds it by the algorithm ceiling or the
+/// device shared-memory budget — both orders of magnitude below `u32::MAX`.
+fn identity_max_nodes(max_nodes: usize) -> u32 {
+    u32::try_from(max_nodes).unwrap_or(u32::MAX)
+}
 
-/// Backend identity for `quip-cuda-gibbs`. `max_nodes` is the self-feeding
-/// Gibbs kernel's hard limit (`shared_state[4800]` in `kernels/gibbs.cu`).
-pub const CUDA_GIBBS_IDENTITY: BackendIdentity = BackendIdentity {
-    backend: "cuda",
-    algorithm: "gibbs",
-    max_nodes: 4800,
-    max_edges: DEFAULT_MAX_EDGES,
-    adapt: CUDA_ADAPT,
-};
+/// Backend identity for `quip-cuda-sa` at a resolved capacity. `max_nodes` is
+/// the self-feeding SA kernel's `unpacked_state` size (thread-local array in
+/// `kernels/sa.cu`) — a job over this would overrun kernel-local storage, not
+/// just run slowly, so it must reject `TooLarge` rather than clamp.
+#[must_use]
+pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
+    BackendIdentity {
+        backend: "cuda",
+        algorithm: "sa",
+        max_nodes: identity_max_nodes(max_nodes),
+        max_edges: DEFAULT_MAX_EDGES,
+        adapt: CUDA_ADAPT,
+    }
+}
+
+/// Backend identity for `quip-cuda-gibbs` at a resolved capacity. `max_nodes`
+/// is the self-feeding Gibbs kernel's `shared_state` size in
+/// `kernels/gibbs.cu`.
+#[must_use]
+pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
+    BackendIdentity {
+        backend: "cuda",
+        algorithm: "gibbs",
+        max_nodes: identity_max_nodes(max_nodes),
+        max_edges: DEFAULT_MAX_EDGES,
+        adapt: CUDA_ADAPT,
+    }
+}
 
 /// CUDA sampler backend: one GPU device plus an NVML utilization governor.
 #[derive(Debug)]

@@ -436,15 +436,21 @@ struct BenchContext<'a> {
 pub fn run_bench(
     device_index: usize,
     algorithm: Algorithm,
+    max_nodes: usize,
     action: &BenchAction,
 ) -> Result<(), BenchError> {
     match action {
-        BenchAction::Run(args) => run_run(device_index, algorithm, args),
+        BenchAction::Run(args) => run_run(device_index, algorithm, max_nodes, args),
         BenchAction::Fold(args) => run_fold(args),
     }
 }
 
-fn run_run(device_index: usize, algorithm: Algorithm, args: &RunArgs) -> Result<(), BenchError> {
+fn run_run(
+    device_index: usize,
+    algorithm: Algorithm,
+    max_nodes: usize,
+    args: &RunArgs,
+) -> Result<(), BenchError> {
     std::fs::create_dir_all(&args.out).map_err(|e| BenchError::Io(e.to_string()))?;
     let sweeps: Vec<u64> = if args.sweeps.is_empty() {
         vec![1024]
@@ -468,8 +474,11 @@ fn run_run(device_index: usize, algorithm: Algorithm, args: &RunArgs) -> Result<
         .with(flame_layer);
 
     tracing::subscriber::with_default(subscriber, || -> Result<(), BenchError> {
-        let device =
-            CudaDevice::open(device_index).map_err(|e| BenchError::Device(e.to_string()))?;
+        // Open for the algorithm actually being benched, at the requested
+        // capacity: the defaulting `open` would compile SA at 5000 and reject
+        // any larger graph regardless of which binary is running.
+        let device = CudaDevice::open_with_nodes(device_index, algorithm, max_nodes)
+            .map_err(|e| BenchError::Device(e.to_string()))?;
         let device_name = device
             .name()
             .unwrap_or_else(|_| format!("cuda-{device_index}"));

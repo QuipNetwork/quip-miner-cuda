@@ -69,8 +69,6 @@ fn seed_low_u32(seed: u64) -> u32 {
 struct AlgoLimits {
     /// CUDA blocks (SMs) launched per nonce.
     sms_per_nonce: usize,
-    /// Largest `N` the kernel's fixed-size per-thread/shared state supports.
-    max_nodes: usize,
     /// Largest reads-per-nonce this driver allocates for.
     max_reads: usize,
 }
@@ -78,27 +76,28 @@ struct AlgoLimits {
 fn algo_limits(algorithm: Algorithm) -> AlgoLimits {
     match algorithm {
         // 1 block (1 SM) per nonce; `if (tid < num_reads)` in a 256-thread
-        // block hard-caps reads/nonce; `unpacked_state[5000]` caps N.
+        // block hard-caps reads/nonce. N is capped by the kernel's
+        // `unpacked_state[QUIP_MAX_NODES]`, which is resolved per process and
+        // carried on `CudaDevice::max_nodes` rather than fixed here.
         Algorithm::Sa => AlgoLimits {
             sms_per_nonce: 1,
-            max_nodes: 5000,
             max_reads: 256,
         },
-        // `shared_state[4800]` caps N. reads/nonce isn't block-capped (work
-        // is chunked across `sms_per_nonce` blocks) but is held to the same
-        // 256 for a uniform, generous device-memory bound.
+        // reads/nonce isn't block-capped (work is chunked across
+        // `sms_per_nonce` blocks) but is held to the same 256 for a uniform,
+        // generous device-memory bound. N is capped by
+        // `shared_state[QUIP_MAX_NODES]`, see above.
         Algorithm::Gibbs => AlgoLimits {
             sms_per_nonce: 4,
-            max_nodes: 4800,
             max_reads: 256,
         },
     }
 }
 
-/// Backend-facing read cap for `Sampler::max_reads`. `max_nodes` is instead
-/// hardcoded directly on [`crate::CUDA_SA_IDENTITY`] /
-/// [`crate::CUDA_GIBBS_IDENTITY`] (kept next to `algo_limits` in spirit —
-/// `BackendIdentity` is a `const`, so it can't call a non-`const fn` here).
+/// Backend-facing read cap for `Sampler::max_reads`. `max_nodes` is not here:
+/// it is resolved per process from `--max-nodes` and the device, then carried
+/// on [`crate::cuda_device::CudaDevice::max_nodes`] and reported through
+/// [`crate::cuda_sa_identity`] / [`crate::cuda_gibbs_identity`].
 ///
 /// # Examples
 ///
@@ -303,17 +302,16 @@ impl<'a> SelfFeedingSession<'a> {
         max_num_betas: usize,
     ) -> Result<Self, SampleError> {
         let _span = trace_span!("problem_setup", n = topology.n, nnz = topology.nnz).entered();
-        let limits = algo_limits(algorithm);
         let n = topology.n;
-        // Defense in depth: `CUDA_SA_IDENTITY`/`CUDA_GIBBS_IDENTITY.max_nodes`
-        // already reject an oversized job in `job.rs` before it reaches the
-        // sampler; this catches any future drift between those consts and
-        // the kernel's actual fixed-size array bounds before it becomes a
-        // kernel-side buffer overrun instead of a clean error.
-        if n > limits.max_nodes {
+        // Defense in depth: the backend identity's `max_nodes` already rejects
+        // an oversized job in `job.rs` before it reaches the sampler. This
+        // catches any future drift between what the identity advertises and
+        // the capacity the kernel was actually compiled for, before it becomes
+        // a kernel-side buffer overrun instead of a clean error.
+        if n > device.max_nodes {
             return Err(SampleError::GraphTooLarge {
                 n,
-                limit: limits.max_nodes,
+                limit: device.max_nodes,
             });
         }
         let nnz_alloc = topology.nnz.max(1);
@@ -1836,16 +1834,15 @@ mod tests {
 
     #[test]
     fn algo_limits_match_the_kernels_fixed_size_arrays() {
-        // SA: one block per nonce, `unpacked_state[5000]`.
+        // SA: one block per nonce. N is bounded by the resolved capacity on
+        // the device, not by this table.
         let sa = algo_limits(Algorithm::Sa);
         assert_eq!(sa.sms_per_nonce, 1);
-        assert_eq!(sa.max_nodes, 5000);
         assert_eq!(sa.max_reads, 256);
 
-        // Gibbs: four blocks per nonce, `shared_state[4800]`.
+        // Gibbs: four blocks per nonce.
         let gibbs = algo_limits(Algorithm::Gibbs);
         assert_eq!(gibbs.sms_per_nonce, 4);
-        assert_eq!(gibbs.max_nodes, 4800);
         assert_eq!(gibbs.max_reads, 256);
     }
 

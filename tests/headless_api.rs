@@ -6,9 +6,10 @@
 //! `stream_width` requires a `&CudaDevice` and cannot run headless — deliberately
 //! not covered here. Run GPU tests with `cargo test -- --ignored` on a GPU host.
 
+use quip_miner_cuda::capacity::{GIBBS_DEFAULT_NODES, SA_DEFAULT_NODES};
 use quip_miner_cuda::streaming::max_reads;
 use quip_miner_cuda::topology::{fill_h_j, SelfFeedingTopology};
-use quip_miner_cuda::{Algorithm, IsingGraph, CUDA_GIBBS_IDENTITY, CUDA_SA_IDENTITY};
+use quip_miner_cuda::{cuda_gibbs_identity, cuda_sa_identity, Algorithm, IsingGraph};
 
 /// Read cap advertised by the streaming driver (kernel block size for SA).
 #[test]
@@ -17,16 +18,25 @@ fn max_reads_is_256_for_sa_and_gibbs() {
     assert_eq!(max_reads(Algorithm::Gibbs), 256);
 }
 
-/// Identity `max_nodes` must mirror the kernel fixed-size limits they reject against.
+/// Identity `max_nodes` must mirror whatever capacity the process resolved,
+/// not a fixed constant, so `--capabilities` never overstates or understates
+/// what the compiled kernel accepts.
 #[test]
-fn cuda_identities_mirror_kernel_node_limits() {
-    assert_eq!(CUDA_SA_IDENTITY.backend, "cuda");
-    assert_eq!(CUDA_SA_IDENTITY.algorithm, "sa");
-    assert_eq!(CUDA_SA_IDENTITY.max_nodes, 5000);
+fn identities_report_the_resolved_capacity() {
+    let sa = cuda_sa_identity(SA_DEFAULT_NODES);
+    assert_eq!(sa.backend, "cuda");
+    assert_eq!(sa.algorithm, "sa");
+    assert_eq!(sa.max_nodes, 5000);
 
-    assert_eq!(CUDA_GIBBS_IDENTITY.backend, "cuda");
-    assert_eq!(CUDA_GIBBS_IDENTITY.algorithm, "gibbs");
-    assert_eq!(CUDA_GIBBS_IDENTITY.max_nodes, 4800);
+    let gibbs = cuda_gibbs_identity(GIBBS_DEFAULT_NODES);
+    assert_eq!(gibbs.backend, "cuda");
+    assert_eq!(gibbs.algorithm, "gibbs");
+    assert_eq!(gibbs.max_nodes, 4800);
+
+    // A raised capacity must show through, or a coordinator would keep
+    // rejecting jobs the kernel can now accept.
+    assert_eq!(cuda_sa_identity(8192).max_nodes, 8192);
+    assert_eq!(cuda_gibbs_identity(32768).max_nodes, 32768);
 }
 
 /// Exercise `SelfFeedingTopology::build` + `fill_h_j` via the public API only.

@@ -62,6 +62,23 @@ pub fn default_nodes(algorithm: Algorithm) -> usize {
     }
 }
 
+/// Capacity to advertise in `--capabilities`, which must answer without
+/// opening the device.
+///
+/// Applies the floor and every bound knowable without a device, so the
+/// advertised value is never larger than what [`resolve`] would accept. SA has
+/// a static ceiling ([`SA_MAX_NODES`]) and is clamped to it. Gibbs is bounded
+/// only by the device's shared memory, so its request passes through and
+/// `open_with_nodes` is what refuses.
+#[must_use]
+pub fn advertised_nodes(algorithm: Algorithm, requested: usize) -> usize {
+    let want = requested.max(default_nodes(algorithm));
+    match algorithm {
+        Algorithm::Sa => want.min(SA_MAX_NODES),
+        Algorithm::Gibbs => want,
+    }
+}
+
 /// Resolve a requested capacity against the algorithm and the device.
 ///
 /// A request below the default is raised to the default. A request above a
@@ -160,5 +177,24 @@ mod tests {
     fn defaults_match_the_shipped_kernel_arrays() {
         assert_eq!(default_nodes(Algorithm::Sa), 5000);
         assert_eq!(default_nodes(Algorithm::Gibbs), 4800);
+    }
+
+    /// `--capabilities` runs without opening the device, so it cannot call
+    /// `resolve`. It must still never advertise a capacity the process would
+    /// refuse to open: a coordinator that believed an over-large `max_nodes`
+    /// would keep sending jobs this miner rejects.
+    #[test]
+    fn advertised_never_exceeds_the_static_algorithm_bound() {
+        assert_eq!(advertised_nodes(Algorithm::Sa, 16384), SA_MAX_NODES);
+        assert_eq!(advertised_nodes(Algorithm::Sa, 5640), 5640);
+        assert_eq!(advertised_nodes(Algorithm::Sa, 64), SA_DEFAULT_NODES);
+    }
+
+    /// Gibbs has no static ceiling — its bound comes from the device — so the
+    /// request passes through and `open_with_nodes` is what refuses.
+    #[test]
+    fn advertised_passes_gibbs_through_above_the_default() {
+        assert_eq!(advertised_nodes(Algorithm::Gibbs, 32768), 32768);
+        assert_eq!(advertised_nodes(Algorithm::Gibbs, 64), GIBBS_DEFAULT_NODES);
     }
 }
