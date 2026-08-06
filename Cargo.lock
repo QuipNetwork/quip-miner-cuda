@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "quip-miner-cuda"
-version = "0.3.0"
+version = "0.3.0-rc2"
 dependencies = [
  "clap",
  "cudarc",
