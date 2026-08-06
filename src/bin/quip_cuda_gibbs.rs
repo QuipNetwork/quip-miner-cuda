@@ -59,6 +59,23 @@ fn main() -> ExitCode {
             }
         };
     }
+    // Install a log sink before anything can fail. `quip-miner-core` reports
+    // every session error, including `--check` failures and a refused node
+    // capacity, through `tracing::error!`, and with no subscriber those
+    // records are dropped: the process exits non-zero having printed nothing.
+    // The bench path above sets its own scoped subscriber, so this stays off
+    // that branch.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.common.log_level));
+    // `try_init` fails only when a subscriber is already installed, which is
+    // not an error here.
+    drop(
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init(),
+    );
+
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("cuda-{}", cli.device));
     }
