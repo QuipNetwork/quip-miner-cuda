@@ -86,10 +86,12 @@ pub fn sa_working_set_bytes(nodes: usize, limits: &DeviceLimits) -> usize {
 
 /// Largest node count whose SA working set fits this device.
 ///
-/// Never returns less than [`SA_DEFAULT_NODES`]: a plain invocation must open
-/// on any device that can run the miner at all, and a starved card should
-/// fail at allocation with the driver's own error rather than be refused a
-/// capacity the shipped kernel has always used.
+/// Video memory is the line. A device too full for even
+/// [`SA_DEFAULT_NODES`] gets a budget below it and [`resolve`] refuses,
+/// naming the request and the budget. Flooring this at the default would
+/// hand that case to the driver instead, and a bare
+/// `CUDA_ERROR_OUT_OF_MEMORY` from inside an allocation says nothing about
+/// which knob to turn.
 #[must_use]
 pub fn sa_budget(limits: &DeviceLimits) -> usize {
     // Bytes per node, from `sa_working_set_bytes` with the packed-state
@@ -102,7 +104,7 @@ pub fn sa_budget(limits: &DeviceLimits) -> usize {
     let by_memory = limits.usable_bytes() / per_node;
     // 9 frame bytes per 8 nodes, inverted against the per-thread cap.
     let by_local_cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
-    by_memory.min(by_local_cap).max(SA_DEFAULT_NODES)
+    by_memory.min(by_local_cap)
 }
 
 /// Shipped `shared_state` size in `kernels/gibbs.cu`, and the floor.
@@ -364,12 +366,35 @@ mod tests {
         );
     }
 
-    /// A card with almost nothing free must still not report a budget below
-    /// the default, or a plain invocation would fail to open.
+    /// Video memory is the line. A card too full for even the default must
+    /// report a budget below it and refuse with our message, rather than be
+    /// floored to the default and hand a bare out-of-memory to the driver.
     #[test]
-    fn sa_budget_never_falls_below_the_default() {
-        let starved = sa_budget(&a4000(1024 * 1024));
-        assert!(starved >= SA_DEFAULT_NODES);
+    fn a_starved_card_is_refused_rather_than_left_to_the_driver() {
+        let limits = a4000(1024 * 1024);
+        let budget = sa_budget(&limits);
+        assert!(
+            budget < SA_DEFAULT_NODES,
+            "a 1 MiB card cannot afford the default: budget {budget}"
+        );
+        assert_eq!(
+            resolve(Algorithm::Sa, SA_DEFAULT_NODES, &limits),
+            Err(CapacityError::AboveDeviceBudget {
+                requested: SA_DEFAULT_NODES,
+                budget,
+                resource: BudgetResource::DeviceMemory,
+            })
+        );
+    }
+
+    /// A card with room for the default still opens on a plain invocation.
+    #[test]
+    fn an_ordinary_card_affords_the_default() {
+        let limits = a4000(A4000_FREE);
+        assert_eq!(
+            resolve(Algorithm::Sa, SA_DEFAULT_NODES, &limits),
+            Ok(SA_DEFAULT_NODES)
+        );
     }
 
     /// `--capabilities` runs without opening the device, so it cannot call
