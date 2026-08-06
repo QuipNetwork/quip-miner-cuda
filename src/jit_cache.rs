@@ -2,10 +2,11 @@
 //!
 //! NVRTC compiling `kernels/sa.cu` / `kernels/gibbs.cu` to PTX costs tens of
 //! seconds at every process start, which distorts throughput/timing
-//! measurements. The compile is topology-independent — the kernels take the
-//! graph as runtime device buffers, nothing per-topology is baked in — so one
-//! cached PTX per (source, GPU arch, driver/NVRTC version) serves every
-//! topology and model.
+//! measurements. The kernels take the graph as runtime device buffers, so no
+//! specific topology is baked in, but the state array is sized at compile time
+//! by `-D QUIP_MAX_NODES`. One cached PTX per (source, GPU arch,
+//! driver/NVRTC version, node capacity) therefore serves every topology and
+//! model that fits that capacity.
 //!
 //! [`load_or_compile`] loads the module from cached PTX when a matching entry
 //! exists and recompiles (then rewrites the cache) otherwise. A corrupt or
@@ -78,16 +79,23 @@ fn cache_disabled() -> bool {
         .is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// Cache key / filename stem for one kernel. Same `(src, arch, driver_version)`
-/// yields the same key; a different `src` yields a different key. `arch` and
-/// `driver_version` appear verbatim in the stem (readable + they partition the
-/// cache); the source text and flag set are folded into the trailing hash.
-fn cache_key(kernel: &str, src: &str, arch: &str, driver_version: i32) -> String {
+/// Cache key / filename stem for one kernel. Same
+/// `(src, arch, driver_version, max_nodes)` yields the same key; a different
+/// `src` yields a different key. `arch`, `driver_version` and `max_nodes`
+/// appear verbatim in the stem (readable + they partition the cache); the
+/// source text and flag set are folded into the trailing hash.
+///
+/// `max_nodes` is part of the key because it is a `-D QUIP_MAX_NODES` on the
+/// NVRTC compile: it changes the emitted PTX without changing `src`. Omitting
+/// it would serve a PTX built for a small state array to a run that needs a
+/// large one, and the kernel would write past the array with no error.
+fn cache_key(kernel: &str, src: &str, arch: &str, driver_version: i32, max_nodes: usize) -> String {
     let mut h = DefaultHasher::new();
     src.hash(&mut h);
     FLAGS_TAG.hash(&mut h);
+    max_nodes.hash(&mut h);
     let src_hash = h.finish();
-    format!("{kernel}-{arch}-drv{driver_version}-{src_hash:016x}")
+    format!("{kernel}-{arch}-drv{driver_version}-n{max_nodes}-{src_hash:016x}")
 }
 
 /// Write `text` to `<dir>/<key>.ptx` atomically: write a pid-scoped temp file,
@@ -128,12 +136,13 @@ pub(crate) fn load_or_compile<F>(
     src: &str,
     arch: &str,
     driver_version: i32,
+    max_nodes: usize,
     compile: F,
 ) -> Result<Arc<CudaModule>, CudaError>
 where
     F: FnOnce() -> Result<Ptx, CudaError>,
 {
-    let key = cache_key(kernel, src, arch, driver_version);
+    let key = cache_key(kernel, src, arch, driver_version, max_nodes);
     let dir = if cache_disabled() { None } else { cache_dir() };
 
     if let Some(dir) = &dir {
@@ -174,25 +183,36 @@ mod tests {
 
     #[test]
     fn key_is_stable_for_same_inputs() {
-        let a = cache_key("sa", "__global__ void k(){}", "sm_86", 12080);
-        let b = cache_key("sa", "__global__ void k(){}", "sm_86", 12080);
+        let a = cache_key("sa", "__global__ void k(){}", "sm_86", 12080, 5000);
+        let b = cache_key("sa", "__global__ void k(){}", "sm_86", 12080, 5000);
         assert_eq!(a, b);
     }
 
     #[test]
     fn key_changes_with_source() {
-        let a = cache_key("sa", "source one", "sm_86", 12080);
-        let b = cache_key("sa", "source two", "sm_86", 12080);
+        let a = cache_key("sa", "source one", "sm_86", 12080, 5000);
+        let b = cache_key("sa", "source two", "sm_86", 12080, 5000);
         assert_ne!(a, b);
     }
 
     #[test]
     fn key_changes_with_arch_and_driver() {
-        let base = cache_key("sa", "src", "sm_86", 12080);
-        assert_ne!(base, cache_key("sa", "src", "sm_90", 12080));
-        assert_ne!(base, cache_key("sa", "src", "sm_86", 12090));
+        let base = cache_key("sa", "src", "sm_86", 12080, 5000);
+        assert_ne!(base, cache_key("sa", "src", "sm_90", 12080, 5000));
+        assert_ne!(base, cache_key("sa", "src", "sm_86", 12090, 5000));
         // Different kernel name → different key even for identical source.
-        assert_ne!(base, cache_key("gibbs", "src", "sm_86", 12080));
+        assert_ne!(base, cache_key("gibbs", "src", "sm_86", 12080, 5000));
+    }
+
+    /// Node capacity is a `-D` on the kernel, so it changes the generated
+    /// PTX without changing `src`. Leaving it out of the key would serve a
+    /// PTX built for a small state array to a run that needs a large one,
+    /// and the kernel would write past the array with no error.
+    #[test]
+    fn key_changes_with_max_nodes() {
+        let base = cache_key("sa", "src", "sm_86", 12080, 5000);
+        assert_ne!(base, cache_key("sa", "src", "sm_86", 12080, 8192));
+        assert_ne!(base, cache_key("sa", "src", "sm_86", 12080, 32768));
     }
 
     #[test]
