@@ -12,10 +12,23 @@ use thiserror::Error;
 /// smaller array saves nothing measurable and only narrows what runs.
 pub const SA_DEFAULT_NODES: usize = 5000;
 
-/// Hard ceiling for SA. Measured on an A4000: 8192 runs, 16384 fails with
-/// `CUDA_ERROR_ILLEGAL_ADDRESS`. The array size alone does not explain a
-/// bound there, so the SA path holds a second limit that is not yet found.
-/// Until it is, a larger request must fail rather than corrupt memory.
+/// Ceiling for SA.
+///
+/// This was once a defect boundary. `kernels/sa.cu` staged its bit-packed
+/// output in a fixed `packed_state[640]`, which holds 5120 nodes, so any
+/// larger `N` wrote past it. Between 5121 and about 9700 the overrun landed
+/// in per-thread local allocation slack and passed silently; beyond that it
+/// left the allocation and raised `CUDA_ERROR_ILLEGAL_ADDRESS`. That array is
+/// now sized from `QUIP_MAX_NODES` like the state it packs, so no internal
+/// array bounds SA any more.
+///
+/// What remains is device memory. The kernel's per-thread frame is
+/// `QUIP_MAX_NODES * 9 / 8` bytes, reserved for full occupancy, so the real
+/// ceiling depends on the GPU: measured between 57344 and 65536 on a 16 GB
+/// A4000, failing cleanly with `CUDA_ERROR_OUT_OF_MEMORY`. This constant
+/// stays at the previous value as a conservative static bound rather than a
+/// measured one. Deriving it from device properties, as `gibbs_budget` does
+/// for shared memory, is the honest fix and is not done here.
 pub const SA_MAX_NODES: usize = 8192;
 
 /// Shipped `shared_state` size in `kernels/gibbs.cu`, and the floor.

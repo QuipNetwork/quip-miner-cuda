@@ -333,8 +333,10 @@ __global__ void cuda_sa_self_feeding(
                 }
             }
 
-            // Pack final state to bit format
-            signed char packed_state[640];
+            // Pack final state to bit format. Sized from the same macro as
+            // `unpacked_state` it packs: a fixed size here would be overrun
+            // by any N above `size * 8`, and the two must not drift apart.
+            signed char packed_state[(QUIP_MAX_NODES + 7) / 8];
             for (int b = 0; b < packed_size; b++)
                 packed_state[b] = 0;
             for (int i = 0; i < N; i++) {
