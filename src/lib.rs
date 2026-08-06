@@ -14,6 +14,7 @@
 //! loop lives in `quip-miner-core`.
 
 pub mod bench;
+pub mod capacity;
 pub mod corpus;
 pub mod cuda_device;
 mod jit_cache;
