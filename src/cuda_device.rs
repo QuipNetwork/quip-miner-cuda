@@ -236,7 +236,21 @@ impl CudaDevice {
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
         )
         .map_err(|_| CudaError::Driver("CUDA reported negative shared memory".into()))?;
-        let resolved = capacity::resolve(algorithm, max_nodes, shared_per_block)?;
+        let threads_per_sm = usize::try_from(
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
+        )
+        .map_err(|_| CudaError::Driver("CUDA reported negative threads per SM".into()))?;
+        // Free rather than total: the SA local-memory reservation competes
+        // with whatever else already holds memory on this device, and a
+        // budget derived from total would promise capacity that is not there.
+        let (free_bytes, _total_bytes) = ctx.mem_get_info()?;
+        let limits = capacity::DeviceLimits {
+            shared_bytes_per_block: shared_per_block,
+            free_bytes,
+            sm_count: max_sms.max(1),
+            threads_per_sm,
+        };
+        let resolved = capacity::resolve(algorithm, max_nodes, &limits)?;
         let (sa_nodes, gibbs_nodes) = match algorithm {
             Algorithm::Sa => (resolved, capacity::GIBBS_DEFAULT_NODES),
             Algorithm::Gibbs => (capacity::SA_DEFAULT_NODES, resolved),

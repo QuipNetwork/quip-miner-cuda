@@ -12,24 +12,98 @@ use thiserror::Error;
 /// smaller array saves nothing measurable and only narrows what runs.
 pub const SA_DEFAULT_NODES: usize = 5000;
 
-/// Ceiling for SA.
+/// CUDA's hard cap on per-thread local memory. The SA stack frame lives
+/// here, so it bounds SA regardless of how much device memory is free.
+pub const LOCAL_MEM_BYTES_PER_THREAD: usize = 512 * 1024;
+
+/// Threads per block the SA kernel launches, and so the multiplier on its
+/// per-thread `delta_energy` workspace. Mirrors `total_threads` in
+/// `streaming::build_algo_state`.
+pub const SA_THREADS_PER_NONCE: usize = 256;
+
+/// Fraction of free device memory the capacity derivation will spend, as
+/// numerator over denominator.
 ///
-/// This was once a defect boundary. `kernels/sa.cu` staged its bit-packed
-/// output in a fixed `packed_state[640]`, which holds 5120 nodes, so any
-/// larger `N` wrote past it. Between 5121 and about 9700 the overrun landed
-/// in per-thread local allocation slack and passed silently; beyond that it
-/// left the allocation and raised `CUDA_ERROR_ILLEGAL_ADDRESS`. That array is
-/// now sized from `QUIP_MAX_NODES` like the state it packs, so no internal
-/// array bounds SA any more.
+/// The model below covers the two allocations that scale with node count and
+/// dominate at large N. It does not model the topology, sample and energy
+/// buffers, nor the driver's own rounding of the local-memory reservation, so
+/// the headroom absorbs them. The driver's `CUDA_ERROR_OUT_OF_MEMORY` is the
+/// real backstop; this only keeps a reasonable request from reaching it.
+pub const MEMORY_HEADROOM_NUM: usize = 4;
+/// See [`MEMORY_HEADROOM_NUM`].
+pub const MEMORY_HEADROOM_DEN: usize = 5;
+
+/// Device facts the capacity derivation needs, read once at open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceLimits {
+    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK`. Bounds Gibbs.
+    pub shared_bytes_per_block: usize,
+    /// Free device memory at open, from `cuMemGetInfo`. Bounds SA.
+    pub free_bytes: usize,
+    /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
+    pub sm_count: usize,
+    /// `CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR`. The driver
+    /// reserves local memory for full occupancy, so this multiplies the SA
+    /// frame whether or not that many threads ever run.
+    pub threads_per_sm: usize,
+}
+
+impl DeviceLimits {
+    /// Free memory less the headroom the model does not account for.
+    #[must_use]
+    pub fn usable_bytes(&self) -> usize {
+        self.free_bytes / MEMORY_HEADROOM_DEN * MEMORY_HEADROOM_NUM
+    }
+}
+
+/// Bytes of per-thread stack frame the SA kernel needs for `nodes`.
 ///
-/// What remains is device memory. The kernel's per-thread frame is
-/// `QUIP_MAX_NODES * 9 / 8` bytes, reserved for full occupancy, so the real
-/// ceiling depends on the GPU: measured between 57344 and 65536 on a 16 GB
-/// A4000, failing cleanly with `CUDA_ERROR_OUT_OF_MEMORY`. This constant
-/// stays at the previous value as a conservative static bound rather than a
-/// measured one. Deriving it from device properties, as `gibbs_budget` does
-/// for shared memory, is the honest fix and is not done here.
-pub const SA_MAX_NODES: usize = 8192;
+/// `unpacked_state` is one byte per node and `packed_state` one bit, both
+/// sized from `QUIP_MAX_NODES` in `kernels/sa.cu`.
+#[must_use]
+pub fn sa_frame_bytes(nodes: usize) -> usize {
+    nodes + nodes.div_ceil(8)
+}
+
+/// Device memory the SA path consumes at `nodes`, for the two allocations
+/// that scale with node count.
+///
+/// The local-memory backing store is the frame times full occupancy, because
+/// the driver reserves for every thread the device could run. The
+/// `delta_energy` workspace is one byte per node per launched thread
+/// (`streaming.rs`, `total_threads * topology.n`), and SA launches one block
+/// per SM.
+#[must_use]
+pub fn sa_working_set_bytes(nodes: usize, limits: &DeviceLimits) -> usize {
+    let local = sa_frame_bytes(nodes)
+        .saturating_mul(limits.sm_count)
+        .saturating_mul(limits.threads_per_sm);
+    let workspace = nodes
+        .saturating_mul(limits.sm_count)
+        .saturating_mul(SA_THREADS_PER_NONCE);
+    local.saturating_add(workspace)
+}
+
+/// Largest node count whose SA working set fits this device.
+///
+/// Never returns less than [`SA_DEFAULT_NODES`]: a plain invocation must open
+/// on any device that can run the miner at all, and a starved card should
+/// fail at allocation with the driver's own error rather than be refused a
+/// capacity the shipped kernel has always used.
+#[must_use]
+pub fn sa_budget(limits: &DeviceLimits) -> usize {
+    // Bytes per node, from `sa_working_set_bytes` with the packed-state
+    // rounding dropped: 9 bytes of frame per 8 nodes, plus one workspace byte
+    // per launched thread.
+    let per_node = limits
+        .sm_count
+        .saturating_mul(limits.threads_per_sm.saturating_mul(9) / 8 + SA_THREADS_PER_NONCE)
+        .max(1);
+    let by_memory = limits.usable_bytes() / per_node;
+    // 9 frame bytes per 8 nodes, inverted against the per-thread cap.
+    let by_local_cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
+    by_memory.min(by_local_cap).max(SA_DEFAULT_NODES)
+}
 
 /// Shipped `shared_state` size in `kernels/gibbs.cu`, and the floor.
 pub const GIBBS_DEFAULT_NODES: usize = 4800;
@@ -38,24 +112,39 @@ pub const GIBBS_DEFAULT_NODES: usize = 4800;
 /// `s_chunk` and `s_arrival`, one `int` each.
 pub const GIBBS_FIXED_SHARED_BYTES: usize = 8;
 
+/// Which device limit bounds an algorithm's capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetResource {
+    /// Gibbs holds its spin state in shared memory, per block.
+    SharedMemory,
+    /// SA holds its state in per-thread local memory, which the driver backs
+    /// with device memory reserved for full occupancy.
+    DeviceMemory,
+}
+
+impl std::fmt::Display for BudgetResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SharedMemory => write!(f, "shared-memory"),
+            Self::DeviceMemory => write!(f, "memory"),
+        }
+    }
+}
+
 /// Why a capacity request was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CapacityError {
-    /// Above the algorithm's own ceiling.
-    #[error("requested {requested} nodes exceeds the algorithm limit of {limit}")]
-    AboveAlgorithmBound {
-        /// Nodes asked for.
-        requested: usize,
-        /// Ceiling that applies.
-        limit: usize,
-    },
-    /// Above what this device's shared memory can hold.
-    #[error("requested {requested} nodes exceeds the device shared-memory budget of {budget}")]
+    /// Above what this device can hold. `resource` names which limit bound
+    /// it, because the two algorithms are bounded by different ones and a
+    /// message naming the wrong resource sends the reader to the wrong knob.
+    #[error("requested {requested} nodes exceeds the device {resource} budget of {budget}")]
     AboveDeviceBudget {
         /// Nodes asked for.
         requested: usize,
         /// Budget derived from the device.
         budget: usize,
+        /// Which device limit bound this request.
+        resource: BudgetResource,
     },
 }
 
@@ -78,16 +167,16 @@ pub fn default_nodes(algorithm: Algorithm) -> usize {
 /// Capacity to advertise in `--capabilities`, which must answer without
 /// opening the device.
 ///
-/// Applies the floor and every bound knowable without a device, so the
-/// advertised value is never larger than what [`resolve`] would accept. SA has
-/// a static ceiling ([`SA_MAX_NODES`]) and is clamped to it. Gibbs is bounded
-/// only by the device's shared memory, so its request passes through and
-/// `open_with_nodes` is what refuses.
+/// Applies the floor and every bound knowable without a device. Both
+/// algorithms are now bounded by device properties rather than a static
+/// ceiling, so the request passes through and `open_with_nodes` is what
+/// refuses. The per-thread local-memory cap is the one hardware bound that
+/// holds on every CUDA device, so SA is clamped to it here.
 #[must_use]
 pub fn advertised_nodes(algorithm: Algorithm, requested: usize) -> usize {
     let want = requested.max(default_nodes(algorithm));
     match algorithm {
-        Algorithm::Sa => want.min(SA_MAX_NODES),
+        Algorithm::Sa => want.min(LOCAL_MEM_BYTES_PER_THREAD * 8 / 9),
         Algorithm::Gibbs => want,
     }
 }
@@ -99,37 +188,30 @@ pub fn advertised_nodes(algorithm: Algorithm, requested: usize) -> usize {
 ///
 /// # Errors
 ///
-/// [`CapacityError::AboveAlgorithmBound`] when SA is asked for more than
-/// [`SA_MAX_NODES`]. [`CapacityError::AboveDeviceBudget`] when Gibbs is
-/// asked for more than [`gibbs_budget`] allows.
+/// [`CapacityError::AboveDeviceBudget`] when the request exceeds
+/// [`sa_budget`] or [`gibbs_budget`] for this device.
 pub fn resolve(
     algorithm: Algorithm,
     requested: usize,
-    shared_bytes_per_block: usize,
+    limits: &DeviceLimits,
 ) -> Result<usize, CapacityError> {
     let floor = default_nodes(algorithm);
     let want = requested.max(floor);
-    match algorithm {
-        Algorithm::Sa => {
-            if want > SA_MAX_NODES {
-                return Err(CapacityError::AboveAlgorithmBound {
-                    requested: want,
-                    limit: SA_MAX_NODES,
-                });
-            }
-            Ok(want)
-        }
-        Algorithm::Gibbs => {
-            let budget = gibbs_budget(shared_bytes_per_block);
-            if want > budget {
-                return Err(CapacityError::AboveDeviceBudget {
-                    requested: want,
-                    budget,
-                });
-            }
-            Ok(want)
-        }
+    let (budget, resource) = match algorithm {
+        Algorithm::Sa => (sa_budget(limits), BudgetResource::DeviceMemory),
+        Algorithm::Gibbs => (
+            gibbs_budget(limits.shared_bytes_per_block),
+            BudgetResource::SharedMemory,
+        ),
+    };
+    if want > budget {
+        return Err(CapacityError::AboveDeviceBudget {
+            requested: want,
+            budget,
+            resource,
+        });
     }
+    Ok(want)
 }
 
 #[cfg(test)]
@@ -147,30 +229,19 @@ mod tests {
 
     #[test]
     fn resolve_accepts_a_request_inside_both_bounds() {
-        assert_eq!(resolve(Algorithm::Gibbs, 5640, 49152), Ok(5640));
-        assert_eq!(resolve(Algorithm::Sa, 5640, 49152), Ok(5640));
-    }
-
-    /// SA has an unfixed out-of-bounds defect above 8192, so a larger
-    /// request must fail rather than clamp into the broken range.
-    #[test]
-    fn resolve_rejects_sa_above_its_bound() {
-        assert_eq!(
-            resolve(Algorithm::Sa, 16384, 49152),
-            Err(CapacityError::AboveAlgorithmBound {
-                requested: 16384,
-                limit: SA_MAX_NODES,
-            })
-        );
+        let limits = a4000(A4000_FREE);
+        assert_eq!(resolve(Algorithm::Gibbs, 5640, &limits), Ok(5640));
+        assert_eq!(resolve(Algorithm::Sa, 5640, &limits), Ok(5640));
     }
 
     #[test]
     fn resolve_rejects_gibbs_above_the_device_budget() {
         assert_eq!(
-            resolve(Algorithm::Gibbs, 65536, 49152),
+            resolve(Algorithm::Gibbs, 65536, &a4000(A4000_FREE)),
             Err(CapacityError::AboveDeviceBudget {
                 requested: 65536,
                 budget: 49144,
+                resource: BudgetResource::SharedMemory,
             })
         );
     }
@@ -179,9 +250,10 @@ mod tests {
     /// gain, so the default is a floor.
     #[test]
     fn resolve_raises_a_small_request_to_the_default() {
-        assert_eq!(resolve(Algorithm::Sa, 64, 49152), Ok(SA_DEFAULT_NODES));
+        let limits = a4000(A4000_FREE);
+        assert_eq!(resolve(Algorithm::Sa, 64, &limits), Ok(SA_DEFAULT_NODES));
         assert_eq!(
-            resolve(Algorithm::Gibbs, 64, 49152),
+            resolve(Algorithm::Gibbs, 64, &limits),
             Ok(GIBBS_DEFAULT_NODES)
         );
     }
@@ -192,13 +264,121 @@ mod tests {
         assert_eq!(default_nodes(Algorithm::Gibbs), 4800);
     }
 
-    /// `--capabilities` runs without opening the device, so it cannot call
-    /// `resolve`. It must still never advertise a capacity the process would
-    /// refuse to open: a coordinator that believed an over-large `max_nodes`
-    /// would keep sending jobs this miner rejects.
+    /// An A4000 as this code sees it: 48 SMs, 1536 resident threads each,
+    /// 48152 bytes of shared memory per block, and a nominally free 16 GiB.
+    const A4000_SMS: usize = 48;
+    const A4000_THREADS_PER_SM: usize = 1536;
+    const A4000_FREE: usize = 16 * 1024 * 1024 * 1024;
+
+    fn a4000(free_bytes: usize) -> DeviceLimits {
+        DeviceLimits {
+            shared_bytes_per_block: 49152,
+            free_bytes,
+            sm_count: A4000_SMS,
+            threads_per_sm: A4000_THREADS_PER_SM,
+        }
+    }
+
+    /// The SA stack frame is `unpacked_state` (one byte per node) plus
+    /// `packed_state` (one bit per node), both sized from `QUIP_MAX_NODES`.
     #[test]
-    fn advertised_never_exceeds_the_static_algorithm_bound() {
-        assert_eq!(advertised_nodes(Algorithm::Sa, 16384), SA_MAX_NODES);
+    fn sa_frame_is_the_two_state_arrays() {
+        assert_eq!(sa_frame_bytes(5000), 5000 + 625);
+        assert_eq!(sa_frame_bytes(8), 8 + 1);
+        // Rounds up: 9 nodes need 2 packed bytes, not 1.
+        assert_eq!(sa_frame_bytes(9), 9 + 2);
+    }
+
+    /// The budget must be self-consistent: the working set at the budget fits
+    /// in the free memory it was derived from, and one node more does not.
+    #[test]
+    fn sa_budget_is_the_largest_node_count_that_fits() {
+        let limits = a4000(A4000_FREE);
+        let budget = sa_budget(&limits);
+        assert!(budget > 0, "a 16 GiB card must afford some capacity");
+        assert!(
+            sa_working_set_bytes(budget, &limits) <= limits.usable_bytes(),
+            "the working set at the budget must fit"
+        );
+        assert!(
+            sa_working_set_bytes(budget + 1, &limits) > limits.usable_bytes(),
+            "one node above the budget must not fit"
+        );
+    }
+
+    /// A bigger card affords more, which is the whole reason for deriving
+    /// this rather than hardcoding it.
+    #[test]
+    fn sa_budget_scales_with_free_memory() {
+        let small = sa_budget(&a4000(8 * 1024 * 1024 * 1024));
+        let large = sa_budget(&a4000(48 * 1024 * 1024 * 1024));
+        assert!(
+            large > small,
+            "48 GiB must afford more than 8 GiB: {large} vs {small}"
+        );
+    }
+
+    /// CUDA caps local memory at 512 KiB per thread regardless of how much
+    /// device memory is free, so a huge card is still bounded.
+    #[test]
+    fn sa_budget_respects_the_per_thread_local_cap() {
+        let huge = sa_budget(&a4000(1024 * 1024 * 1024 * 1024));
+        assert!(
+            sa_frame_bytes(huge) <= LOCAL_MEM_BYTES_PER_THREAD,
+            "frame {} exceeds the {LOCAL_MEM_BYTES_PER_THREAD}-byte per-thread cap",
+            sa_frame_bytes(huge)
+        );
+    }
+
+    /// At the limit resolves, one above it fails. This is the contract the
+    /// whole module exists for.
+    #[test]
+    fn resolve_sa_accepts_at_the_budget_and_rejects_above_it() {
+        let limits = a4000(A4000_FREE);
+        let budget = sa_budget(&limits);
+        assert_eq!(resolve(Algorithm::Sa, budget, &limits), Ok(budget));
+        assert_eq!(
+            resolve(Algorithm::Sa, budget + 1, &limits),
+            Err(CapacityError::AboveDeviceBudget {
+                requested: budget + 1,
+                budget,
+                resource: BudgetResource::DeviceMemory,
+            })
+        );
+    }
+
+    /// Same contract for Gibbs, whose budget comes from shared memory.
+    #[test]
+    fn resolve_gibbs_accepts_at_the_budget_and_rejects_above_it() {
+        let limits = a4000(A4000_FREE);
+        let budget = gibbs_budget(limits.shared_bytes_per_block);
+        assert_eq!(budget, 49144);
+        assert_eq!(resolve(Algorithm::Gibbs, budget, &limits), Ok(budget));
+        assert_eq!(
+            resolve(Algorithm::Gibbs, budget + 1, &limits),
+            Err(CapacityError::AboveDeviceBudget {
+                requested: budget + 1,
+                budget,
+                resource: BudgetResource::SharedMemory,
+            })
+        );
+    }
+
+    /// A card with almost nothing free must still not report a budget below
+    /// the default, or a plain invocation would fail to open.
+    #[test]
+    fn sa_budget_never_falls_below_the_default() {
+        let starved = sa_budget(&a4000(1024 * 1024));
+        assert!(starved >= SA_DEFAULT_NODES);
+    }
+
+    /// `--capabilities` runs without opening the device, so it cannot call
+    /// `resolve`. The per-thread local-memory cap is the one bound that holds
+    /// on every CUDA device, so it is the only clamp available here.
+    #[test]
+    fn advertised_clamps_sa_to_the_per_thread_local_cap() {
+        let cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
+        assert_eq!(advertised_nodes(Algorithm::Sa, cap * 2), cap);
         assert_eq!(advertised_nodes(Algorithm::Sa, 5640), 5640);
         assert_eq!(advertised_nodes(Algorithm::Sa, 64), SA_DEFAULT_NODES);
     }
