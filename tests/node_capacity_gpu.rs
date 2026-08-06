@@ -7,7 +7,7 @@
 //! `docs/superpowers/specs/2026-08-06-configurable-node-capacity-design.md`
 //! for the sweep those numbers come from.
 
-use quip_miner_cuda::capacity::{GIBBS_DEFAULT_NODES, SA_MAX_NODES};
+use quip_miner_cuda::capacity::GIBBS_DEFAULT_NODES;
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::Algorithm;
 
@@ -43,28 +43,42 @@ fn gibbs_opens_well_above_the_shared_default() {
     assert_eq!(dev.max_nodes, 32768);
 }
 
-/// SA fails with `CUDA_ERROR_ILLEGAL_ADDRESS` at 16384, which the array size
-/// alone does not explain. Until that defect is found, the open must refuse
-/// rather than reach the range that corrupts memory.
+/// SA is bounded by device memory, which no card satisfies at this size, so
+/// the refusal must name the request and the memory budget rather than let
+/// the driver fail later with a bare out-of-memory.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn sa_refuses_above_its_bound() {
+fn sa_refuses_above_the_device_memory_budget() {
     if CudaDevice::device_count().unwrap_or(0) == 0 {
         eprintln!("no CUDA device visible; skipping");
         return;
     }
 
-    let err = CudaDevice::open_with_nodes(0, Algorithm::Sa, 16384)
-        .expect_err("SA above its bound must fail at open");
+    let err = CudaDevice::open_with_nodes(0, Algorithm::Sa, 10_000_000)
+        .expect_err("SA above the device memory budget must fail at open");
     let msg = err.to_string();
     assert!(
-        msg.contains("16384"),
+        msg.contains("10000000"),
         "message must name the request: {msg}"
     );
     assert!(
-        msg.contains(&SA_MAX_NODES.to_string()),
-        "message must name the limit: {msg}"
+        msg.contains("memory budget"),
+        "message must name the resource that bound it: {msg}"
     );
+}
+
+/// SA now reaches far past its old 8192 cap. 16384 was the original
+/// `CUDA_ERROR_ILLEGAL_ADDRESS` repro and must open cleanly.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn sa_opens_at_the_original_illegal_address_repro() {
+    if CudaDevice::device_count().unwrap_or(0) == 0 {
+        eprintln!("no CUDA device visible; skipping");
+        return;
+    }
+
+    let dev = CudaDevice::open_with_nodes(0, Algorithm::Sa, 16384).expect("SA at 16384");
+    assert_eq!(dev.max_nodes, 16384);
 }
 
 /// The Gibbs ceiling comes from the device, not a constant. On a 48 KB
