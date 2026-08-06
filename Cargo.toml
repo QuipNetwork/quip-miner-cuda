@@ -39,12 +39,15 @@ nvml-wrapper = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-flame = "0.2"
 
 [dev-dependencies]
 quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
 proptest = "1"
-serde_json = "1"
 serial_test = "3.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }
 

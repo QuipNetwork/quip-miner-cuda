@@ -1,0 +1,4 @@
+"ID","Kernel Name","Metric Name","Metric Unit","Metric Value"
+"0","cuda_sa_self_feeding","gpu__time_duration.sum","ns","812000.00"
+"0","cuda_sa_self_feeding","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","76.30"
+"0","cuda_sa_self_feeding","sm__warps_active.avg.pct_of_peak_sustained_active","%","61.10"

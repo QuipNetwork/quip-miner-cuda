@@ -13,6 +13,15 @@
 // Color loop inside kernel with __syncthreads() between colors.
 // Spin state in shared memory (unpacked, 1 byte/spin) - same as Metal.
 
+// Largest N this kernel's shared state supports. The host supplies it through
+// NVRTC as -D QUIP_MAX_NODES=<n>; the default matches the historical fixed
+// size so a plain compile is unchanged. This array is per block and lives in
+// shared memory, so the device's shared-memory-per-block limit caps it: on
+// sm_86 that is 49152 bytes less the 8 taken by s_chunk and s_arrival.
+#ifndef QUIP_MAX_NODES
+#define QUIP_MAX_NODES 4800
+#endif
+
 // ==============================================================================
 // NonceControl layout (flat int array, CTRL_STRIDE ints per nonce)
 // ==============================================================================
@@ -224,7 +233,7 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
     unsigned int base_seed,
     int update_mode
 ) {
-    __shared__ signed char shared_state[4800];
+    __shared__ signed char shared_state[QUIP_MAX_NODES];
     __shared__ int s_chunk;
     __shared__ int s_arrival;
 

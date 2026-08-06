@@ -1,0 +1,2 @@
+"Time (%)","Total Time (ns)","Instances","Avg (ns)","Med (ns)","Min (ns)","Max (ns)","StdDev (ns)","Name"
+"100.0","4000000","5","800000","800000","790000","815000","9000","cuda_sa_self_feeding"

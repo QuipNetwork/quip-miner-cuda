@@ -9,8 +9,16 @@
 // independently using thread-local unpacked state + delta_energy workspace.
 //
 // No inter-block coordination needed (blocks_per_nonce = 1).
-// No shared memory spin state (thread-local unpacked_state[5000]).
+// No shared memory spin state (thread-local unpacked_state[QUIP_MAX_NODES]).
 // No color loop (SA sweeps all vars sequentially per thread).
+
+// Largest N this kernel's thread-local state supports. The host supplies it
+// through NVRTC as -D QUIP_MAX_NODES=<n>; the default matches the historical
+// fixed size so a plain compile is unchanged. This array is per thread, so
+// raising it multiplies the local-memory footprint by the thread count.
+#ifndef QUIP_MAX_NODES
+#define QUIP_MAX_NODES 5000
+#endif
 
 // ==============================================================================
 // NonceControl layout (flat int array, CTRL_STRIDE ints per nonce)
@@ -190,7 +198,7 @@ __global__ void cuda_sa_self_feeding(
             int packed_size = (N + 7) / 8;
 
             // Thread-local state
-            signed char unpacked_state[5000];
+            signed char unpacked_state[QUIP_MAX_NODES];
 
             // Delta energy workspace (unique per global thread)
             int global_tid = blockIdx.x * blockDim.x + tid;

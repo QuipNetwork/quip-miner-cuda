@@ -2,12 +2,16 @@
 //!
 //! One process owns one device (`[cuda.N]` → device N / miner id `cuda-N`).
 
+use crate::capacity;
+use crate::jit_cache;
 use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
+use quip_miner_core::Algorithm;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::trace_span;
 
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
@@ -56,6 +60,9 @@ pub enum CudaError {
     /// A CUDA driver call failed; the payload is the driver's own message.
     #[error("CUDA driver: {0}")]
     Driver(String),
+    /// A requested node capacity was refused before any compile.
+    #[error("node capacity: {0}")]
+    Capacity(#[from] crate::capacity::CapacityError),
     /// NVRTC rejected the kernel source on both the default and the
     /// architecture-fallback compile.
     #[error("NVRTC compile: {0}")]
@@ -77,9 +84,14 @@ impl From<cudarc::driver::DriverError> for CudaError {
 /// natively. The fallback arch is the highest one the installed driver
 /// supports; the driver JIT-compiles that PTX up to the real SM at module
 /// load time. Port of `_compile_module`.
-fn compile_with_fallback(src: &str) -> Result<Ptx, CudaError> {
+fn compile_with_fallback(src: &str, max_nodes: usize) -> Result<Ptx, CudaError> {
+    // Sizes the kernel's state array. Both passes must carry it: a fallback
+    // compiled at the default while the cache key says otherwise would load a
+    // kernel whose array is smaller than the run needs.
+    let define = format!("-DQUIP_MAX_NODES={max_nodes}");
     let base = CompileOptions {
         use_fast_math: Some(true),
+        options: vec![define.clone()],
         ..Default::default()
     };
     match compile_ptx_with_opts(src, base) {
@@ -89,7 +101,7 @@ fn compile_with_fallback(src: &str) -> Result<Ptx, CudaError> {
             let fb = best_fallback_arch(ver);
             let opts = CompileOptions {
                 use_fast_math: Some(true),
-                options: vec![format!("--gpu-architecture=compute_{fb}")],
+                options: vec![define, format!("--gpu-architecture=compute_{fb}")],
                 ..Default::default()
             };
             compile_ptx_with_opts(src, opts).map_err(|e| {
@@ -124,6 +136,8 @@ pub struct CudaDevice {
     pub(crate) gibbs: CudaFunction,
     /// SMs on this device (`launch_self_feeding`'s `num_kernels` budget).
     pub max_sms: usize,
+    /// Node capacity the running algorithm's kernel was compiled for.
+    pub max_nodes: usize,
     _sa_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
 }
@@ -135,6 +149,7 @@ impl fmt::Debug for CudaDevice {
         f.debug_struct("CudaDevice")
             .field("device_index", &self.device_index)
             .field("max_sms", &self.max_sms)
+            .field("max_nodes", &self.max_nodes)
             .finish_non_exhaustive()
     }
 }
@@ -160,6 +175,26 @@ impl CudaDevice {
     /// # Ok::<(), quip_miner_cuda::cuda_device::CudaError>(())
     /// ```
     pub fn open(device_index: usize) -> Result<Self, CudaError> {
+        Self::open_with_nodes(device_index, Algorithm::Sa, capacity::SA_DEFAULT_NODES)
+    }
+
+    /// [`CudaDevice::open`], compiling `algorithm`'s kernel for `max_nodes`.
+    ///
+    /// The other algorithm's kernel compiles at its own default. One process
+    /// drives one algorithm, so only `algorithm` needs the larger array, and a
+    /// bigger SA array would cost local memory for a kernel that never
+    /// launches here.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`CudaDevice::open`] returns, plus [`CudaError::Capacity`]
+    /// when `max_nodes` exceeds the algorithm bound or this device's
+    /// shared-memory budget.
+    pub fn open_with_nodes(
+        device_index: usize,
+        algorithm: Algorithm,
+        max_nodes: usize,
+    ) -> Result<Self, CudaError> {
         // CUDA reports counts as i32; reject a negative driver response rather
         // than silent truncation into usize.
         let n = usize::try_from(CudaContext::device_count()?)
@@ -193,11 +228,54 @@ impl CudaDevice {
         )
         .map_err(|_| CudaError::Driver("CUDA reported a negative SM count".into()))?;
 
-        let sa_ptx = compile_with_fallback(SA_SRC)?;
-        let gibbs_ptx = compile_with_fallback(GIBBS_SRC)?;
+        // Node capacity is a `-D` on the kernel, so it is resolved before the
+        // compile and must reach both `compile_with_fallback` and the cache
+        // key. Gibbs is bounded by this device's shared memory, so the budget
+        // comes from the device rather than a constant.
+        let shared_per_block = usize::try_from(
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
+        )
+        .map_err(|_| CudaError::Driver("CUDA reported negative shared memory".into()))?;
+        let resolved = capacity::resolve(algorithm, max_nodes, shared_per_block)?;
+        let (sa_nodes, gibbs_nodes) = match algorithm {
+            Algorithm::Sa => (resolved, capacity::GIBBS_DEFAULT_NODES),
+            Algorithm::Gibbs => (capacity::SA_DEFAULT_NODES, resolved),
+        };
 
-        let sa_mod = ctx.load_module(sa_ptx)?;
-        let gibbs_mod = ctx.load_module(gibbs_ptx)?;
+        // Cache key components: GPU arch + driver/NVRTC version + the node
+        // capacity. Capacity changes the emitted PTX without changing the
+        // source text, so PTX built at one value must never be served at
+        // another (see `jit_cache`).
+        let cc_major =
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+        let cc_minor =
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
+        let arch = format!("sm_{cc_major}{cc_minor}");
+        let driver_ver = driver_version()?;
+
+        let (sa_mod, gibbs_mod) = {
+            let _span = trace_span!("jit", kernels = 2).entered();
+            (
+                jit_cache::load_or_compile(
+                    &ctx,
+                    "sa",
+                    SA_SRC,
+                    &arch,
+                    driver_ver,
+                    sa_nodes,
+                    || compile_with_fallback(SA_SRC, sa_nodes),
+                )?,
+                jit_cache::load_or_compile(
+                    &ctx,
+                    "gibbs",
+                    GIBBS_SRC,
+                    &arch,
+                    driver_ver,
+                    gibbs_nodes,
+                    || compile_with_fallback(GIBBS_SRC, gibbs_nodes),
+                )?,
+            )
+        };
 
         let sa = sa_mod.load_function("cuda_sa_self_feeding")?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
@@ -209,6 +287,7 @@ impl CudaDevice {
             sa,
             gibbs,
             max_sms: max_sms.max(1),
+            max_nodes: resolved,
             _sa_mod: sa_mod,
             _gibbs_mod: gibbs_mod,
         })
@@ -253,6 +332,16 @@ impl CudaDevice {
         // The probe is the open itself; the device is dropped straight away.
         drop(Self::open(device_index)?);
         Ok(())
+    }
+
+    /// The GPU's marketing name (e.g. "NVIDIA H100 80GB HBM3"), for the
+    /// `bench` subcommand's `BenchRecord.device` field.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Driver`] if the driver cannot report the device name.
+    pub fn name(&self) -> Result<String, CudaError> {
+        Ok(self.ctx.name()?)
     }
 }
 
