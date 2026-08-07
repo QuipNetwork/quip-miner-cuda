@@ -17,6 +17,7 @@ pub mod bench;
 pub mod capacity;
 pub mod corpus;
 pub mod cuda_device;
+pub mod driver_budget;
 mod jit_cache;
 pub mod nsight;
 pub mod nvml_gov;
@@ -152,7 +153,7 @@ impl Sampler for CudaSampler {
         out: tokio::sync::mpsc::Sender<StreamResult>,
         cancel: CancelGuard,
     ) {
-        streaming::run_stream(&self.device, self.algorithm, jobs, out, cancel);
+        streaming::run_stream(&self.device, self.algorithm, jobs, out, cancel, &self.gov);
     }
 
     fn stream_width(&self) -> usize {

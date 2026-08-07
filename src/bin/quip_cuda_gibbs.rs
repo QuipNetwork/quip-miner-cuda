@@ -23,10 +23,13 @@ struct Cli {
     /// CUDA device index (one process per GPU). Default 0 → miner id `cuda-0`.
     #[arg(long, default_value_t = 0)]
     device: usize,
-    /// Target GPU utilization ceiling percent (1–100). Used by NVML governor.
+    /// Ceiling percent (1–100) the NVML governor compares foreign GPU load
+    /// against. Only consulted with --yielding. The default of 100 never
+    /// throttles.
     #[arg(long, default_value_t = 100)]
     utilization: u32,
-    /// Yield to other GPU users when NVML util exceeds 90%.
+    /// Share the GPU: end the current session when load from *other* processes
+    /// exceeds --utilization. Load from this miner is excluded.
     #[arg(long, default_value_t = false)]
     yielding: bool,
     /// Largest node count to compile the kernel for. The miner opens its

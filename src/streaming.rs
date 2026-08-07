@@ -16,6 +16,8 @@
 //! correct, just not guaranteed to hit full width on a very short run.
 
 use crate::cuda_device::CudaDevice;
+use crate::driver_budget::{Bucket, DriverBudget};
+use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
 use crate::topology::{fill_h_j, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
@@ -35,6 +37,12 @@ use tracing::trace_span;
 
 const CTRL_STRIDE: usize = 8;
 const CTRL_EXIT_NOW: usize = 6;
+/// How long the driver stands down for, per check, while yielding.
+///
+/// Only ever slept with no session running, so this is real time the GPU is
+/// free rather than time our own resident kernel spends spinning.
+const YIELD_SLICE: Duration = Duration::from_millis(250);
+
 /// Device slots each nonce rotates through. Typed `u8` because it is first a
 /// slot *index* (`SlotState`, `ActiveSlot::slot`); the buffer-offset uses
 /// widen it with `usize::from` rather than the reverse.
@@ -1137,6 +1145,7 @@ fn emit_completion(
     out: &Sender<StreamResult>,
     done: ActiveSlot,
     reads: Result<Vec<Vec<i8>>, SampleError>,
+    budget: &mut DriverBudget,
 ) -> bool {
     // Saturating rather than wrapping: a residency that overflows `u64`
     // microseconds (~584,000 years) should report "immeasurably long", not a
@@ -1151,17 +1160,37 @@ fn emit_completion(
             return true;
         }
     };
+    let scored = budget.mark();
     let results: Vec<SamplerResult> = reads
         .into_iter()
         .take(done.job.params.num_reads.max(1))
         .map(|spins| score_spins(&spins, &done.job.graph))
         .collect();
-    out.blocking_send(StreamResult {
-        job_id: done.job.job_id,
-        outcome: StreamOutcome::Completed(Ok(results)),
-        device_access_time_us,
-    })
-    .is_ok()
+    budget.charge(Bucket::Score, scored);
+
+    // Charged separately from scoring: this send is where consumer-side
+    // backpressure shows up, and QUI-870 needs a slow consumer to be
+    // distinguishable from slow host scoring.
+    let sent = budget.mark();
+    let delivered = out
+        .blocking_send(StreamResult {
+            job_id: done.job.job_id,
+            outcome: StreamOutcome::Completed(Ok(results)),
+            device_access_time_us,
+        })
+        .is_ok();
+    budget.charge(Bucket::Consumer, sent);
+    delivered
+}
+
+/// Driver state that outlives any single session.
+///
+/// Both fields span the whole `run_stream` call: the budget because uptime is
+/// the variable QUI-870 measures, and the governor because a yield decision
+/// applies to the device rather than to one session.
+struct DriverContext<'a> {
+    budget: &'a mut DriverBudget,
+    gov: &'a UtilGovernor,
 }
 
 /// Why a session stopped drawing jobs from the channel.
@@ -1311,6 +1340,7 @@ fn refill_slots(
     sess: &mut SelfFeedingSession<'_>,
     slots: &mut [SlotState],
     feed: &mut Feed<'_>,
+    budget: &mut DriverBudget,
 ) -> Halt {
     for (nonce_id, slot) in slots.iter_mut().enumerate() {
         while let Some(free) = slot.open_slot() {
@@ -1322,10 +1352,10 @@ fn refill_slots(
                         }
                         continue;
                     }
-                    if sess
-                        .upload_slot(nonce_id, usize::from(free), &j.graph)
-                        .is_err()
-                    {
+                    let uploaded = budget.mark();
+                    let upload = sess.upload_slot(nonce_id, usize::from(free), &j.graph);
+                    budget.charge(Bucket::Upload, uploaded);
+                    if upload.is_err() {
                         send_reject(feed.out, j, RejectReason::Overloaded);
                         continue;
                     }
@@ -1355,8 +1385,12 @@ fn scan_completions(
     sess: &SelfFeedingSession<'_>,
     slots: &mut [SlotState],
     out: &Sender<StreamResult>,
+    budget: &mut DriverBudget,
 ) -> Result<Scan, SampleError> {
-    let ctrl = sess.poll_ctrl()?;
+    let polled = budget.mark();
+    let ctrl = sess.poll_ctrl();
+    budget.charge(Bucket::Poll, polled);
+    let ctrl = ctrl?;
     let mut scan = Scan {
         progressed: false,
         output_closed: false,
@@ -1374,12 +1408,15 @@ fn scan_completions(
             continue;
         }
         scan.progressed = true;
+        let downloaded = budget.mark();
         let reads = sess.download_slot(nonce_id, active_slot);
+        budget.charge(Bucket::Download, downloaded);
         // Always `Some`: `active` was matched immediately above.
         let Some(done) = slot.rotate_on_completion() else {
             continue;
         };
-        if !emit_completion(out, done, reads) {
+        budget.record_completions(1);
+        if !emit_completion(out, done, reads, budget) {
             scan.output_closed = true;
         }
     }
@@ -1395,17 +1432,30 @@ fn pump_session(
     slots: &mut [SlotState],
     feed: &mut Feed<'_>,
     mut halt: Halt,
+    ctx: &mut DriverContext<'_>,
 ) -> Halt {
     let mut exhausted = halt.is_exhausted();
     loop {
+        ctx.budget.maybe_report();
+        // Yielding ends the session rather than pausing inside it. The
+        // persistent kernel holds its SMs until an explicit EXIT_NOW
+        // (`kernels/sa.cu`, the indefinite READY wait), so a driver that
+        // merely slept would leave the kernel resident and spinning — starving
+        // ourselves without freeing anything for the process we meant to yield
+        // to. Stopping the refill drains what is in flight; the teardown in
+        // `run_session` is what actually releases the device, and `run_stream`
+        // does the waiting from there.
+        if !exhausted && ctx.gov.should_throttle() {
+            exhausted = true;
+        }
         if !exhausted {
-            halt = refill_slots(sess, slots, feed);
+            halt = refill_slots(sess, slots, feed, ctx.budget);
             exhausted = halt.is_exhausted();
         }
         if exhausted && slots.iter().all(SlotState::is_vacant) {
             break;
         }
-        let scan = match scan_completions(sess, slots, feed.out) {
+        let scan = match scan_completions(sess, slots, feed.out, ctx.budget) {
             Ok(scan) => scan,
             Err(e) => {
                 // The ctrl mailbox is what tells us a slot finished, so once
@@ -1421,7 +1471,9 @@ fn pump_session(
             exhausted = true;
         }
         if !scan.progressed {
+            let spun = ctx.budget.mark();
             std::thread::sleep(Duration::from_millis(1));
+            ctx.budget.charge(Bucket::Spin, spun);
         }
     }
     halt
@@ -1440,6 +1492,7 @@ fn run_session(
     jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
     cancel: &CancelGuard,
+    ctx: &mut DriverContext<'_>,
 ) -> Option<StreamJob> {
     if seed.graph.num_nodes() == 0 {
         // Degenerate empty-graph job: no kernel needed, answer directly.
@@ -1531,8 +1584,21 @@ fn run_session(
         return next_seed(&mut feed, halt);
     }
 
-    let halt = pump_session(&mut sess, &mut slots[..active_nonces], &mut feed, halt);
+    let halt = pump_session(&mut sess, &mut slots[..active_nonces], &mut feed, halt, ctx);
     drop(sess); // signals exit + synchronizes stream_compute (Drop impl)
+
+    // Yield here, after teardown and before claiming the next seed. After
+    // teardown, because only then are the SMs actually free — the kernel is
+    // persistent, so a pause taken while it was resident would idle us without
+    // releasing anything. Before the seed, because `next_seed` blocks to claim
+    // a job, and a contended GPU can hold this loop for an unbounded time:
+    // sleeping with a job already in hand would leave the coordinator waiting
+    // on a result we have not started.
+    while ctx.gov.should_throttle() {
+        let yielded = ctx.budget.mark();
+        std::thread::sleep(YIELD_SLICE);
+        ctx.budget.charge(Bucket::Throttle, yielded);
+    }
     next_seed(&mut feed, halt)
 }
 
@@ -1544,24 +1610,33 @@ fn run_session(
 /// Returns once `jobs` is closed and every job it delivered has produced a
 /// [`StreamResult`] — success, or a `RejectReason` if the device failed.
 ///
+/// # Yielding
+///
+/// While `gov` reports foreign GPU contention, this ends the current session
+/// and waits between sessions rather than pausing inside one. The kernel is
+/// persistent and holds its SMs until torn down, so pausing mid-session would
+/// yield nothing — see the comment in `pump_session`.
+///
 /// # Examples
 ///
 /// ```no_run
 /// use quip_miner_core::{CancelGuard, StreamJob, StreamResult};
 /// use quip_miner_cuda::cuda_device::CudaDevice;
+/// use quip_miner_cuda::nvml_gov::UtilGovernor;
 /// use quip_miner_cuda::streaming::run_stream;
 /// use quip_miner_cuda::Algorithm;
 /// use tokio::sync::mpsc::channel;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = CudaDevice::open(0)?;
+/// let gov = UtilGovernor::start(0, 90, false);
 /// let (job_tx, job_rx) = channel::<StreamJob>(16);
 /// let (res_tx, _res_rx) = channel::<StreamResult>(16);
 ///
 /// // A real caller feeds `job_tx` from another task; closing it is what
 /// // eventually lets `run_stream` return.
 /// drop(job_tx);
-/// run_stream(&device, Algorithm::Sa, job_rx, res_tx, CancelGuard::default());
+/// run_stream(&device, Algorithm::Sa, job_rx, res_tx, CancelGuard::default(), &gov);
 /// # Ok(())
 /// # }
 /// ```
@@ -1576,10 +1651,27 @@ pub fn run_stream(
     mut jobs: Receiver<StreamJob>,
     out: Sender<StreamResult>,
     cancel: CancelGuard,
+    gov: &UtilGovernor,
 ) {
+    // One budget for the whole process, not per session: uptime is the
+    // variable QUI-870 and QUI-922 are asking about, and a per-session budget
+    // would reset every time a topology change ended a session.
+    let mut budget = DriverBudget::from_env();
+    let mut ctx = DriverContext {
+        budget: &mut budget,
+        gov,
+    };
     let mut pending = jobs.blocking_recv();
     while let Some(seed) = pending.take() {
-        pending = run_session(device, algorithm, seed, &mut jobs, &out, &cancel);
+        // `run_session` does the yielding itself, between teardown and the
+        // claim of the next seed.
+        //
+        // No anti-flap guard: the governor resamples only every 2s, and a
+        // neighbour oscillating across the ceiling costs one session rebuild
+        // per swing (buffer allocation plus a launch, with the kernel PTX
+        // already cached). If that ever shows up as a real cost, measure it
+        // before adding hysteresis.
+        pending = run_session(device, algorithm, seed, &mut jobs, &out, &cancel, &mut ctx);
     }
 }
 
