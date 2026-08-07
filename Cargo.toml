@@ -1,6 +1,6 @@
 [package]
 name = "quip-miner-cuda"
-version = "0.3.0-rc3"
+version = "0.3.0-rc4"
 edition = "2021"
 rust-version = "1.97"
 description = "CUDA Ising miners: simulated annealing and heat-bath Gibbs (v0.3)"
