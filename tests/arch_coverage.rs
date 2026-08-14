@@ -34,7 +34,12 @@ fn compile_and_assemble(name: &str, src: &str, nodes: usize, arch: i32) -> Resul
         .map_err(|e| format!("{name} @ compute_{arch}: NVRTC: {e}"))?;
 
     let mut child = Command::new("ptxas")
-        .args([format!("-arch=sm_{arch}"), "-o".into(), "/dev/null".into(), "/dev/stdin".into()])
+        .args([
+            format!("-arch=sm_{arch}"),
+            "-o".into(),
+            "/dev/null".into(),
+            "/dev/stdin".into(),
+        ])
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
