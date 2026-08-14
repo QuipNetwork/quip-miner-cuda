@@ -27,12 +27,18 @@ quip-proto = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch
 quip-protocol = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
 quip-miner-core = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
 clap = { version = "4", features = ["derive"] }
-# NVRTC JIT + driver launch; pin CUDA 13.2 bindings to match /usr/local/cuda.
+# NVRTC JIT + driver launch. cuda-12090 is a deployment decision, not a
+# toolkit-matching one. The kernels need sm_70+ (`__nanosleep`), so the
+# effective support range is sm_70..sm_121 (SUPPORTED_ARCHS in cuda_device):
+# NVRTC 12.9 keeps sm_70/72, which CUDA 13 drops, and reaches the same
+# sm_121 ceiling; CUDA 13 would add only sm_88/sm_110, which we do not
+# need. The runtime image must ship libnvrtc.so.12
+# (docker/Dockerfile.quip-miner-cuda in quip-miner installs cuda-nvrtc-12-9).
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
     "driver",
     "nvrtc",
-    "cuda-13020",
+    "cuda-12090",
     "dynamic-loading",
 ] }
 nvml-wrapper = "0.11"

@@ -6,7 +6,6 @@
 
 # Local agent/tool state, not project configuration
 .agents/
-.beads/
 .claude/
 .codex/
 .serena/
@@ -15,4 +14,3 @@ CLAUDE.md
 # Beads / Dolt files
 .dolt/
 *.db
-.beads-credential-key

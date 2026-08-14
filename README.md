@@ -8,7 +8,16 @@ Each process binds one CUDA device (`--device N`) and drives it directly.
 Kernels (`kernels/sa.cu`, `kernels/gibbs.cu`) are JIT-compiled via NVRTC at
 runtime through `cudarc`'s dynamic-loading feature, so **building this crate
 does not require the CUDA toolkit** — only a CUDA GPU and driver are needed to
-*run* the binaries. Energies are scored with the canonical
+*run* the binaries.
+
+Supported GPUs: compute capability 7.0 (Volta) through 12.1 (consumer
+Blackwell). The floor comes from the kernels (`__nanosleep` is sm_70+); the
+ceiling from NVRTC 12.9 (`cuda-12090` in `Cargo.toml`). Kernels are compiled
+for each device's detected capability, clamped into that range; capabilities
+the toolkit lacks (for example 8.8) get the next lower architecture and load
+through the driver's forward-compatible PTX JIT. `SUPPORTED_ARCHS` in
+`src/cuda_device.rs` is the contract and `tests/arch_coverage.rs` enforces it
+(`make test-archs`). Energies are scored with the canonical
 `quip_protocol::scoring::energy_milli` so results match consensus.
 
 ## Binaries
