@@ -6,10 +6,17 @@ variables:
   PKG: quip-miner-cuda
 
 default:
-  image: rust:1.97
+  # Same toolkit the Makefile targets use (Dockerfile.ci is this base with
+  # rustup preinstalled): the CUDA 12.9 the crate's cuda-12090 pin targets.
+  # A CUDA-less image cannot catch a pin/toolkit mismatch — the original
+  # cuda-13020-vs-12.9-image gap shipped precisely because CI built on
+  # rust:1.97. rust-toolchain.toml supplies the toolchain at first cargo use.
+  image: nvidia/cuda:12.9.1-devel-ubuntu24.04
   tags: [linux, amd64]
   before_script:
-    - apt-get update -qq && apt-get install -y -qq protobuf-compiler
+    - apt-get update -qq && apt-get install -y -qq curl ca-certificates build-essential pkg-config protobuf-compiler git
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+    - export PATH="$HOME/.cargo/bin:$PATH"
 
 cache:
   key: cargo-$CI_COMMIT_REF_SLUG
@@ -18,14 +25,26 @@ cache:
 test:
   stage: test
   script:
-    - rustup component add clippy rustfmt
     - cargo fmt --all --check
     - cargo test --release
+    # The support contract: every SUPPORTED_ARCHS entry NVRTC-compiles and
+    # ptxas-assembles. Needs the toolkit (this image), not a GPU.
+    - cargo test --release --test arch_coverage -- --include-ignored
     - cargo clippy --release --all-targets --all-features -- -D warnings
-  # GPU-dependent tests are `#[ignore]`d, so this job reports them as ignored
-  # rather than passed — "no GPU ran" is visible in the output instead of
-  # looking identical to a green run. On a runner with a CUDA device, run them
-  # explicitly with `cargo test --release -- --include-ignored`.
+  # GPU-dependent tests stay `#[ignore]`d here, so this job reports them as
+  # ignored rather than passed — "no GPU ran" is visible in the output. The
+  # test-gpu job below (or `make test-gpu` locally) runs them on hardware.
+
+# On-hardware suite. Manual + allow_failure until a runner carrying the `gpu`
+# tag (docker executor with gpus=all) is confirmed; `make test-gpu` is the
+# local equivalent and part of the release checklist.
+test-gpu:
+  stage: test
+  tags: [gpu]
+  when: manual
+  allow_failure: true
+  script:
+    - cargo test --release -- --include-ignored
 
 .build:
   stage: build
