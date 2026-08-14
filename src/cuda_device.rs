@@ -16,30 +16,42 @@ use tracing::trace_span;
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 
-/// Minimum CUDA driver version (`cuDriverGetVersion` encoding: `major*1000 +
-/// minor*10`) NVRTC needs to natively target each GPU arch. Port of
-/// `GPU/base_cuda_sampler.py::_CUDA_ARCH_MIN_VERSION`.
-const CUDA_ARCH_MIN_VERSION: &[(i32, i32)] = &[
-    (121, 12090),
-    (120, 12080),
-    (103, 12090),
-    (101, 12080),
-    (100, 12080),
-    (90, 12000),
-    (89, 11080),
-    (86, 11010),
-    (80, 11000),
+/// Every GPU architecture the miner supports: the intersection of what NVRTC
+/// 12.9 targets natively (`sm_50..sm_121`, measured via `nvrtcGetSupportedArchs`
+/// 2026-08-14) and what the kernels require — both call `__nanosleep`, an
+/// `sm_70+` instruction, so the floor is Volta regardless of toolkit.
+///
+/// This is the support contract: `tests/arch_coverage.rs` compiles both
+/// kernels for each entry and assembles the PTX with `ptxas`, so growing or
+/// shrinking this list is a reviewed, CI-checked decision rather than a side
+/// effect of a toolkit bump.
+pub const SUPPORTED_ARCHS: &[i32] = &[
+    70, 72, // Volta
+    75, // Turing
+    80, 86, 87, 89, // Ampere / Ada
+    90, // Hopper
+    100, 101, 103, // Blackwell datacenter
+    120, 121, // Blackwell consumer
 ];
 
-/// Highest GPU arch the given driver version supports. Port of
-/// `_best_fallback_arch`.
-fn best_fallback_arch(driver_version: i32) -> i32 {
-    CUDA_ARCH_MIN_VERSION
+/// Highest supported arch at or below the detected compute capability.
+///
+/// Above the ceiling clamps to 121 (PTX loads forward through the driver
+/// JIT); below the floor clamps to 70, where the load then fails at the
+/// driver with a clear per-device error instead of inside NVRTC; a gap value
+/// (e.g. 88, which only CUDA 13 tables know) selects the next lower entry.
+///
+/// This replaces a driver-version fallback table that could select an arch
+/// *newer* than the actual device (r610 driver → `compute_121` on an `sm_86`
+/// card) — and PTX only loads forward, so that open failed with
+/// `CUDA_ERROR_INVALID_PTX`.
+fn select_arch(cc: i32) -> i32 {
+    SUPPORTED_ARCHS
         .iter()
-        .filter(|&&(_, min)| min <= driver_version)
-        .map(|&(arch, _)| arch)
+        .copied()
+        .filter(|&a| a <= cc)
         .max()
-        .unwrap_or(80)
+        .unwrap_or(70)
 }
 
 /// `cuDriverGetVersion`, wrapped safely (cudarc exposes only the raw sys fn).
@@ -63,8 +75,7 @@ pub enum CudaError {
     /// A requested node capacity was refused before any compile.
     #[error("node capacity: {0}")]
     Capacity(#[from] crate::capacity::CapacityError),
-    /// NVRTC rejected the kernel source on both the default and the
-    /// architecture-fallback compile.
+    /// NVRTC rejected the kernel source for the selected architecture.
     #[error("NVRTC compile: {0}")]
     Compile(String),
     /// `device_index` is past the number of devices visible to this process.
@@ -78,39 +89,26 @@ impl From<cudarc::driver::DriverError> for CudaError {
     }
 }
 
-/// Compile CUDA source with NVRTC, retrying with an explicit
-/// `--gpu-architecture=compute_N` PTX fallback if the default (portable,
-/// arch-unspecified) compile fails — e.g. a GPU newer than this NVRTC knows
-/// natively. The fallback arch is the highest one the installed driver
-/// supports; the driver JIT-compiles that PTX up to the real SM at module
-/// load time. Port of `_compile_module`.
-fn compile_with_fallback(src: &str, max_nodes: usize) -> Result<Ptx, CudaError> {
-    // Sizes the kernel's state array. Both passes must carry it: a fallback
-    // compiled at the default while the cache key says otherwise would load a
-    // kernel whose array is smaller than the run needs.
-    let define = format!("-DQUIP_MAX_NODES={max_nodes}");
-    let base = CompileOptions {
+/// Compile CUDA source with NVRTC for one specific architecture.
+///
+/// `arch` must come from [`select_arch`], which only emits values NVRTC 12.9
+/// supports — so a failure here is a real kernel error and there is no
+/// fallback pass. The arch-unspecified compile the fallback served no longer
+/// exists: NVRTC 12.9's default target (`sm_52`) predates the kernels'
+/// `__nanosleep` floor, so a portable compile can never succeed.
+fn compile_for_arch(src: &str, max_nodes: usize, arch: i32) -> Result<Ptx, CudaError> {
+    // QUIP_MAX_NODES sizes the kernel's state array and must match the
+    // jit_cache key's max_nodes component (see `jit_cache`).
+    let opts = CompileOptions {
         use_fast_math: Some(true),
-        options: vec![define.clone()],
+        options: vec![
+            format!("-DQUIP_MAX_NODES={max_nodes}"),
+            format!("--gpu-architecture=compute_{arch}"),
+        ],
         ..Default::default()
     };
-    match compile_ptx_with_opts(src, base) {
-        Ok(ptx) => Ok(ptx),
-        Err(first_err) => {
-            let ver = driver_version()?;
-            let fb = best_fallback_arch(ver);
-            let opts = CompileOptions {
-                use_fast_math: Some(true),
-                options: vec![define, format!("--gpu-architecture=compute_{fb}")],
-                ..Default::default()
-            };
-            compile_ptx_with_opts(src, opts).map_err(|e| {
-                CudaError::Compile(format!(
-                    "default compile failed ({first_err}); compute_{fb} fallback also failed: {e}"
-                ))
-            })
-        }
-    }
+    compile_ptx_with_opts(src, opts)
+        .map_err(|e| CudaError::Compile(format!("compute_{arch} compile failed: {e}")))
 }
 
 /// Loaded kernels + streams bound to a single device.
@@ -164,8 +162,8 @@ impl CudaDevice {
     /// - [`CudaError::Driver`] on any driver failure: the device-count query,
     ///   context creation, the SM-count attribute query, module load, or
     ///   kernel function load.
-    /// - [`CudaError::Compile`] if NVRTC rejects a kernel on both the default
-    ///   pass and the `compute_N` arch-fallback pass.
+    /// - [`CudaError::Compile`] if NVRTC rejects a kernel for the selected
+    ///   `compute_N` architecture.
     ///
     /// ```no_run
     /// use quip_miner_cuda::cuda_device::CudaDevice;
@@ -229,7 +227,7 @@ impl CudaDevice {
         .map_err(|_| CudaError::Driver("CUDA reported a negative SM count".into()))?;
 
         // Node capacity is a `-D` on the kernel, so it is resolved before the
-        // compile and must reach both `compile_with_fallback` and the cache
+        // compile and must reach both `compile_for_arch` and the cache
         // key. Gibbs is bounded by this device's shared memory, so the budget
         // comes from the device rather than a constant.
         let shared_per_block = usize::try_from(
@@ -256,15 +254,20 @@ impl CudaDevice {
             Algorithm::Gibbs => (capacity::SA_DEFAULT_NODES, resolved),
         };
 
-        // Cache key components: GPU arch + driver/NVRTC version + the node
-        // capacity. Capacity changes the emitted PTX without changing the
-        // source text, so PTX built at one value must never be served at
-        // another (see `jit_cache`).
-        let cc_major =
-            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
-        let cc_minor =
-            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
-        let arch = format!("sm_{cc_major}{cc_minor}");
+        // Detected capability -> clamped compile target. An unreadable
+        // attribute degrades to the floor (70) rather than failing the open:
+        // compute_70 PTX loads on every supported card. The selected arch
+        // feeds both the compile and the cache key, so the key always
+        // describes the artifact it stores.
+        let cc = match (
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
+        ) {
+            (Ok(major), Ok(minor)) => major * 10 + minor,
+            _ => 70,
+        };
+        let sel = select_arch(cc);
+        let arch = format!("sm_{sel}");
         let driver_ver = driver_version()?;
 
         let (sa_mod, gibbs_mod) = {
@@ -277,7 +280,7 @@ impl CudaDevice {
                     &arch,
                     driver_ver,
                     sa_nodes,
-                    || compile_with_fallback(SA_SRC, sa_nodes),
+                    || compile_for_arch(SA_SRC, sa_nodes, sel),
                 )?,
                 jit_cache::load_or_compile(
                     &ctx,
@@ -286,7 +289,7 @@ impl CudaDevice {
                     &arch,
                     driver_ver,
                     gibbs_nodes,
-                    || compile_with_fallback(GIBBS_SRC, gibbs_nodes),
+                    || compile_for_arch(GIBBS_SRC, gibbs_nodes, sel),
                 )?,
             )
         };
@@ -333,8 +336,8 @@ impl CudaDevice {
     /// The same set [`open`](Self::open) reports, since this is a full open
     /// that discards the device: [`CudaError::NoDevice`] for an out-of-range
     /// index, [`CudaError::Driver`] for any driver failure, and
-    /// [`CudaError::Compile`] when NVRTC fails both the default and the
-    /// arch-fallback compile.
+    /// [`CudaError::Compile`] when NVRTC rejects a kernel for the selected
+    /// architecture.
     ///
     /// ```no_run
     /// use quip_miner_cuda::cuda_device::CudaDevice;
@@ -361,27 +364,50 @@ impl CudaDevice {
 
 #[cfg(test)]
 mod arch_tests {
-    use super::best_fallback_arch;
+    use super::{select_arch, SUPPORTED_ARCHS};
 
-    // `best_fallback_arch` is a pure lookup over CUDA_ARCH_MIN_VERSION, so
-    // these run without a GPU or a CUDA driver.
+    // `select_arch` is a pure lookup over SUPPORTED_ARCHS, so these run
+    // without a GPU or a CUDA driver.
 
     #[test]
-    fn picks_the_highest_arch_the_driver_supports() {
-        // 12079: only the entries with a minimum <= 12079 qualify, the
-        // highest of which is sm_90 (min 12000).
-        assert_eq!(best_fallback_arch(12079), 90);
-        // 12080 unlocks 120/101/100; 120 is the highest of those.
-        assert_eq!(best_fallback_arch(12080), 120);
-        // 12090 additionally unlocks 121 and 103.
-        assert_eq!(best_fallback_arch(12090), 121);
+    fn in_range_value_passes_through() {
+        assert_eq!(select_arch(70), 70);
+        assert_eq!(select_arch(86), 86);
+        assert_eq!(select_arch(121), 121);
     }
 
     #[test]
-    fn floors_at_sm_80_below_every_table_entry() {
-        // No entry has a minimum <= 10000, so the `unwrap_or` floor applies.
-        assert_eq!(best_fallback_arch(10000), 80);
-        // 11000 is the lowest real entry and lands on the same arch.
-        assert_eq!(best_fallback_arch(11000), 80);
+    fn newer_than_ceiling_clamps_down_to_121() {
+        // A future card past consumer Blackwell: PTX for compute_121 still
+        // loads forward through the driver JIT.
+        assert_eq!(select_arch(130), 121);
+    }
+
+    #[test]
+    fn older_than_floor_clamps_up_to_70() {
+        // Pascal (61) predates the kernels' `__nanosleep` floor; compute_70
+        // is the lowest thing NVRTC can emit for these kernels, and the open
+        // then fails at the driver with a clear error instead of inside
+        // NVRTC.
+        assert_eq!(select_arch(61), 70);
+        assert_eq!(select_arch(0), 70);
+    }
+
+    #[test]
+    fn gap_selects_next_lower_supported_arch() {
+        // cc 8.8 exists only in CUDA 13's tables; NVRTC 12.9 cannot target
+        // it natively, so emit PTX for the next lower entry (sm_87) and let
+        // the driver JIT forward.
+        assert_eq!(select_arch(88), 87);
+        // cc 9.5 (unknown to any table) falls back to sm_90 the same way.
+        assert_eq!(select_arch(95), 90);
+    }
+
+    #[test]
+    fn table_is_sorted_unique_and_bounded() {
+        assert!(SUPPORTED_ARCHS.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(*SUPPORTED_ARCHS.first().unwrap(), 70);
+        assert_eq!(*SUPPORTED_ARCHS.last().unwrap(), 121);
+        assert_eq!(SUPPORTED_ARCHS.len(), 13);
     }
 }
