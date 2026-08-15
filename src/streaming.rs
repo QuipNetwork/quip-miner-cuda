@@ -43,6 +43,56 @@ const CTRL_EXIT_NOW: usize = 6;
 /// free rather than time our own resident kernel spends spinning.
 const YIELD_SLICE: Duration = Duration::from_millis(250);
 
+/// How long the pipeline may sit completely empty before the session ends.
+///
+/// The persistent kernel holds every SM it launched with until the host writes
+/// `CTRL_EXIT_NOW`, and only teardown writes it — so a driver that waits inside
+/// a session for jobs that are not coming pins the whole GPU while doing
+/// nothing. Ending the session hands the device back.
+///
+/// Long enough that an ordinary gap between dispatches does not cost a session
+/// rebuild (buffer allocation, launch, and the cold start's own gather), short
+/// enough that a starved miner is not sitting on a device someone else could
+/// use.
+const IDLE_TEARDOWN: Duration = Duration::from_secs(2);
+
+/// Floor for the no-completion cutoff, and the value used before this session
+/// has completed anything.
+const STALL_FLOOR: Duration = Duration::from_mins(10);
+
+/// Multiple of the longest observed completion gap that still counts as
+/// healthy. Four leaves generous room for a job that runs long without letting
+/// a genuinely wedged session wait indefinitely.
+const STALL_FACTOR: u32 = 4;
+
+/// How long a session may hold jobs with no slot completing before it is
+/// treated as wedged.
+///
+/// A fixed constant cannot serve both ends of the range this driver runs: small
+/// graphs complete in well under a second while a hard round takes minutes per
+/// job, and a cutoff short enough to be useful for the former would tear a
+/// healthy session apart mid-flight for the latter. So the cutoff tracks what
+/// this session has actually demonstrated — [`STALL_FACTOR`] times the longest
+/// wait between completions so far — and never drops below [`STALL_FLOOR`],
+/// which is what covers the stretch before anything has completed at all.
+///
+/// # Examples
+///
+/// ```
+/// use quip_miner_cuda::streaming::stall_cutoff;
+/// use std::time::Duration;
+///
+/// // Nothing observed yet, or a fast session: the floor governs.
+/// assert_eq!(stall_cutoff(Duration::ZERO), Duration::from_secs(600));
+/// assert_eq!(stall_cutoff(Duration::from_secs(30)), Duration::from_secs(600));
+/// // A session whose jobs genuinely take five minutes gets proportionate room.
+/// assert_eq!(stall_cutoff(Duration::from_secs(300)), Duration::from_secs(1200));
+/// ```
+#[must_use]
+pub fn stall_cutoff(longest_gap: Duration) -> Duration {
+    STALL_FLOOR.max(longest_gap.saturating_mul(STALL_FACTOR))
+}
+
 /// Device slots each nonce rotates through. Typed `u8` because it is first a
 /// slot *index* (`SlotState`, `ActiveSlot::slot`); the buffer-offset uses
 /// widen it with `usize::from` rather than the reverse.
@@ -532,6 +582,25 @@ impl<'a> SelfFeedingSession<'a> {
         };
         let num_betas = to_kernel_i32("num_betas", num_betas)?;
         let sweeps_per_beta = to_kernel_i32("sweeps_per_beta", sweeps_per_beta)?;
+
+        // Establish the one ordering the ctrl protocol cannot arbitrate: every
+        // cold-start slot must be uploaded and marked READY *before* the kernel
+        // can run. Slot traffic and the beta schedule go out on
+        // `stream_transfer`; this launch goes on `stream_compute`; and event
+        // tracking is disabled for this device (see `CudaDevice::open`), so the
+        // two streams are unordered. Without this drain a block can begin,
+        // find no READY slot and — before the kernels grew their entry waits —
+        // retire its nonce for the whole session, stranding every job the host
+        // later admitted to it. The entry wait now survives that race, but the
+        // ordering is still the host's to establish: the same window also lets
+        // a block read a half-written `h`/`J` payload, which no amount of
+        // kernel-side waiting can detect.
+        //
+        // Once per launch, not per slot: mid-session `upload_slot` traffic is
+        // genuinely concurrent with the running kernel and is arbitrated by the
+        // ctrl protocol, exactly as documented on `SelfFeedingSession`.
+        self.stream_transfer.synchronize()?;
+
         let dims = &self.dims;
 
         // Buffer args are pushed as shared refs regardless of which side
@@ -1435,6 +1504,14 @@ fn pump_session(
     ctx: &mut DriverContext<'_>,
 ) -> Halt {
     let mut exhausted = halt.is_exhausted();
+    // When the pipeline last went completely empty; `None` while it holds a job.
+    let mut empty_since: Option<Instant> = None;
+    // When a slot last completed, and the longest wait between completions seen
+    // so far. The stall cutoff is derived from the latter (see [`stall_cutoff`])
+    // so a session whose jobs legitimately take minutes is not torn down
+    // mid-flight.
+    let mut last_completion = Instant::now();
+    let mut longest_gap = Duration::ZERO;
     loop {
         ctx.budget.maybe_report();
         // Yielding ends the session rather than pausing inside it. The
@@ -1452,8 +1529,42 @@ fn pump_session(
             halt = refill_slots(sess, slots, feed, ctx.budget);
             exhausted = halt.is_exhausted();
         }
-        if exhausted && slots.iter().all(SlotState::is_vacant) {
+        let empty = slots.iter().all(SlotState::is_vacant);
+        if exhausted && empty {
             break;
+        }
+        if empty {
+            // Nothing in flight and nothing queued, so there is no completion
+            // left for this session to observe. Staying here only holds the
+            // persistent kernel resident on every SM it launched with: it spins
+            // for a READY slot until an explicit EXIT_NOW, which only teardown
+            // writes. Ending the session is what releases the device, and
+            // `next_seed` then parks in a blocking receive rather than a poll
+            // loop. `halt` is `Halt::Idle` on this path by construction --
+            // `exhausted` is false, so `refill_slots` ran and returned it.
+            if empty_since.get_or_insert_with(Instant::now).elapsed() >= IDLE_TEARDOWN {
+                break;
+            }
+        } else {
+            empty_since = None;
+            // Stall watchdog. The host waits for SLOT_COMPLETE while the kernel
+            // waits for SLOT_READY, so any divergence between the two parks both
+            // sides permanently, with each behaving exactly as written -- there
+            // is nothing lower down that can notice. Observed in the field as a
+            // miner pinned at 100% GPU utilization for a day with
+            // `jobs_completed` frozen and the coordinator's whole credit pool
+            // stranded in slots that never complete. Rebuild instead of waiting:
+            // rejecting the held jobs refunds their credits, so the coordinator
+            // refills the pipeline, and the next seed launches a fresh kernel.
+            let stalled = last_completion.elapsed();
+            if stalled >= stall_cutoff(longest_gap) {
+                eprintln!(
+                    "quip-miner-cuda: no slot completed in {stalled:?}; rebuilding the \
+                     self-feeding session"
+                );
+                reject_held(slots, feed.out);
+                break;
+            }
         }
         let scan = match scan_completions(sess, slots, feed.out, ctx.budget) {
             Ok(scan) => scan,
@@ -1467,6 +1578,10 @@ fn pump_session(
                 break;
             }
         };
+        if scan.progressed {
+            longest_gap = longest_gap.max(last_completion.elapsed());
+            last_completion = Instant::now();
+        }
         if scan.output_closed {
             exhausted = true;
         }

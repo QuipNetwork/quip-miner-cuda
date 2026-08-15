@@ -12,5 +12,10 @@
 CLAUDE.md
 
 # Beads / Dolt files
+.beads/
+.beads.gate.lock
 .dolt/
 *.db
+
+# Benchmark output (make bench-arch OUT=...)
+bench-out/

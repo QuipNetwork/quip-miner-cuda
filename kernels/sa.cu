@@ -155,22 +155,46 @@ __global__ void cuda_sa_self_feeding(
     // Shared memory for slot coordination
     __shared__ int s_active_slot;
 
-    // Thread 0: claim first READY slot via atomicCAS
+    // Thread 0: claim first READY slot via atomicCAS.
+    //
+    // Waits for a slot instead of giving up after one pass. The host's slot
+    // uploads -- and the SLOT_READY write that publishes them -- run on its
+    // transfer stream while this launch runs on the compute stream, and the
+    // two are deliberately unordered, so a block can start before its own
+    // cold-start slot has been marked READY. Returning on that first empty
+    // pass retired the nonce for the rest of the session: the host keeps
+    // admitting jobs to it, but no block is left to run them, so those jobs
+    // never reach SLOT_COMPLETE and the driver waits forever on a completion
+    // that cannot arrive. Same failure QUI-828 fixed in the model loop's slot
+    // wait below; this claim kept the old give-up-immediately behavior.
+    //
+    // Bounded exactly as that wait is: only an explicit host EXIT_NOW ends
+    // it, and the host always raises it on teardown (signal_exit).
     int active_slot = -1;
     if (tid == 0) {
-        for (int s = 0; s < 3; s++) {
-            int old = atomicCAS(
-                (int*)&nonce_ctrl[ctrl_base + s],
-                SLOT_READY, SLOT_ACTIVE
-            );
-            if (old == SLOT_READY) {
-                active_slot = s;
+        while (true) {
+            for (int s = 0; s < 3; s++) {
+                int old = atomicCAS(
+                    (int*)&nonce_ctrl[ctrl_base + s],
+                    SLOT_READY, SLOT_ACTIVE
+                );
+                if (old == SLOT_READY) {
+                    active_slot = s;
+                    break;
+                }
+            }
+            if (active_slot >= 0) {
                 nonce_ctrl[
                     ctrl_base + CTRL_ACTIVE_SLOT
-                ] = s;
+                ] = active_slot;
                 __threadfence();
                 break;
             }
+            if (nonce_ctrl[
+                    ctrl_base + CTRL_EXIT_NOW]) {
+                break;  // host ended the stream
+            }
+            __nanosleep(10000);  // 10us
         }
         s_active_slot = active_slot;
     }
