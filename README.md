@@ -159,6 +159,12 @@ cargo test --release                       # host-only tests
 cargo test --release -- --include-ignored  # adds the CUDA-device tests
 ```
 
+`tests/arch_coverage.rs` needs the pinned CUDA 12.9 toolkit, so it skips unless
+the environment sets `CI`. Run it with `make test-archs`, which supplies both
+the toolkit and the variable. On a different toolkit the test measures that
+toolkit's own architecture support instead of the kernels, so a skip is the
+correct result. Each skipped test prints a `SKIP` line.
+
 Conformance/golden and handshake tests drive the binary in isolation via
 `quip-mock-coordinator` and check energies against `conformance/golden_vectors.json`.
 Tests that need a live CUDA device are marked `#[ignore]`, so a machine without a

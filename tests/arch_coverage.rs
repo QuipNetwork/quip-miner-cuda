@@ -10,7 +10,8 @@
 //!
 //! Needs the CUDA 12.9 toolkit (libnvrtc + ptxas) but no device — hence the
 //! ignore; CI and `make test-archs` run it inside the CI image with
-//! `--include-ignored`.
+//! `--include-ignored`. Off that toolkit both tests skip, for the reasons on
+//! [`skip_outside_ci`].
 
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use quip_miner_cuda::cuda_device::SUPPORTED_ARCHS;
@@ -19,6 +20,35 @@ use std::process::{Command, Stdio};
 
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
+
+/// Reports whether the caller must return without testing anything, and says
+/// so on stderr when it does.
+///
+/// Both tests here measure what the *toolkit* accepts, so they only carry
+/// meaning on the pinned CUDA 12.9 one. A newer toolkit does not merely fail
+/// them, it misreports them. CUDA 13 dropped `sm_70` and `sm_72` and renamed
+/// `compute_101`, so [`every_supported_arch_compiles_and_assembles_both_kernels`]
+/// fails on three architectures while the kernels are fine, and
+/// [`floor_is_real_one_arch_below_fails`] passes for the wrong reason — NVRTC
+/// rejects `compute_62` as an unknown `-arch` value long before it can reject
+/// `__nanosleep`. A wrong answer in either direction is worse than no answer.
+///
+/// GitLab sets `CI` in every job. The `Makefile` passes it into the CI image,
+/// so `make test-archs` and `make test-gpu` count as well. Nothing else does,
+/// which is the intent: the toolkit these tests need only exists there.
+fn skip_outside_ci(test: &str) -> bool {
+    if std::env::var_os("CI").is_some() {
+        return false;
+    }
+    // Straight to fd 2 rather than `eprintln!`, which libtest captures and
+    // then discards for a passing test. A skip nobody sees reads exactly like
+    // a test that ran and found nothing wrong.
+    drop(writeln!(
+        std::io::stderr(),
+        "SKIP {test}: needs the CUDA 12.9 toolkit. Run `make test-archs`."
+    ));
+    true
+}
 
 /// Compile one kernel for one arch and assemble the PTX for that same arch.
 fn compile_and_assemble(name: &str, src: &str, nodes: usize, arch: i32) -> Result<(), String> {
@@ -66,6 +96,9 @@ fn compile_and_assemble(name: &str, src: &str, nodes: usize, arch: i32) -> Resul
 #[test]
 #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
 fn every_supported_arch_compiles_and_assembles_both_kernels() {
+    if skip_outside_ci("every_supported_arch_compiles_and_assembles_both_kernels") {
+        return;
+    }
     let mut failures = Vec::new();
     for &arch in SUPPORTED_ARCHS {
         // Smallest realistic capacity for SA, the compiled-in default for
@@ -86,6 +119,9 @@ fn every_supported_arch_compiles_and_assembles_both_kernels() {
 #[test]
 #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
 fn floor_is_real_one_arch_below_fails() {
+    if skip_outside_ci("floor_is_real_one_arch_below_fails") {
+        return;
+    }
     // The contract's lower bound is meaningful: one step below the floor the
     // kernels must NOT build (they call `__nanosleep`, sm_70+). If this
     // starts passing, the kernels gained a pre-Volta path and SUPPORTED_ARCHS
