@@ -86,6 +86,28 @@ Inside a container, or on WSL2, the governor falls back to device-wide
 utilization and logs which method it uses. The fallback applies only while
 another process holds a context. A miner alone on a GPU never throttles.
 
+## Session recovery
+
+The driver ends a self-feeding session and builds a new one in two cases.
+
+The pipeline goes empty. Nothing is in flight and the queue holds nothing, so no
+completion can arrive. The kernel is persistent and keeps every SM it launched
+with, so a wait inside the session holds the device for no work. After the
+pipeline stays empty for 2 seconds, the driver ends the session and parks in a
+blocking receive. The next seed starts a new session.
+
+No slot completes. The host waits for a slot to complete while the kernel waits
+for a slot to become ready. Any divergence between the two parks both sides, and
+each side behaves as written, so nothing below them can detect it. The driver
+measures the longest gap between completions and sets the cutoff at 4 times that
+gap, with a floor of 10 minutes. Past the cutoff it rejects the jobs it holds,
+which refunds their credits at the coordinator, and starts a new session. It
+logs one line:
+
+```text
+quip-miner-cuda: no slot completed in 612.4s; rebuilding the self-feeding session
+```
+
 ## Driver time budget
 
 The stream driver can account for its own wall clock, one window at a time.

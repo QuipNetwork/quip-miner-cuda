@@ -250,18 +250,35 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
     // from claiming different slots.
     int active_slot;
     if (local_block == 0) {
+        // Waits for a slot instead of giving up after one pass. The host's
+        // slot uploads -- and the SLOT_READY write that publishes them -- run
+        // on its transfer stream while this launch runs on the compute
+        // stream, and the two are deliberately unordered, so the lead block
+        // can start before its own cold-start slot has been marked READY.
+        // Retiring the nonce on that first empty pass (generation = -1, which
+        // also sends every non-lead block home) meant the host kept admitting
+        // jobs no block was left to run: they never reach SLOT_COMPLETE and
+        // the driver waits forever on a completion that cannot arrive. Same
+        // failure QUI-828 fixed in the model loop's slot wait; this claim kept
+        // the old give-up-immediately behavior. Only an explicit host
+        // EXIT_NOW ends the wait, and teardown always raises it.
         active_slot = -1;
         if (threadIdx.x == 0) {
-            for (int s = 0; s < 3; s++) {
-                int old = atomicCAS(
-                    (int*)&nonce_ctrl[ctrl_base + s],
-                    SLOT_READY, SLOT_ACTIVE
-                );
-                if (old == SLOT_READY) {
-                    active_slot = s;
+            while (true) {
+                for (int s = 0; s < 3; s++) {
+                    int old = atomicCAS(
+                        (int*)&nonce_ctrl[ctrl_base + s],
+                        SLOT_READY, SLOT_ACTIVE
+                    );
+                    if (old == SLOT_READY) {
+                        active_slot = s;
+                        break;
+                    }
+                }
+                if (active_slot >= 0) {
                     nonce_ctrl[
                         ctrl_base + CTRL_ACTIVE_SLOT
-                    ] = s;
+                    ] = active_slot;
                     nonce_ctrl[
                         ctrl_base + CTRL_WORK_QUEUE
                     ] = 0;
@@ -276,13 +293,16 @@ extern "C" __global__ void cuda_gibbs_self_feeding(
                     );
                     break;
                 }
-            }
-            if (active_slot < 0) {
-                atomicExch(
-                    (int*)&nonce_ctrl[
-                        ctrl_base + CTRL_GENERATION],
-                    -1
-                );
+                if (nonce_ctrl[
+                        ctrl_base + CTRL_EXIT_NOW]) {
+                    atomicExch(
+                        (int*)&nonce_ctrl[
+                            ctrl_base + CTRL_GENERATION],
+                        -1
+                    );
+                    break;  // host ended the stream
+                }
+                __nanosleep(10000);  // 10us
             }
             s_chunk = active_slot;
         }
