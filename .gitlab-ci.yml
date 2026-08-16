@@ -35,12 +35,19 @@ test:
   # ignored rather than passed — "no GPU ran" is visible in the output. The
   # test-gpu job below (or `make test-gpu` locally) runs them on hardware.
 
-# On-hardware suite. Manual + allow_failure until a runner carrying the `gpu`
-# tag (docker executor with gpus=all) is confirmed; `make test-gpu` is the
-# local equivalent and part of the release checklist.
+# On-hardware suite. Targets the `cuda` tag the GPU hosts actually carry
+# (lovelace, finney). It asked for a `gpu` tag that no runner in the group has
+# ever been registered with, so from the project's first pipeline to 0.3.0-rc8
+# this job had zero successful runs and the `#[ignore]`d GPU tests never
+# executed in CI. Inherits the CUDA image and before_script from `default:`.
+#
+# Still manual + allow_failure: whether these docker runners expose devices
+# (gpus=all) is unconfirmed, so a first failure should report, not block. Once
+# a green run is on record, drop allow_failure and gate releases on it.
+# `make test-gpu` remains the local equivalent.
 test-gpu:
   stage: test
-  tags: [gpu]
+  tags: [linux, amd64, cuda]
   when: manual
   allow_failure: true
   script:
