@@ -5,7 +5,7 @@
 //! bound on that value so the binaries, the device, and the backend
 //! identities cannot disagree.
 
-use quip_miner_core::Algorithm;
+use quip_solver_core::Algorithm;
 use thiserror::Error;
 
 /// Shipped `unpacked_state` size in `kernels/sa.cu`. Also the floor: a
@@ -219,7 +219,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_miner_core::Algorithm;
+    use quip_solver_core::Algorithm;
 
     /// A4000 reports 49152 bytes of shared memory per block. `s_chunk` and
     /// `s_arrival` take 8 of them, so 49144 nodes is the Gibbs ceiling.

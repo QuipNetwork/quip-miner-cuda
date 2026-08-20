@@ -5,7 +5,7 @@
 FROM nvidia/cuda:12.9.1-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive PATH="/root/.cargo/bin:${PATH}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates git build-essential pkg-config protobuf-compiler \
+        curl ca-certificates git build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
        | sh -s -- -y --profile minimal --default-toolchain none

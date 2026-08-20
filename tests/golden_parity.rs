@@ -14,17 +14,13 @@ use quip_miner_cuda::sampler::sample_ising;
 use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
+use quip_solver_conformance::GOLDEN_VECTORS;
 use serde_json::Value;
 use serial_test::serial;
-use std::fs;
 use std::sync::OnceLock;
 
 fn golden() -> Value {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/conformance/golden_vectors.json"
-    );
-    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    serde_json::from_str(GOLDEN_VECTORS).unwrap()
 }
 
 fn device() -> &'static CudaDevice {

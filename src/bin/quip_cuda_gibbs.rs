@@ -4,13 +4,13 @@
 //! `--miner-id` to `cuda-N` (matching `[cuda.N]` config sections).
 
 use clap::{Parser, Subcommand};
-use quip_miner_core::{run, CommonArgs, OpenError};
 use quip_miner_cuda::bench::{run_bench, BenchAction};
 use quip_miner_cuda::capacity::advertised_nodes;
 use quip_miner_cuda::capacity::GIBBS_DEFAULT_NODES;
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::nvml_gov::UtilGovernor;
 use quip_miner_cuda::{cuda_gibbs_identity, Algorithm, CudaSampler};
+use quip_solver_core::{run, CommonArgs, OpenError};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -62,7 +62,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    // Install a log sink before anything can fail. `quip-miner-core` reports
+    // Install a log sink before anything can fail. `quip-solver-core` reports
     // every session error, including `--check` failures and a refused node
     // capacity, through `tracing::error!`, and with no subscriber those
     // records are dropped: the process exits non-zero having printed nothing.
