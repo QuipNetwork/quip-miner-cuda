@@ -158,13 +158,12 @@ impl Sampler for CudaSampler {
 
     /// The live width is `max_sms / sms_per_nonce` — a property of the opened
     /// device — and `--capabilities` must answer without opening one, so no
-    /// honest device-independent number exists. Advertise the trait default
-    /// of 1 (no static multi-flight promise) and let the session's designed
-    /// mismatch log carry the correction; the live [`Self::stream_width`]
-    /// governs actual pumping. Made explicit so the choice reads as a
-    /// decision, not an omission.
+    /// honest device-independent number exists. Declare the 0 sentinel
+    /// (quip-solver-core 0.0.1-rc1): width unknown until the device opens.
+    /// The in-session `Capabilities` reply then carries the live
+    /// [`Self::stream_width`], and the session logs no misdeclaration.
     fn declared_stream_width() -> u32 {
-        1
+        0
     }
 
     fn utilization(&self) -> f64 {

@@ -4,7 +4,7 @@
 //! never confuses "self-skipped" with "passed" ([quip-miner-cuda-gp2] part b).
 //! Run them on a GPU host: `cargo test -p quip-miner-cuda -- --ignored`.
 
-use quip_solver_conformance::driver::drive_miner;
+use quip_solver_conformance::driver::{drive_miner, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER};
 use serial_test::serial;
 use std::process::Command;
 
@@ -29,18 +29,6 @@ async fn quip_cuda_sa_passes_conformance() {
     assert!(report.is_conformant(), "{}", report.summary());
 }
 
-/// `quip-solver-core`'s job-preparation gate doubles the resolved sweep
-/// budget for any backend whose `BackendIdentity.algorithm` is `"gibbs"`
-/// (`GIBBS_SWEEP_MULTIPLIER` in `job.rs`, restoring v0.2 parity with
-/// `GPU/cuda_miner.py`'s own 2x Gibbs multiplier). `quip-solver-conformance`'s
-/// `sweeps_honoured`/`results_conformant`/`is_conformant` compare
-/// `SamplerMeta.sweeps` against the literal configured value with no
-/// allowance for that gate, so they can never pass for a `"gibbs"` backend.
-/// Halve the observed sweep count back to the configured value before
-/// grading, so this still proves every other axis and the *doubling itself*
-/// — not just skips the axis.
-const GIBBS_SWEEP_MULTIPLIER: u32 = 2;
-
 #[tokio::test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
@@ -56,18 +44,16 @@ async fn quip_cuda_gibbs_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    let mut normalized = report.clone();
-    for r in &mut normalized.results {
-        assert_eq!(
-            r.meta_sweeps % GIBBS_SWEEP_MULTIPLIER,
-            0,
-            "gibbs job {:?} reported an odd sweep count {}, not a clean 2x multiple",
-            r.job_id,
-            r.meta_sweeps
-        );
-        r.meta_sweeps /= GIBBS_SWEEP_MULTIPLIER;
-    }
-    assert!(normalized.is_conformant(), "{}", report.summary());
+    // Algorithm-aware since quip-solver-conformance 0.0.1-rc1: the driver
+    // derives the doubled gibbs expectation from the Hello, so the composite
+    // verdict grades the doubling itself. Pin the derivation so a miner
+    // advertising the wrong algorithm cannot make both sides agree.
+    assert_eq!(
+        report.expected_meta_sweeps(),
+        CONFIGURED_SWEEPS * GIBBS_SWEEP_MULTIPLIER,
+        "driver did not derive the gibbs sweep expectation from the Hello"
+    );
+    assert!(report.is_conformant(), "{}", report.summary());
 }
 
 /// `--capabilities` / `--version` are headless (no CUDA).
