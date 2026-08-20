@@ -7,7 +7,7 @@ use crate::jit_cache;
 use cudarc::driver::sys::CUdevice_attribute;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
-use quip_miner_core::Algorithm;
+use quip_solver_core::Algorithm;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;

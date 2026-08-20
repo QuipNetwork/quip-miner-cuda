@@ -10,7 +10,7 @@
 
 use crate::cuda_device::CudaDevice;
 use crate::streaming;
-use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
 
 /// Failures from running one sampling job on the GPU.
@@ -22,6 +22,14 @@ pub enum SampleError {
     /// A CUDA driver call failed during upload, launch, or download.
     #[error("CUDA driver: {0}")]
     Driver(String),
+    /// The driver could not allocate device memory. Transient: another
+    /// process is holding the VRAM this job needs (the capacity model in
+    /// [`crate::capacity`] keeps our own requests below the budget), and the
+    /// memory can free again with no restart. Maps to
+    /// [`quip_solver_core::SampleError::DeviceBusy`] — a single-job reject —
+    /// not `DeviceFault`.
+    #[error("CUDA out of memory: {0}")]
+    OutOfMemory(String),
     /// The graph has more nodes than the chosen kernel's fixed-size
     /// per-thread/shared state supports. Permanent for this backend: the
     /// limit is compiled into the kernel, so retrying cannot help.
@@ -33,14 +41,46 @@ pub enum SampleError {
         limit: usize,
     },
     /// The persistent kernel never marked the slot COMPLETE before the
-    /// driver's deadline. Transient: the device is wedged or oversubscribed.
+    /// driver's deadline: the device is wedged. Maps to
+    /// [`quip_solver_core::SampleError::DeviceFault`] (see the `From` impl
+    /// below), which ends the session for a supervisor restart rather than
+    /// rejecting jobs one at a time against a device that will keep failing
+    /// the same way.
     #[error("self-feeding kernel timed out")]
     KernelTimeout,
 }
 
 impl From<cudarc::driver::DriverError> for SampleError {
     fn from(e: cudarc::driver::DriverError) -> Self {
-        SampleError::Driver(e.to_string())
+        if e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
+            SampleError::OutOfMemory(e.to_string())
+        } else {
+            SampleError::Driver(e.to_string())
+        }
+    }
+}
+
+impl From<SampleError> for quip_solver_core::SampleError {
+    /// TYPE-4: name every device error variant explicitly, so a variant added
+    /// to this enum later cannot silently fall through a wildcard.
+    ///
+    /// `GraphTooLarge` is a permanent size bound (`Capacity`). `OutOfMemory`
+    /// is transient VRAM pressure from another process (`DeviceBusy`: reject
+    /// this job, keep the session). Every other variant here is a CUDA driver
+    /// or kernel condition this backend cannot tell apart from a genuinely
+    /// wedged device — cudarc surfaces a raw driver failure as an opaque
+    /// string, with nothing to say whether the context can still be trusted —
+    /// so each ends the session for a supervisor restart (`DeviceFault`)
+    /// rather than risking a job rejected forever against hardware that will
+    /// never recover.
+    fn from(e: SampleError) -> Self {
+        match e {
+            SampleError::GraphTooLarge { .. } => Self::Capacity,
+            SampleError::OutOfMemory(_) => Self::DeviceBusy,
+            SampleError::KernelTimeout | SampleError::Cuda(_) | SampleError::Driver(_) => {
+                Self::DeviceFault(e.to_string())
+            }
+        }
     }
 }
 
@@ -53,8 +93,11 @@ impl From<cudarc::driver::DriverError> for SampleError {
 /// - [`SampleError::KernelTimeout`] if the persistent kernel never marks the
 ///   slot complete before the driver's deadline.
 /// - [`SampleError::Cuda`] if opening the device or compiling its kernels failed.
-/// - [`SampleError::Driver`] if a CUDA driver call failed while allocating the
-///   session buffers, uploading the problem, launching, or downloading results.
+/// - [`SampleError::OutOfMemory`] if the driver could not allocate device
+///   memory — transient VRAM pressure, rejected per-job.
+/// - [`SampleError::Driver`] if any other CUDA driver call failed while
+///   allocating the session buffers, uploading the problem, launching, or
+///   downloading results.
 pub fn sample_ising(
     device: &CudaDevice,
     graph: &IsingGraph,
@@ -62,4 +105,40 @@ pub fn sample_ising(
     algorithm: Algorithm,
 ) -> Result<Vec<SamplerResult>, SampleError> {
     streaming::sample_one(device, graph, params, algorithm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SampleError;
+    use cudarc::driver::sys::CUresult;
+    use cudarc::driver::DriverError;
+
+    /// VRAM pressure from another process must reject one job, not end the
+    /// session: `DeviceFault` here would put the miner in a restart loop for
+    /// a condition that clears on its own.
+    #[test]
+    fn oom_driver_error_maps_to_device_busy() {
+        let e = SampleError::from(DriverError(CUresult::CUDA_ERROR_OUT_OF_MEMORY));
+        match e {
+            SampleError::OutOfMemory(_) => {}
+            other => panic!("expected OutOfMemory, got {other:?}"),
+        }
+        assert_eq!(
+            quip_solver_core::SampleError::from(e),
+            quip_solver_core::SampleError::DeviceBusy
+        );
+    }
+
+    /// Any other driver failure still ends the session for a supervisor
+    /// restart — the context cannot be trusted.
+    #[test]
+    fn non_oom_driver_error_stays_a_device_fault() {
+        let e = SampleError::from(DriverError(CUresult::CUDA_ERROR_ILLEGAL_ADDRESS));
+        match quip_solver_core::SampleError::from(e) {
+            quip_solver_core::SampleError::DeviceFault(detail) => {
+                assert!(detail.contains("CUDA driver"));
+            }
+            other => panic!("expected DeviceFault, got {other:?}"),
+        }
+    }
 }

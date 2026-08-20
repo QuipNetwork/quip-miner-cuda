@@ -17,10 +17,10 @@
 //! Redraw uses [`draw_ising_milli`] — the same golden-pinned draw the
 //! network uses (`quip-coordinator/src/producer/pow.rs`) — then maps each
 //! edge's native (possibly sparse) node ids to dense `0..n` positions via
-//! `nodes`' order, matching `TopologyCache::from_proto` in `quip-miner-core`.
+//! `nodes`' order, matching `TopologyCache::from_proto` in `quip-solver-core`.
 
-use quip_miner_core::IsingGraph;
 use quip_protocol::chacha8::draw_ising_milli;
+use quip_solver_core::IsingGraph;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -114,7 +114,7 @@ pub fn load_topology_spec(path: &Path) -> Result<TopologySpec, CorpusError> {
 ///
 /// Dense node positions are the index of each native id in `spec.nodes`'
 /// order — the same mapping `TopologyCache::from_proto` builds in
-/// `quip-miner-core` when a miner resolves a `TopologyHash` job.
+/// `quip-solver-core` when a miner resolves a `TopologyHash` job.
 fn build_graph(spec: &TopologySpec, nonce: [u8; 32]) -> Result<IsingGraph, String> {
     let (h_milli, j_milli) = draw_ising_milli(
         nonce,
@@ -219,7 +219,8 @@ mod tests {
         ));
     }
 
-    /// Golden vector (`conformance/golden_vectors.json`'s `ising[0]`): the
+    /// Golden vector (`quip-solver-conformance`'s `golden_vectors.json`,
+    /// `ising[0]`): the
     /// redrawn graph's `h`/`j`/edges must match the golden `h_milli`/`j_milli`
     /// (scaled) and edge list exactly, proving the corpus path calls
     /// `draw_ising_milli` with the right arguments and doesn't misalign `J`

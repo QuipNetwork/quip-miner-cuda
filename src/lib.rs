@@ -11,7 +11,7 @@
 //! always scored with [`quip_protocol::scoring::energy_milli`] for
 //! consensus — the kernel's own int8-quantized energy tracking only drives
 //! its internal annealing accept/reject decisions. The coordinator session
-//! loop lives in `quip-miner-core`.
+//! loop lives in `quip-solver-core`.
 
 pub mod bench;
 pub mod capacity;
@@ -26,15 +26,15 @@ pub mod schema;
 pub mod streaming;
 pub mod topology;
 
-pub use quip_miner_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
 pub use sampler::sample_ising;
 
 use cuda_device::CudaDevice;
 use nvml_gov::UtilGovernor;
-use quip_miner_core::config::{config_override, warn_unknown_fields};
-use quip_miner_core::{BackendIdentity, CancelGuard, Sampler, StreamJob, StreamResult};
-use quip_proto::v1::RejectReason;
-use sampler::SampleError;
+use quip_solver_core::config::{config_override, warn_unknown_fields};
+use quip_solver_core::{
+    BackendIdentity, CancelToken, SampleError, Sampler, StreamJob, StreamResult,
+};
 use std::collections::BTreeMap;
 
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
@@ -54,7 +54,7 @@ struct CudaConfig {
 }
 
 /// CUDA adapt envelope (from `GPU/cuda_miner.py`).
-const CUDA_ADAPT: quip_miner_core::adapt::AdaptBounds = quip_miner_core::adapt::AdaptBounds {
+const CUDA_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adapt::AdaptBounds {
     min_sweeps: 256,
     max_sweeps: 2048,
     min_reads: 64,
@@ -84,6 +84,9 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: "sa",
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
+        // A real `sample_stream` override and the NVML governor — the two
+        // capability names `BackendIdentity::features` documents.
+        features: &["streaming", "governor"],
         adapt: CUDA_ADAPT,
     }
 }
@@ -98,6 +101,8 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: "gibbs",
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
+        // Same capability set as `cuda_sa_identity`: streaming + governor.
+        features: &["streaming", "governor"],
         adapt: CUDA_ADAPT,
     }
 }
@@ -127,21 +132,12 @@ impl Sampler for CudaSampler {
         &self,
         graph: &IsingGraph,
         params: &SampleParams,
-    ) -> Result<Vec<SamplerResult>, RejectReason> {
-        // quip-miner-cuda-gp4: GraphTooLarge is permanent (kernel storage);
-        // KernelTimeout and other errors are transient overload.
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        // quip-miner-cuda-gp4: the device-error -> wire-error mapping lives on
+        // `sampler::SampleError`'s `From` impl (TYPE-4: exhaustive, no wildcard).
         sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
             eprintln!("cuda sample failed: {e}");
-            // TYPE-4: name every SampleError variant so a new one cannot
-            // silently map to Overloaded via a wildcard. Identical Overloaded
-            // arms are intentional — reasons differ even when the reject does.
-            #[allow(clippy::match_same_arms)]
-            match e {
-                SampleError::GraphTooLarge { .. } => RejectReason::TooLarge,
-                SampleError::KernelTimeout => RejectReason::Overloaded,
-                SampleError::Cuda(_) => RejectReason::Overloaded,
-                SampleError::Driver(_) => RejectReason::Overloaded,
-            }
+            e.into()
         })
     }
 
@@ -151,13 +147,24 @@ impl Sampler for CudaSampler {
         &self,
         jobs: tokio::sync::mpsc::Receiver<StreamJob>,
         out: tokio::sync::mpsc::Sender<StreamResult>,
-        cancel: CancelGuard,
+        cancel: CancelToken,
     ) {
         streaming::run_stream(&self.device, self.algorithm, jobs, out, cancel, &self.gov);
     }
 
     fn stream_width(&self) -> usize {
         streaming::stream_width(&self.device, self.algorithm)
+    }
+
+    /// The live width is `max_sms / sms_per_nonce` — a property of the opened
+    /// device — and `--capabilities` must answer without opening one, so no
+    /// honest device-independent number exists. Advertise the trait default
+    /// of 1 (no static multi-flight promise) and let the session's designed
+    /// mismatch log carry the correction; the live [`Self::stream_width`]
+    /// governs actual pumping. Made explicit so the choice reads as a
+    /// decision, not an omission.
+    fn declared_stream_width() -> u32 {
+        1
     }
 
     fn utilization(&self) -> f64 {

@@ -32,10 +32,10 @@
 //! `ADAPT_MIN_READS=256`) against an Advantage2-scale topology. Everything is
 //! overridable so the light-workload regime from QUI-882 can be soaked too.
 
-use quip_miner_core::{Algorithm, CancelGuard, IsingGraph, SampleParams, StreamJob};
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::nvml_gov::UtilGovernor;
 use quip_miner_cuda::streaming::run_stream;
+use quip_solver_core::{Algorithm, CancelToken, IsingGraph, SampleParams, StreamJob};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -262,7 +262,7 @@ fn stream_driver_soak() {
                 Algorithm::Sa,
                 job_rx,
                 res_tx,
-                CancelGuard::default(),
+                CancelToken::default(),
                 gov_ref,
             );
         });
@@ -283,7 +283,7 @@ fn stream_driver_soak() {
                         beta_range: None,
                         seed: n.wrapping_mul(0x9E37_79B9_7F4A_7C15),
                     },
-                    generation: 0,
+                    watermark: None,
                 };
                 if job_tx.blocking_send(job).is_err() {
                     break;

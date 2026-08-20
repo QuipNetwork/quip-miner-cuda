@@ -22,13 +22,13 @@ use crate::sampler::SampleError;
 use crate::topology::{fill_h_j, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use quip_miner_core::beta::{default_ising_beta_range, geometric_beta_schedule};
-use quip_miner_core::{
-    Algorithm, CancelGuard, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome,
+use quip_protocol::scoring::energy_milli;
+use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::SampleError as WireSampleError;
+use quip_solver_core::{
+    Algorithm, CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome,
     StreamResult,
 };
-use quip_proto::v1::RejectReason;
-use quip_protocol::scoring::energy_milli;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -1189,7 +1189,7 @@ fn try_pull(jobs: &mut Receiver<StreamJob>, key: &SessionKey) -> Pull {
     }
 }
 
-fn send_reject(out: &Sender<StreamResult>, job: StreamJob, reason: RejectReason) {
+fn send_reject(out: &Sender<StreamResult>, job: StreamJob, err: WireSampleError) {
     // Discarded deliberately: `blocking_send` only fails once the result
     // channel is closed, i.e. the consumer is gone and no result of any kind
     // can still be delivered. Every caller either follows this with a send of
@@ -1198,16 +1198,19 @@ fn send_reject(out: &Sender<StreamResult>, job: StreamJob, reason: RejectReason)
     // rejection could recover here.
     drop(out.blocking_send(StreamResult {
         job_id: job.job_id,
-        outcome: StreamOutcome::Completed(Err(reason)),
+        outcome: StreamOutcome::Completed(Err(err)),
         device_access_time_us: 0,
     }));
 }
 
 /// Score one completed job's downloaded reads and emit its `StreamResult`.
 ///
-/// A failed download is reported as `Overloaded` rather than banked as an
+/// A failed download is reported as a `DeviceFault` rather than banked as an
 /// empty success: telling the coordinator a job succeeded with zero reads
-/// loses the work permanently, whereas a rejection lets it retry.
+/// loses the work permanently, and a slot that downloads COMPLETE samples
+/// wrong is the same device condition [`SampleError::KernelTimeout`] and a
+/// ctrl-mailbox read failure already end the session over (see
+/// `scan_completions`).
 ///
 /// Returns `false` once the result channel has closed.
 fn emit_completion(
@@ -1225,7 +1228,7 @@ fn emit_completion(
         Ok(reads) => reads,
         Err(e) => {
             eprintln!("cuda streaming slot download failed: {e}");
-            send_reject(out, done.job, RejectReason::Overloaded);
+            send_reject(out, done.job, e.into());
             return true;
         }
     };
@@ -1289,7 +1292,7 @@ struct Feed<'a> {
     out: &'a Sender<StreamResult>,
     /// Watermark for generations the coordinator abandoned on reseed. Jobs at or
     /// below it are emitted as `Cancelled` at dequeue rather than sampled.
-    cancel: &'a CancelGuard,
+    cancel: &'a CancelToken,
 }
 
 /// Emit a `Cancelled` result for a job from an abandoned generation so the
@@ -1335,12 +1338,12 @@ fn answer_empty_graph(out: &Sender<StreamResult>, job: StreamJob) -> bool {
     .is_ok()
 }
 
-/// Reject every job these nonces still hold, so none is dropped without a
-/// `StreamResult` — the coordinator is blocked on one per job.
-fn reject_held(slots: &mut [SlotState], out: &Sender<StreamResult>) {
+/// Reject every job these nonces still hold with `reason`, so none is dropped
+/// without a `StreamResult` — the coordinator is blocked on one per job.
+fn reject_held(slots: &mut [SlotState], out: &Sender<StreamResult>, reason: &WireSampleError) {
     for slot in slots {
         for job in slot.drain_jobs() {
-            send_reject(out, job, RejectReason::Overloaded);
+            send_reject(out, job, reason.clone());
         }
     }
 }
@@ -1383,7 +1386,7 @@ fn drain_cold_start(feed: &mut Feed<'_>, seed: StreamJob, width: usize) -> (Vec<
     while cold.len() < width && Instant::now() < hard_cap {
         match try_pull(feed.jobs, feed.key) {
             Pull::Job(j) => {
-                if feed.cancel.is_cancelled(j.generation) {
+                if feed.cancel.is_cancelled(j.watermark) {
                     let _ = emit_cancelled(feed.out, j);
                 } else {
                     cold.push(j);
@@ -1415,7 +1418,7 @@ fn refill_slots(
         while let Some(free) = slot.open_slot() {
             match try_pull(feed.jobs, feed.key) {
                 Pull::Job(j) => {
-                    if feed.cancel.is_cancelled(j.generation) {
+                    if feed.cancel.is_cancelled(j.watermark) {
                         if !emit_cancelled(feed.out, j) {
                             return Halt::Closed;
                         }
@@ -1424,8 +1427,8 @@ fn refill_slots(
                     let uploaded = budget.mark();
                     let upload = sess.upload_slot(nonce_id, usize::from(free), &j.graph);
                     budget.charge(Bucket::Upload, uploaded);
-                    if upload.is_err() {
-                        send_reject(feed.out, j, RejectReason::Overloaded);
+                    if let Err(e) = upload {
+                        send_reject(feed.out, j, e.into());
                         continue;
                     }
                     slot.admit(free, j);
@@ -1556,13 +1559,19 @@ fn pump_session(
             // stranded in slots that never complete. Rebuild instead of waiting:
             // rejecting the held jobs refunds their credits, so the coordinator
             // refills the pipeline, and the next seed launches a fresh kernel.
+            //
+            // `DeviceBusy`, not `KernelTimeout.into()` (`DeviceFault`): the
+            // in-process rebuild below IS the recovery, and a fault would end
+            // the whole session before it runs. If the device is genuinely
+            // gone, the rebuild itself fails and that error is the
+            // session-fatal signal.
             let stalled = last_completion.elapsed();
             if stalled >= stall_cutoff(longest_gap) {
                 eprintln!(
                     "quip-miner-cuda: no slot completed in {stalled:?}; rebuilding the \
                      self-feeding session"
                 );
-                reject_held(slots, feed.out);
+                reject_held(slots, feed.out, &WireSampleError::DeviceBusy);
                 break;
             }
         }
@@ -1572,9 +1581,12 @@ fn pump_session(
                 // The ctrl mailbox is what tells us a slot finished, so once
                 // it is unreadable no in-flight job can ever be observed as
                 // COMPLETE. Reject everything still held instead of breaking
-                // out and dropping it silently.
+                // out and dropping it silently. `DeviceBusy` for the same
+                // reason as the stall watchdog above: the break leads to a
+                // rebuild, and a rebuild against a dead device surfaces its
+                // own fault.
                 eprintln!("cuda streaming ctrl poll failed: {e}");
-                reject_held(slots, feed.out);
+                reject_held(slots, feed.out, &WireSampleError::DeviceBusy);
                 break;
             }
         };
@@ -1606,7 +1618,7 @@ fn run_session(
     seed: StreamJob,
     jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
-    cancel: &CancelGuard,
+    cancel: &CancelToken,
     ctx: &mut DriverContext<'_>,
 ) -> Option<StreamJob> {
     if seed.graph.num_nodes() == 0 {
@@ -1620,7 +1632,7 @@ fn run_session(
     // Seed from a generation the coordinator abandoned on reseed: emit Cancelled
     // (refunds the credit) and advance to the next seed rather than spinning up a
     // kernel for stale work.
-    if cancel.is_cancelled(seed.generation) {
+    if cancel.is_cancelled(seed.watermark) {
         if !emit_cancelled(out, seed) {
             return None;
         }
@@ -1657,12 +1669,12 @@ fn run_session(
         Ok(s) => s,
         Err(e) => {
             eprintln!("cuda streaming session build failed: {e}");
-            send_reject(out, seed, RejectReason::Overloaded);
+            send_reject(out, seed, e.into());
             return feed.jobs.blocking_recv();
         }
     };
-    if sess.upload_beta_schedule(&beta).is_err() {
-        send_reject(out, seed, RejectReason::Overloaded);
+    if let Err(e) = sess.upload_beta_schedule(&beta) {
+        send_reject(out, seed, e.into());
         return feed.jobs.blocking_recv();
     }
 
@@ -1673,29 +1685,26 @@ fn run_session(
     );
     let mut slots: Vec<SlotState> = (0..width).map(|_| SlotState::default()).collect();
     for (nonce_id, job) in cold.into_iter().enumerate() {
-        if sess.upload_slot(nonce_id, 0, &job.graph).is_err() {
-            send_reject(out, job, RejectReason::Overloaded);
+        if let Err(e) = sess.upload_slot(nonce_id, 0, &job.graph) {
+            send_reject(out, job, e.into());
             continue;
         }
         slots[nonce_id].assign_active(0, job);
     }
 
-    if sess
-        .launch(
-            active_nonces,
-            beta.len(),
-            sweeps_per_beta,
-            session_seed(job_seed),
-        )
-        .is_err()
-    {
+    if let Err(e) = sess.launch(
+        active_nonces,
+        beta.len(),
+        sweeps_per_beta,
+        session_seed(job_seed),
+    ) {
         // The cold-start jobs are held in `slots`, not handed off: with no
         // kernel running none of them can ever complete, so reject them here
         // rather than drop them and leave the coordinator waiting on results
         // that will never come. A cold-start mismatch is a real job too, and
         // `next_seed` carries it to the next session instead of dropping it
         // with the failed launch.
-        reject_held(&mut slots[..active_nonces], out);
+        reject_held(&mut slots[..active_nonces], out, &e.into());
         return next_seed(&mut feed, halt);
     }
 
@@ -1723,7 +1732,7 @@ fn run_session(
 /// completion order.
 ///
 /// Returns once `jobs` is closed and every job it delivered has produced a
-/// [`StreamResult`] — success, or a `RejectReason` if the device failed.
+/// [`StreamResult`] — success, or a `SampleError` if the device failed.
 ///
 /// # Yielding
 ///
@@ -1735,7 +1744,7 @@ fn run_session(
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_core::{CancelGuard, StreamJob, StreamResult};
+/// use quip_solver_core::{CancelToken, StreamJob, StreamResult};
 /// use quip_miner_cuda::cuda_device::CudaDevice;
 /// use quip_miner_cuda::nvml_gov::UtilGovernor;
 /// use quip_miner_cuda::streaming::run_stream;
@@ -1751,7 +1760,7 @@ fn run_session(
 /// // A real caller feeds `job_tx` from another task; closing it is what
 /// // eventually lets `run_stream` return.
 /// drop(job_tx);
-/// run_stream(&device, Algorithm::Sa, job_rx, res_tx, CancelGuard::default(), &gov);
+/// run_stream(&device, Algorithm::Sa, job_rx, res_tx, CancelToken::default(), &gov);
 /// # Ok(())
 /// # }
 /// ```
@@ -1765,7 +1774,7 @@ pub fn run_stream(
     algorithm: Algorithm,
     mut jobs: Receiver<StreamJob>,
     out: Sender<StreamResult>,
-    cancel: CancelGuard,
+    cancel: CancelToken,
     gov: &UtilGovernor,
 ) {
     // One budget for the whole process, not per session: uptime is the
@@ -1814,7 +1823,7 @@ mod tests {
             job_id: vec![id],
             graph: graph(),
             params: SampleParams::default(),
-            generation: 0,
+            watermark: None,
         }
     }
 
@@ -2101,7 +2110,7 @@ mod tests {
         job_tx.try_send(job(2)).expect("queue a second job");
         drop(job_tx);
 
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
         let mut feed = Feed {
             jobs: &mut job_rx,
             key: &key,
@@ -2125,7 +2134,7 @@ mod tests {
         other.params.num_sweeps += 1;
         job_tx.try_send(other).expect("queue a mismatched job");
 
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
         let mut feed = Feed {
             jobs: &mut job_rx,
             key: &key,
@@ -2150,7 +2159,7 @@ mod tests {
         job_tx.try_send(job(2)).expect("queue a second job");
         job_tx.try_send(job(3)).expect("queue a third job");
 
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
         let mut feed = Feed {
             jobs: &mut job_rx,
             key: &key,
@@ -2171,7 +2180,7 @@ mod tests {
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let key = SessionKey::seed(&job(1), 8);
         drop(job_tx);
-        let cancel = CancelGuard::default();
+        let cancel = CancelToken::default();
         let mut feed = Feed {
             jobs: &mut job_rx,
             key: &key,

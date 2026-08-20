@@ -1,11 +1,10 @@
-//! Protocol conformance: spawn SA and Gibbs miners against quip-mock-coordinator.
+//! Protocol conformance: spawn SA and Gibbs miners against quip-solver-conformance's driver.
 //!
 //! GPU-backed drive tests are `#[ignore]` so default `cargo test` on headless CI
 //! never confuses "self-skipped" with "passed" ([quip-miner-cuda-gp2] part b).
 //! Run them on a GPU host: `cargo test -p quip-miner-cuda -- --ignored`.
 
-use quip_mock_coordinator::driver::drive_miner;
-use quip_proto::v1::RejectReason;
+use quip_solver_conformance::driver::drive_miner;
 use serial_test::serial;
 use std::process::Command;
 
@@ -27,44 +26,20 @@ async fn quip_cuda_sa_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    assert!(report.handshake_ok, "SA handshake failed");
-    assert_eq!(
-        report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
-    );
-    assert!(
-        report.result_job_ids().iter().any(|id| id == b"job-1"),
-        "missing result for job-1: {:?}",
-        report.result_job_ids()
-    );
-    assert!(
-        report.result_job_ids().iter().any(|id| id == b"job-2"),
-        "missing result for job-2: {:?}",
-        report.result_job_ids()
-    );
-    assert!(
-        report.result_job_ids().iter().any(|id| id == b"job-hash"),
-        "missing result for topology-hash job-hash: {:?}",
-        report.result_job_ids()
-    );
-    assert!(
-        report.has_reject(b"job-bad-h", RejectReason::Malformed),
-        "missing MALFORMED reject for job-bad-h: {:?}",
-        report.rejects
-    );
-    assert!(
-        report.has_reject(b"job-gate", RejectReason::UnsupportedKind),
-        "missing UNSUPPORTED_KIND reject for job-gate: {:?}",
-        report.rejects
-    );
-    assert!(
-        report.has_reject(b"job-old", RejectReason::Expired),
-        "missing EXPIRED reject for job-old: {:?}",
-        report.rejects
-    );
-    assert_eq!(report.exit_code, 0, "clean shutdown expected");
+    assert!(report.is_conformant(), "{}", report.summary());
 }
+
+/// `quip-solver-core`'s job-preparation gate doubles the resolved sweep
+/// budget for any backend whose `BackendIdentity.algorithm` is `"gibbs"`
+/// (`GIBBS_SWEEP_MULTIPLIER` in `job.rs`, restoring v0.2 parity with
+/// `GPU/cuda_miner.py`'s own 2x Gibbs multiplier). `quip-solver-conformance`'s
+/// `sweeps_honoured`/`results_conformant`/`is_conformant` compare
+/// `SamplerMeta.sweeps` against the literal configured value with no
+/// allowance for that gate, so they can never pass for a `"gibbs"` backend.
+/// Halve the observed sweep count back to the configured value before
+/// grading, so this still proves every other axis and the *doubling itself*
+/// — not just skips the axis.
+const GIBBS_SWEEP_MULTIPLIER: u32 = 2;
 
 #[tokio::test]
 #[serial]
@@ -81,19 +56,18 @@ async fn quip_cuda_gibbs_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    assert!(report.handshake_ok, "Gibbs handshake failed");
-    assert_eq!(
-        report.result_job_ids().len(),
-        3,
-        "expected 3 job results (job-1, job-2, job-hash)"
-    );
-    assert!(report.result_job_ids().iter().any(|id| id == b"job-1"));
-    assert!(report.result_job_ids().iter().any(|id| id == b"job-2"));
-    assert!(report.result_job_ids().iter().any(|id| id == b"job-hash"));
-    assert!(report.has_reject(b"job-bad-h", RejectReason::Malformed));
-    assert!(report.has_reject(b"job-gate", RejectReason::UnsupportedKind));
-    assert!(report.has_reject(b"job-old", RejectReason::Expired));
-    assert_eq!(report.exit_code, 0, "clean shutdown expected");
+    let mut normalized = report.clone();
+    for r in &mut normalized.results {
+        assert_eq!(
+            r.meta_sweeps % GIBBS_SWEEP_MULTIPLIER,
+            0,
+            "gibbs job {:?} reported an odd sweep count {}, not a clean 2x multiple",
+            r.job_id,
+            r.meta_sweeps
+        );
+        r.meta_sweeps /= GIBBS_SWEEP_MULTIPLIER;
+    }
+    assert!(normalized.is_conformant(), "{}", report.summary());
 }
 
 /// `--capabilities` / `--version` are headless (no CUDA).

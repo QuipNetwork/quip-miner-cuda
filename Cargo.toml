@@ -19,13 +19,13 @@ path = "src/bin/quip_cuda_sa.rs"
 name = "quip-cuda-gibbs"
 path = "src/bin/quip_cuda_gibbs.rs"
 
-# Shared protocol crates live in the quip-protocol repo; pinned by tag until
-# they are published to a registry (crates.io / GitLab). Bump the tag to adopt
-# newer shared code.
+# The solver contract (quip-proto, quip-protocol, quip-solver-core) is
+# published to crates.io from quip.network/quip-solver-core. Bump the pinned
+# version to adopt newer shared code.
 [dependencies]
-quip-proto = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
-quip-protocol = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
-quip-miner-core = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
+quip-proto = "0.0.0"
+quip-protocol = "0.0.0"
+quip-solver-core = "0.0.0"
 clap = { version = "4", features = ["derive"] }
 # NVRTC JIT + driver launch. cuda-12090 is a deployment decision, not a
 # toolkit-matching one. The kernels need sm_70+ (`__nanosleep`), so the
@@ -52,7 +52,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-flame = "0.2"
 
 [dev-dependencies]
-quip-mock-coordinator = { git = "https://gitlab.com/quip.network/quip-protocol.git", branch = "v0.3" }
+quip-solver-conformance = "0.0.0"
 proptest = "1"
 serial_test = "3.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync", "process"] }

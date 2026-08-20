@@ -33,14 +33,14 @@ Prebuilt `amd64` binaries are attached to each
 ## Build
 
 ```sh
-cargo build --release        # needs protoc on PATH (protobuf-compiler)
+cargo build --release
 ```
 
 `cudarc` uses dynamic-loading, so the build links against no CUDA libraries;
 the CUDA driver is loaded and kernels are compiled at process start.
 
-Shared protocol crates (`quip-proto`, `quip-protocol`, `quip-miner-core`) are
-git dependencies pinned to a `shared-vX.Y.Z` tag of `quip-protocol`.
+The solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) is
+published to crates.io from [quip.network/quip-solver-core](https://gitlab.com/quip.network/quip-solver-core).
 
 ## Running
 
@@ -166,7 +166,8 @@ toolkit's own architecture support instead of the kernels, so a skip is the
 correct result. Each skipped test prints a `SKIP` line.
 
 Conformance/golden and handshake tests drive the binary in isolation via
-`quip-mock-coordinator` and check energies against `conformance/golden_vectors.json`.
+`quip-solver-conformance`'s driver and check energies against its bundled
+golden vectors.
 Tests that need a live CUDA device are marked `#[ignore]`, so a machine without a
 GPU reports them as ignored rather than passed. Run them with `--include-ignored`
 on a CUDA host.
