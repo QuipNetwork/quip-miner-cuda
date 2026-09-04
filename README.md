@@ -5,6 +5,9 @@ mining protocol: simulated annealing (`quip-cuda-sa`) and heat-bath Gibbs
 (`quip-cuda-gibbs`), shipped as separate binaries. **amd64 only.**
 
 Each process binds one CUDA device (`--device N`) and drives it directly.
+The coordinator takes N from the `[cuda.N]` config section and passes it as
+`--device N`; the miner warns at startup when its `cuda-N` label and `--device`
+disagree, and the label never overrides the flag.
 Kernels (`kernels/sa.cu`, `kernels/gibbs.cu`) are JIT-compiled via NVRTC at
 runtime through `cudarc`'s dynamic-loading feature, so **building this crate
 does not require the CUDA toolkit** — only a CUDA GPU and driver are needed to

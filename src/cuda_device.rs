@@ -122,6 +122,14 @@ fn compile_for_arch(src: &str, max_nodes: usize, arch: i32) -> Result<Ptx, CudaE
 pub struct CudaDevice {
     /// Zero-based index of the physical GPU this device was opened on.
     pub device_index: usize,
+    /// PCI bus id of that GPU, in NVML's `domain:bus:device.function` form.
+    ///
+    /// The CUDA ordinal above cannot be used to reach the same GPU through
+    /// NVML: NVML enumerates in PCI bus order, while a CUDA ordinal follows
+    /// `CUDA_DEVICE_ORDER` (default `FASTEST_FIRST`) and is further remapped
+    /// by `CUDA_VISIBLE_DEVICES`. The bus id is the one name both APIs agree
+    /// on, so the governor resolves its handle from this.
+    pub pci_bus_id: String,
     pub(crate) ctx: Arc<CudaContext>,
     /// The device's default (null) stream. `streaming` builds its own
     /// compute/transfer streams, so nothing reads this today.
@@ -146,6 +154,7 @@ impl fmt::Debug for CudaDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CudaDevice")
             .field("device_index", &self.device_index)
+            .field("pci_bus_id", &self.pci_bus_id)
             .field("max_sms", &self.max_sms)
             .field("max_nodes", &self.max_nodes)
             .finish_non_exhaustive()
@@ -297,8 +306,17 @@ impl CudaDevice {
         let sa = sa_mod.load_function("cuda_sa_self_feeding")?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
 
+        // Read before the struct is built so an unreadable attribute fails the
+        // open rather than leaving a device whose governor can never bind.
+        let pci_bus_id = format_pci_bus_id(
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID)?,
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_BUS_ID)?,
+            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)?,
+        );
+
         Ok(Self {
             device_index,
+            pci_bus_id,
             ctx,
             stream,
             sa,
@@ -362,6 +380,60 @@ impl CudaDevice {
     }
 }
 
+/// NVML's textual PCI bus id, `%08X:%02X:%02X.0`, from the three CUDA device
+/// attributes that carry the same address.
+///
+/// `nvmlDeviceGetHandleByPciBusId` parses this exact shape, and it is what
+/// `nvidia-smi` prints, so an operator can match a miner's log line against
+/// `nvidia-smi --query-gpu=pci.bus_id` directly. The function is always 0:
+/// CUDA reports no function digit, and a GPU is never a multi-function device.
+///
+/// The three inputs are `i32` because that is what `CudaContext::attribute`
+/// returns; a driver reporting a negative address would be a driver bug, and
+/// the hex formatting below renders it harmlessly rather than panicking.
+#[must_use]
+fn format_pci_bus_id(domain: i32, bus: i32, device: i32) -> String {
+    format!("{domain:08X}:{bus:02X}:{device:02X}.0")
+}
+
+/// The CUDA ordinal a `cuda-N` miner id names, when the label has that shape.
+///
+/// Deliberately strict — all ASCII digits, no sign, no leading zero except
+/// `"0"` — so a free-form label that merely looks device-shaped cannot produce
+/// a spurious warning. Returns `None` for any other label (`drive-0`,
+/// `mock-0`, `rig7-a`), which imply nothing about the device.
+///
+/// Advisory only: this never selects a device. The coordinator owns the
+/// `[cuda.N]` -> device mapping and passes it as `--device N`.
+fn device_from_miner_id(miner_id: &str) -> Option<usize> {
+    let digits = miner_id.strip_prefix("cuda-")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // A leading zero ("cuda-01") is a different label from "cuda-1"; treating
+    // both as device 1 would let a label the coordinator never emits pass as
+    // one it does.
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The ordinal a `cuda-N` miner id names, when it disagrees with `device`.
+///
+/// `None` means there is nothing to report: the label names no device, or it
+/// names the one `--device` selected. Both binaries decide identically, so the
+/// comparison lives here rather than twice in `main`.
+///
+/// Advisory only. The label never selects a device — overriding `--device`
+/// from it would move a running miner to a GPU the operator's config may not
+/// have — so a disagreement is a log line, not an error.
+#[must_use]
+pub fn device_label_mismatch(miner_id: Option<&str>, device: usize) -> Option<usize> {
+    let labelled = miner_id.and_then(device_from_miner_id)?;
+    (labelled != device).then_some(labelled)
+}
+
 #[cfg(test)]
 mod arch_tests {
     use super::{select_arch, SUPPORTED_ARCHS};
@@ -409,5 +481,89 @@ mod arch_tests {
         assert_eq!(*SUPPORTED_ARCHS.first().unwrap(), 70);
         assert_eq!(*SUPPORTED_ARCHS.last().unwrap(), 121);
         assert_eq!(SUPPORTED_ARCHS.len(), 13);
+    }
+}
+
+#[cfg(test)]
+mod pci_bus_id_tests {
+    use super::format_pci_bus_id;
+
+    /// The shape `nvmlDeviceGetHandleByPciBusId` parses and `nvidia-smi
+    /// --query-gpu=pci.bus_id` prints. Widths are load-bearing: NVML does not
+    /// match an unpadded address.
+    #[test]
+    fn renders_nvml_and_nvidia_smi_shape() {
+        assert_eq!(format_pci_bus_id(0, 3, 0), "00000000:03:00.0");
+        assert_eq!(format_pci_bus_id(0, 6, 0), "00000000:06:00.0");
+    }
+
+    /// Bus and device numbers past 15 must stay two hex digits, not widen.
+    #[test]
+    fn hex_digits_are_uppercase_and_not_truncated() {
+        assert_eq!(format_pci_bus_id(0, 0x1A, 0x0B), "00000000:1A:0B.0");
+        assert_eq!(format_pci_bus_id(1, 0xFF, 0xFF), "00000001:FF:FF.0");
+    }
+}
+
+#[cfg(test)]
+mod miner_id_tests {
+    use super::{device_from_miner_id, device_label_mismatch};
+
+    // Pure string parsing: no GPU, no CUDA driver.
+
+    #[test]
+    fn coordinator_shaped_labels_yield_their_ordinal() {
+        assert_eq!(device_from_miner_id("cuda-0"), Some(0));
+        assert_eq!(device_from_miner_id("cuda-1"), Some(1));
+        assert_eq!(device_from_miner_id("cuda-10"), Some(10));
+    }
+
+    /// Anything that is not exactly `cuda-<decimal>` names no device, so the
+    /// startup cross-check stays silent instead of warning on a label that
+    /// only resembles one.
+    #[test]
+    fn malformed_cuda_labels_name_no_device() {
+        for label in [
+            "cuda-", "cuda-x", "cuda-01", "cuda-+1", "cuda- 1", "cuda-1.0", "cuda--1",
+        ] {
+            assert_eq!(device_from_miner_id(label), None, "{label}");
+        }
+    }
+
+    /// The conformance driver spawns miners as `--miner-id mock-0` and
+    /// `quip-coordinator drive` uses `drive-0`; neither implies a device, so
+    /// neither may warn.
+    #[test]
+    fn foreign_labels_name_no_device() {
+        for label in ["drive-0", "mock-0", "rig7-a", ""] {
+            assert_eq!(device_from_miner_id(label), None, "{label}");
+        }
+    }
+
+    /// The bug this diagnostic exists for: the coordinator sends
+    /// `--miner-id cuda-1` and no `--device`, so the process labels itself
+    /// device 1 while clap's default puts it on device 0.
+    #[test]
+    fn label_disagreeing_with_the_flag_is_reported() {
+        assert_eq!(device_label_mismatch(Some("cuda-1"), 0), Some(1));
+        assert_eq!(device_label_mismatch(Some("cuda-0"), 2), Some(0));
+    }
+
+    /// Agreement is the supervised path after the coordinator forwards
+    /// `--device N`, and it must not log.
+    #[test]
+    fn label_agreeing_with_the_flag_is_silent() {
+        assert_eq!(device_label_mismatch(Some("cuda-0"), 0), None);
+        assert_eq!(device_label_mismatch(Some("cuda-3"), 3), None);
+    }
+
+    /// A label that names no device implies nothing to contradict, whatever
+    /// `--device` says. Covers the `drive-0`/`mock-0` callers and the
+    /// pre-default `None` an operator sees before the id is filled in.
+    #[test]
+    fn labels_naming_no_device_are_silent() {
+        assert_eq!(device_label_mismatch(Some("drive-0"), 1), None);
+        assert_eq!(device_label_mismatch(Some("mock-0"), 1), None);
+        assert_eq!(device_label_mismatch(None, 1), None);
     }
 }
