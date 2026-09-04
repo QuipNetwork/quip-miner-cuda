@@ -1753,7 +1753,7 @@ fn run_session(
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = CudaDevice::open(0)?;
-/// let gov = UtilGovernor::start(0, 90, false);
+/// let gov = UtilGovernor::start(&device.pci_bus_id, 90, false);
 /// let (job_tx, job_rx) = channel::<StreamJob>(16);
 /// let (res_tx, _res_rx) = channel::<StreamResult>(16);
 ///

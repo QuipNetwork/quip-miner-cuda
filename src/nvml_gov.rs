@@ -108,16 +108,19 @@ impl UtilGovernor {
     /// ```
     /// use quip_miner_cuda::nvml_gov::UtilGovernor;
     ///
-    /// let gov = UtilGovernor::start(0, 90, true);
+    /// // No GPU answers to this address, so the poll thread exits immediately
+    /// // and only the knobs are exercised. A real caller passes
+    /// // `CudaDevice::pci_bus_id`.
+    /// let gov = UtilGovernor::start("00000000:00:00.0", 90, true);
     /// assert_eq!(gov.utilization_ceiling(), 90);
     /// assert!(gov.yielding());
     ///
     /// // 0 clamps up to 1, 200 clamps down to 100.
-    /// assert_eq!(UtilGovernor::start(0, 0, false).utilization_ceiling(), 1);
-    /// assert_eq!(UtilGovernor::start(0, 200, false).utilization_ceiling(), 100);
+    /// assert_eq!(UtilGovernor::start("00000000:00:00.0", 0, false).utilization_ceiling(), 1);
+    /// assert_eq!(UtilGovernor::start("00000000:00:00.0", 200, false).utilization_ceiling(), 100);
     /// ```
     #[must_use]
-    pub fn start(device_index: u32, utilization_ceiling: u32, yielding: bool) -> Self {
+    pub fn start(pci_bus_id: &str, utilization_ceiling: u32, yielding: bool) -> Self {
         let knobs = Arc::new(Knobs {
             ceiling: AtomicU32::new(utilization_ceiling.clamp(1, 100)),
             yielding: AtomicBool::new(yielding),
@@ -126,8 +129,9 @@ impl UtilGovernor {
             stop: AtomicBool::new(false),
         });
         let knobs_thread = Arc::clone(&knobs);
+        let bus_id = pci_bus_id.to_owned();
         let handle = Some(thread::spawn(move || {
-            poll_loop(device_index, &knobs_thread);
+            poll_loop(&bus_id, &knobs_thread);
         }));
         Self { knobs, handle }
     }
@@ -140,7 +144,7 @@ impl UtilGovernor {
     /// ```
     /// use quip_miner_cuda::nvml_gov::UtilGovernor;
     ///
-    /// let gov = UtilGovernor::start(0, 90, true);
+    /// let gov = UtilGovernor::start("00000000:00:00.0", 90, true);
     ///
     /// gov.reconfigure(0, false);
     /// assert_eq!(gov.utilization_ceiling(), 1);
@@ -162,7 +166,7 @@ impl UtilGovernor {
     /// ```
     /// use quip_miner_cuda::nvml_gov::UtilGovernor;
     ///
-    /// let gov = UtilGovernor::start(0, 75, false);
+    /// let gov = UtilGovernor::start("00000000:00:00.0", 75, false);
     /// assert_eq!(gov.utilization_ceiling(), 75);
     ///
     /// gov.reconfigure(40, false);
@@ -178,7 +182,7 @@ impl UtilGovernor {
     /// ```
     /// use quip_miner_cuda::nvml_gov::UtilGovernor;
     ///
-    /// let gov = UtilGovernor::start(0, 75, false);
+    /// let gov = UtilGovernor::start("00000000:00:00.0", 75, false);
     /// assert!(!gov.yielding());
     ///
     /// gov.reconfigure(75, true);
@@ -230,7 +234,7 @@ impl UtilGovernor {
     /// ```
     /// use quip_miner_cuda::nvml_gov::UtilGovernor;
     ///
-    /// let gov = UtilGovernor::start(0, 50, false);
+    /// let gov = UtilGovernor::start("00000000:00:00.0", 50, false);
     /// assert!(!gov.should_throttle());
     /// ```
     #[must_use]
@@ -346,12 +350,29 @@ fn foreign_utilization(
     (util, Attribution::WholeDevice)
 }
 
-fn poll_loop(device_index: u32, knobs: &Knobs) {
+fn poll_loop(pci_bus_id: &str, knobs: &Knobs) {
     let Ok(nvml) = nvml_wrapper::Nvml::init() else {
         return;
     };
-    let Ok(device) = nvml.device_by_index(device_index) else {
-        return;
+    // By bus id, never by index: NVML enumerates in PCI bus order while the
+    // CUDA ordinal follows `CUDA_DEVICE_ORDER` and `CUDA_VISIBLE_DEVICES`, so
+    // the two index spaces agree only by coincidence. Governing the wrong GPU
+    // is silent — foreign utilization would be read from a card this process
+    // never touches, and yielding would fire on a stranger's load.
+    let device = match nvml.device_by_pci_bus_id(pci_bus_id) {
+        Ok(device) => device,
+        Err(e) => {
+            // Every other NVML failure here is a silent no-op by design (the
+            // miner still mines, util stays 0). This one is named: it means
+            // the governor is off, and with `yielding = true` the operator
+            // asked for behavior they are not getting.
+            tracing::warn!(
+                pci_bus_id,
+                error = %e,
+                "NVML has no device at this PCI bus id; the utilization governor is inactive"
+            );
+            return;
+        }
     };
     let own_pid = std::process::id();
     let mut last_seen = 0u64;
@@ -388,6 +409,10 @@ fn poll_loop(device_index: u32, knobs: &Knobs) {
 
 #[cfg(test)]
 mod governor_tests {
+    /// An address no GPU answers to: these tests exercise the knobs, never
+    /// NVML, so the poll thread finds nothing and exits.
+    const TEST_BUS_ID: &str = "00000000:00:00.0";
+
     use super::{foreign_sm_util, throttle_decision, UtilGovernor};
     use nvml_wrapper::struct_wrappers::device::ProcessUtilizationSample;
     use std::sync::atomic::Ordering;
@@ -472,9 +497,9 @@ mod governor_tests {
 
     #[test]
     fn start_clamps_the_ceiling_into_1_100() {
-        let below = UtilGovernor::start(0, 0, false);
-        let above = UtilGovernor::start(0, 200, false);
-        let inside = UtilGovernor::start(0, 55, false);
+        let below = UtilGovernor::start(TEST_BUS_ID, 0, false);
+        let above = UtilGovernor::start(TEST_BUS_ID, 200, false);
+        let inside = UtilGovernor::start(TEST_BUS_ID, 55, false);
 
         assert_eq!(below.utilization_ceiling(), 1);
         assert_eq!(above.utilization_ceiling(), 100);
@@ -483,7 +508,7 @@ mod governor_tests {
 
     #[test]
     fn reconfigure_clamps_and_round_trips_both_knobs() {
-        let gov = UtilGovernor::start(0, 90, true);
+        let gov = UtilGovernor::start(TEST_BUS_ID, 90, true);
 
         gov.reconfigure(0, false);
         assert_eq!(gov.utilization_ceiling(), 1);
@@ -500,7 +525,7 @@ mod governor_tests {
 
     #[test]
     fn never_throttles_while_not_yielding() {
-        let gov = UtilGovernor::start(0, 1, false);
+        let gov = UtilGovernor::start(TEST_BUS_ID, 1, false);
         // Plant a sample far above the ceiling. On a host with NVML the poll
         // thread may overwrite it with 0, but either way `should_throttle`
         // short-circuits on the yielding flag, so the assertion holds under

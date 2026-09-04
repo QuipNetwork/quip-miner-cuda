@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use quip_miner_cuda::bench::{run_bench, BenchAction};
 use quip_miner_cuda::capacity::advertised_nodes;
 use quip_miner_cuda::capacity::SA_DEFAULT_NODES;
-use quip_miner_cuda::cuda_device::CudaDevice;
+use quip_miner_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_miner_cuda::nvml_gov::UtilGovernor;
 use quip_miner_cuda::{cuda_sa_identity, Algorithm, CudaSampler};
 use quip_solver_core::{run, CommonArgs, OpenError};
@@ -82,20 +82,33 @@ fn main() -> ExitCode {
     if cli.common.miner_id.is_none() {
         cli.common.miner_id = Some(format!("cuda-{}", cli.device));
     }
+
+    // Advisory only. The miner id is a wire label; the coordinator owns device
+    // selection and passes it as `--device N`. A disagreement means the caller
+    // sent no `--device` or sent a different one, and the process is about to
+    // mine on a GPU its label does not name — invisible from the coordinator
+    // side, which sees only the label.
+    if let Some(labelled) = device_label_mismatch(cli.common.miner_id.as_deref(), cli.device) {
+        tracing::warn!(
+            device = cli.device,
+            miner_id = %cli.common.miner_id.as_deref().unwrap_or_default(),
+            "miner id names CUDA device {labelled} but --device selects {}; the label is \
+             advisory and does not select the device. If the caller is quip-coordinator, it \
+             predates the --device flag and needs upgrading",
+            cli.device
+        );
+    }
     run(
         cuda_sa_identity(advertised_nodes(Algorithm::Sa, cli.max_nodes)),
         &cli.common,
         || {
             let device = CudaDevice::open_with_nodes(cli.device, Algorithm::Sa, cli.max_nodes)
                 .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
-            // NVML device index is u32; CLI takes usize to match CudaDevice::open.
-            let nvml_index = u32::try_from(cli.device).map_err(|_| {
-                OpenError(format!(
-                    "device index {} exceeds u32 range for NVML",
-                    cli.device
-                ))
-            })?;
-            let gov = UtilGovernor::start(nvml_index, cli.utilization, cli.yielding);
+            // The governor binds by PCI bus id, not by ordinal: NVML's index
+            // space is PCI-ordered and does not track the CUDA ordinal this
+            // process opened. Taking it from the opened device means both
+            // APIs name the same physical GPU by construction.
+            let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
             Ok(CudaSampler::new(device, gov, Algorithm::Sa))
         },
     )

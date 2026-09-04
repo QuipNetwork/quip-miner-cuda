@@ -248,7 +248,7 @@ fn stream_driver_soak() {
 
     // Yielding off: this soak measures the driver alone on the card, and a
     // governor that could end sessions would confound the decay question.
-    let gov = UtilGovernor::start(u32::try_from(device_index).unwrap_or(0), 100, false);
+    let gov = UtilGovernor::start(&device.pci_bus_id, 100, false);
     let gov_ref = &gov;
     let graph_ref = &graph;
     let device_ref = &device;
