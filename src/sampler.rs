@@ -50,13 +50,29 @@ pub enum SampleError {
     KernelTimeout,
 }
 
+impl SampleError {
+    /// Classify a CUDA driver result, deferring the human-readable detail.
+    ///
+    /// `detail` is a closure, not a `String`, because rendering a
+    /// [`cudarc::driver::DriverError`] calls `cuGetErrorString` in `libcuda`.
+    /// Building the message eagerly would make this classification — and
+    /// every test of it — require a loaded CUDA driver, which the host-only
+    /// CI runners do not have.
+    fn from_driver_result(
+        code: cudarc::driver::sys::CUresult,
+        detail: impl FnOnce() -> String,
+    ) -> Self {
+        if code == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
+            SampleError::OutOfMemory(detail())
+        } else {
+            SampleError::Driver(detail())
+        }
+    }
+}
+
 impl From<cudarc::driver::DriverError> for SampleError {
     fn from(e: cudarc::driver::DriverError) -> Self {
-        if e.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
-            SampleError::OutOfMemory(e.to_string())
-        } else {
-            SampleError::Driver(e.to_string())
-        }
+        Self::from_driver_result(e.0, || e.to_string())
     }
 }
 
@@ -111,14 +127,15 @@ pub fn sample_ising(
 mod tests {
     use super::SampleError;
     use cudarc::driver::sys::CUresult;
-    use cudarc::driver::DriverError;
 
     /// VRAM pressure from another process must reject one job, not end the
     /// session: `DeviceFault` here would put the miner in a restart loop for
     /// a condition that clears on its own.
     #[test]
-    fn oom_driver_error_maps_to_device_busy() {
-        let e = SampleError::from(DriverError(CUresult::CUDA_ERROR_OUT_OF_MEMORY));
+    fn oom_driver_result_maps_to_device_busy() {
+        let e = SampleError::from_driver_result(CUresult::CUDA_ERROR_OUT_OF_MEMORY, || {
+            "out of memory".to_owned()
+        });
         match e {
             SampleError::OutOfMemory(_) => {}
             other => panic!("expected OutOfMemory, got {other:?}"),
@@ -132,13 +149,28 @@ mod tests {
     /// Any other driver failure still ends the session for a supervisor
     /// restart — the context cannot be trusted.
     #[test]
-    fn non_oom_driver_error_stays_a_device_fault() {
-        let e = SampleError::from(DriverError(CUresult::CUDA_ERROR_ILLEGAL_ADDRESS));
+    fn non_oom_driver_result_stays_a_device_fault() {
+        let e = SampleError::from_driver_result(CUresult::CUDA_ERROR_ILLEGAL_ADDRESS, || {
+            "an illegal memory access was encountered".to_owned()
+        });
         match quip_solver_core::SampleError::from(e) {
             quip_solver_core::SampleError::DeviceFault(detail) => {
                 assert!(detail.contains("CUDA driver"));
             }
             other => panic!("expected DeviceFault, got {other:?}"),
         }
+    }
+
+    /// The detail closure runs only for the variant that is built, so a
+    /// caller never pays `cuGetErrorString` for a message it discards.
+    #[test]
+    fn detail_is_rendered_once_for_the_chosen_variant() {
+        let mut calls = 0;
+        let e = SampleError::from_driver_result(CUresult::CUDA_ERROR_INVALID_VALUE, || {
+            calls += 1;
+            "invalid argument".to_owned()
+        });
+        assert_eq!(calls, 1);
+        assert!(matches!(e, SampleError::Driver(_)));
     }
 }
