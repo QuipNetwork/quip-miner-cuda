@@ -28,7 +28,7 @@ const MSA_SRC: &str = include_str!("../kernels/msa.cu");
 /// Both tests here measure what the *toolkit* accepts, so they only carry
 /// meaning on the pinned CUDA 12.9 one. A newer toolkit does not merely fail
 /// them, it misreports them. CUDA 13 dropped `sm_70` and `sm_72` and renamed
-/// `compute_101`, so [`every_supported_arch_compiles_and_assembles_both_kernels`]
+/// `compute_101`, so [`every_supported_arch_compiles_and_assembles_every_kernel`]
 /// fails on three architectures while the kernels are fine, and
 /// [`floor_is_real_one_arch_below_fails`] passes for the wrong reason — NVRTC
 /// rejects `compute_62` as an unknown `-arch` value long before it can reject
@@ -96,8 +96,8 @@ fn compile_and_assemble(name: &str, src: &str, nodes: usize, arch: i32) -> Resul
 
 #[test]
 #[ignore = "needs the CUDA 12.9 toolkit (make test-archs runs it in the CI image)"]
-fn every_supported_arch_compiles_and_assembles_both_kernels() {
-    if skip_outside_ci("every_supported_arch_compiles_and_assembles_both_kernels") {
+fn every_supported_arch_compiles_and_assembles_every_kernel() {
+    if skip_outside_ci("every_supported_arch_compiles_and_assembles_every_kernel") {
         return;
     }
     let mut failures = Vec::new();
@@ -107,7 +107,7 @@ fn every_supported_arch_compiles_and_assembles_both_kernels() {
         for (name, src, nodes) in [
             ("sa", SA_SRC, 512),
             ("gibbs", GIBBS_SRC, 4800),
-            ("msa", MSA_SRC, 4800),
+            ("msa", MSA_SRC, quip_miner_cuda::capacity::MSA_DEFAULT_NODES),
         ] {
             if let Err(e) = compile_and_assemble(name, src, nodes, arch) {
                 failures.push(e);
