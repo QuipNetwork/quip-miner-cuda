@@ -150,13 +150,15 @@ fn sa_finds_ground_state_on_ferro() {
     );
 }
 
-/// msa finds the ferro ground state (the multi-spin kernel anneals).
+/// msa finds the ground state of a ferro pair under positive fields. The
+/// untouched all-`+1` state scores `+1000`, so the assertion fails unless the
+/// kernel anneals; the ground state `(-1, -1)` scores `-3000`.
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
-fn msa_finds_ground_state_on_ferro() {
+fn msa_finds_ground_state_on_ferro_with_fields() {
     let dev = device();
-    let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+    let graph = IsingGraph::new(vec![1.0, 1.0], vec![-1.0], vec![(0, 1)]);
     let params = SampleParams {
         num_reads: 16,
         num_sweeps: 128,
@@ -165,8 +167,8 @@ fn msa_finds_ground_state_on_ferro() {
     };
     let results = sample_ising(dev, &graph, &params, KernelKind::Msa).expect("msa");
     assert!(
-        results.iter().any(|r| r.energy_milli == -1000),
-        "msa failed to find ferro ground: {:?}",
+        results.iter().any(|r| r.energy_milli == -3000),
+        "msa failed to find the ferro ground state under fields: {:?}",
         results.iter().map(|r| r.energy_milli).collect::<Vec<_>>()
     );
 }
