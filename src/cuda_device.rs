@@ -103,18 +103,10 @@ fn compile_for_arch(src: &str, max_nodes: usize, arch: i32) -> Result<Ptx, CudaE
     // jit_cache key's max_nodes component (see `jit_cache`).
     let opts = CompileOptions {
         use_fast_math: Some(true),
-        options: {
-            let mut o = vec![
-                format!("-DQUIP_MAX_NODES={max_nodes}"),
-                format!("--gpu-architecture=compute_{arch}"),
-            ];
-            // Diagnostic compile switches for the msa kernel (benchmarking only;
-            // pair with QUIP_CUDA_CACHE_DISABLE=1 since defines are not in the cache key).
-            if let Ok(d) = std::env::var("QUIP_MSA_DIAG") {
-                o.push(format!("-DMSA_DIAG={d}"));
-            }
-            o
-        },
+        options: vec![
+            format!("-DQUIP_MAX_NODES={max_nodes}"),
+            format!("--gpu-architecture=compute_{arch}"),
+        ],
         ..Default::default()
     };
     compile_ptx_with_opts(src, opts)

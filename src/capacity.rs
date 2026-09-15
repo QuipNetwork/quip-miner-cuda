@@ -145,9 +145,9 @@ pub const MSA_MAX_DEGREE: usize = 20;
 
 /// Static `__shared__` members of the msa kernel: `s_active_slot` and
 /// `s_abort`, one `int` each (8 bytes of variables). The compiled function
-/// reports 16: measured opening `kernels/msa.cu` under NVRTC 12.9 on an
-/// A4000 (`sm_86`), where the static shared allocation rounds up to a
-/// 16-byte boundary. They count against the opt-in cap, so the dynamic
+/// reports 16: measured opening `kernels/msa.cu` on an A4000 (`sm_86`,
+/// driver 610.57), where the driver rounds the static shared allocation
+/// up to a 16-byte boundary. They count against the opt-in cap, so the dynamic
 /// budget is the opt-in less this. `CudaDevice::open_with_nodes` refuses a
 /// loaded function that reports more, so the budget never over-advertises.
 /// A function that reports less leaves the budget conservative by under
