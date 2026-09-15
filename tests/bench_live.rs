@@ -115,3 +115,22 @@ fn bench_one_gibbs_scores_and_reports_positive_kernel_time() {
     }
     assert!(timings.kernel_ns > 0);
 }
+
+/// msa through the isolated bench path: scored reads and a positive kernel
+/// time, like SA and Gibbs.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[serial]
+fn bench_one_msa_scores_and_reports_positive_kernel_time() {
+    let graph = ring(64);
+    let params = SampleParams {
+        num_reads: 8,
+        num_sweeps: 64,
+        sweeps_per_beta: 4,
+        seed: 7,
+        ..Default::default()
+    };
+    let (reads, timings) = bench_one(device(), &graph, &params, KernelKind::Msa).unwrap();
+    assert_eq!(reads.len(), 8);
+    assert!(timings.kernel_ns > 0);
+}

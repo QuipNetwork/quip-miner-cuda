@@ -8,8 +8,10 @@
 //! for the sweep those numbers come from.
 
 use quip_miner_cuda::capacity::GIBBS_DEFAULT_NODES;
+use quip_miner_cuda::capacity::MSA_DEFAULT_NODES;
 use quip_miner_cuda::cuda_device::CudaDevice;
-use quip_miner_cuda::KernelKind;
+use quip_miner_cuda::sampler::{sample_ising, SampleError};
+use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
 
 /// Pegasus P16 has 5640 nodes, above both shipped defaults (5000 / 4800).
 /// Both kernels must compile and open there, which is the whole point of the
@@ -65,6 +67,39 @@ fn msa_refuses_above_the_shared_memory_budget() {
     assert!(
         msg.contains("shared-memory budget"),
         "message must name the resource that bound it: {msg}"
+    );
+}
+
+/// The msa kernel unrolls `capacity::MSA_MAX_DEGREE` neighbours per
+/// spin. A denser graph is refused per job as `Unsupported`, which the
+/// wire maps to `Capacity`, and the session stays usable.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn msa_refuses_a_spin_with_more_than_twenty_neighbours() {
+    if CudaDevice::device_count().unwrap_or(0) == 0 {
+        eprintln!("no CUDA device visible; skipping");
+        return;
+    }
+
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES)
+        .expect("msa opens at its default");
+    // A star: node 0 has 21 neighbours, one above the budget.
+    let edges: Vec<(usize, usize)> = (1..=21).map(|i| (0, i)).collect();
+    let graph = IsingGraph::new(vec![0.0; 22], vec![1.0; 21], edges);
+    let params = SampleParams {
+        num_reads: 8,
+        num_sweeps: 16,
+        seed: 1,
+        ..Default::default()
+    };
+    let Err(SampleError::Unsupported(msg)) =
+        sample_ising(&device, &graph, &params, KernelKind::Msa)
+    else {
+        panic!("a degree-21 graph must be refused as Unsupported");
+    };
+    assert!(
+        msg.contains("max degree 21") && msg.contains("20-neighbour budget"),
+        "message must name the degree and the budget: {msg}"
     );
 }
 

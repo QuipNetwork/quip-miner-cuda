@@ -94,7 +94,7 @@ fn truncation_matches_golden() {
     }
 }
 
-/// Live SA/Gibbs sample: every returned energy equals consensus scoring.
+/// Live SA, msa and Gibbs sample: every returned energy equals consensus scoring.
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
@@ -112,14 +112,14 @@ fn live_sample_energies_match_energy_milli() {
         ..Default::default()
     };
 
-    for algo in [KernelKind::Sa, KernelKind::Gibbs] {
-        let results = sample_ising(dev, &graph, &params, algo).expect("sample");
+    for kernel in [KernelKind::Sa, KernelKind::Msa, KernelKind::Gibbs] {
+        let results = sample_ising(dev, &graph, &params, kernel).expect("sample");
         assert_eq!(results.len(), 16);
         for r in &results {
             let expected = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
             assert_eq!(
                 r.energy_milli, expected,
-                "{algo:?} reported energy_milli {} != consensus {}",
+                "{kernel:?} reported energy_milli {} != consensus {}",
                 r.energy_milli, expected
             );
             assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
@@ -146,6 +146,27 @@ fn sa_finds_ground_state_on_ferro() {
     assert!(
         results.iter().any(|r| r.energy_milli == -1000),
         "SA failed to find ferro ground: {:?}",
+        results.iter().map(|r| r.energy_milli).collect::<Vec<_>>()
+    );
+}
+
+/// msa finds the ferro ground state (the multi-spin kernel anneals).
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+fn msa_finds_ground_state_on_ferro() {
+    let dev = device();
+    let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
+    let params = SampleParams {
+        num_reads: 16,
+        num_sweeps: 128,
+        seed: 42,
+        ..Default::default()
+    };
+    let results = sample_ising(dev, &graph, &params, KernelKind::Msa).expect("msa");
+    assert!(
+        results.iter().any(|r| r.energy_milli == -1000),
+        "msa failed to find ferro ground: {:?}",
         results.iter().map(|r| r.energy_milli).collect::<Vec<_>>()
     );
 }
