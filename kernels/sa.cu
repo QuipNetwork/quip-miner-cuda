@@ -40,6 +40,14 @@
 #define CTRL_EXIT_NOW     6
 // [7] unused (generation not needed for 1 block/nonce)
 
+// Values the host writes to CTRL_EXIT_NOW. Any nonzero value ends the waits
+// for a READY slot below. EXIT_ABORT is also honoured inside the sweep loop:
+// the block leaves mid-model and never publishes the slot. EXIT_AFTER_MODEL
+// lets the current model finish and publish first, which the isolated bench
+// path (streaming::bench_one) relies on when it pre-arms the flag.
+#define EXIT_AFTER_MODEL 1
+#define EXIT_ABORT       2
+
 // Debug flags (can be overridden via -D compiler flags)
 #ifndef DEBUG_KERNEL
 #define DEBUG_KERNEL 0
@@ -217,6 +225,10 @@ __global__ void cuda_sa_self_feeding(
             base_seed + (unsigned int)(
                 nonce_id * 3 + active_slot);
 
+        // Set by a thread that leaves the sweep loop early on EXIT_ABORT.
+        // Threads past num_reads never enter the loop and stay false.
+        bool aborted = false;
+
         // Each thread processes one read
         if (tid < num_reads) {
             int packed_size = (N + 7) / 8;
@@ -276,18 +288,14 @@ __global__ void cuda_sa_self_feeding(
                 }
             }
             // === SA sweep loop ===
-            // Abort-on-cancel: the host raises this nonce's
-            // EXIT_NOW when the coordinator abandons the round. Stock code
-            // only reads the flag between models, so a cancelled model ran to
-            // completion. Peeking every few beta rungs costs one L2 read per
-            // thread per rung and lets the block leave mid-model. The flag is
-            // volatile, so this is a real read each time.
-            bool aborted = false;
+            // Abort-on-cancel: the host writes EXIT_ABORT when the
+            // coordinator abandons the round. EXIT_AFTER_MODEL is not
+            // honoured here, so a pre-armed exit still anneals the model.
             for (int beta_idx = 0;
                  beta_idx < num_betas;
                  beta_idx++) {
                 if ((beta_idx & 7) == 0 &&
-                    nonce_ctrl[ctrl_base + CTRL_EXIT_NOW]) {
+                    nonce_ctrl[ctrl_base + CTRL_EXIT_NOW] == EXIT_ABORT) {
                     aborted = true;
                     break;
                 }
@@ -369,21 +377,23 @@ __global__ void cuda_sa_self_feeding(
                 }
             }
 
-            // Pack final state to bit format. Sized from the same macro as
-            // `unpacked_state` it packs: a fixed size here would be overrun
-            // by any N above `size * 8`, and the two must not drift apart.
-            signed char packed_state[(QUIP_MAX_NODES + 7) / 8];
-            for (int b = 0; b < packed_size; b++)
-                packed_state[b] = 0;
-            for (int i = 0; i < N; i++) {
-                set_spin_packed(
-                    i, unpacked_state[i],
-                    packed_state);
-            }
-
-            // Write packed samples to output (skipped for an aborted
-            // model: the host never reads a slot it did not see COMPLETE)
+            // Pack and write the final state. Skipped for an aborted model:
+            // the host never reads a slot it did not see COMPLETE.
             if (!aborted) {
+                // Pack final state to bit format. Sized from the same macro
+                // as `unpacked_state` it packs: a fixed size here would be
+                // overrun by any N above `size * 8`, and the two must not
+                // drift apart.
+                signed char packed_state[(QUIP_MAX_NODES + 7) / 8];
+                for (int b = 0; b < packed_size; b++)
+                    packed_state[b] = 0;
+                for (int i = 0; i < N; i++) {
+                    set_spin_packed(
+                        i, unpacked_state[i],
+                        packed_state);
+                }
+
+                // Write packed samples to output
                 signed char* out_sample =
                     &slot_samples[
                         sample_base
@@ -397,8 +407,12 @@ __global__ void cuda_sa_self_feeding(
             }
         }
 
-        // All threads done writing energy + samples
-        __syncthreads();
+        // Block-uniform verdict on the model. Each thread peeks the abort
+        // flag on its own schedule, so one thread can leave the sweep loop
+        // while another finishes; the slot is published only if no thread
+        // aborted. __syncthreads_or is a barrier as well, so it replaces the
+        // plain __syncthreads that stood here.
+        int model_aborted = __syncthreads_or(aborted ? 1 : 0);
 
         // Fence every thread's global writes so the host
         // sees energy/sample data before SLOT_COMPLETE.
@@ -412,18 +426,21 @@ __global__ void cuda_sa_self_feeding(
         }
         __syncthreads();
 
-        // Thread 0: mark COMPLETE, find next READY
+        // Thread 0: publish, then find next READY
         if (tid == 0) {
-            // Check exit flag FIRST: an aborted or
-            // exiting model is never published as COMPLETE, so the host
-            // cannot download half-annealed samples by mistake.
-            if (nonce_ctrl[
-                    ctrl_base + CTRL_EXIT_NOW]) {
+            if (model_aborted) {
+                // Never publish a half-annealed model: the host reads only
+                // slots it saw COMPLETE.
                 s_active_slot = -1;
             } else {
                 nonce_ctrl[ctrl_base + active_slot] =
                     SLOT_COMPLETE;
 
+                // Check exit flag
+                if (nonce_ctrl[
+                        ctrl_base + CTRL_EXIT_NOW]) {
+                    s_active_slot = -1;
+                } else {
                 // Find next READY slot. Wait through transient feeder
                 // starvation instead of the old bounded ~100ms retry
                 // (10000 x 10us): that cap let a momentarily-empty feeder
@@ -462,6 +479,7 @@ __global__ void cuda_sa_self_feeding(
                     __threadfence();
                 }
                 s_active_slot = next_slot;
+                }
             }
         }
         __syncthreads();

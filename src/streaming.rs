@@ -38,6 +38,13 @@ use tracing::trace_span;
 
 const CTRL_STRIDE: usize = 8;
 const CTRL_EXIT_NOW: usize = 6;
+/// Values the host writes to a nonce's `CTRL_EXIT_NOW` word. The kernels end
+/// their slot waits on any nonzero value; only [`EXIT_ABORT`] makes the SA
+/// and msa kernels leave mid-model without publishing the slot. Gibbs
+/// finishes its model on either value.
+const EXIT_AFTER_MODEL: i32 = 1;
+/// See [`EXIT_AFTER_MODEL`].
+const EXIT_ABORT: i32 = 2;
 /// How long the driver stands down for, per check, while yielding.
 ///
 /// Only ever slept with no session running, so this is real time the GPU is
@@ -890,22 +897,26 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(())
     }
 
-    /// Pre-arm one nonce's `CTRL_EXIT_NOW` before launch, so the kernel
-    /// processes exactly one model and returns instead of spinning for the
-    /// next slot. Used only by the isolated bench path ([`bench_one`]); the
-    /// streaming path arms exit at teardown via [`Self::signal_exit`].
+    /// Pre-arm one nonce's `CTRL_EXIT_NOW` with `EXIT_AFTER_MODEL` before
+    /// launch, so the kernel anneals exactly one model, publishes it and
+    /// returns instead of spinning for the next slot. Used only by the
+    /// isolated bench path ([`bench_one`]); the streaming path arms exit at
+    /// teardown via [`Self::signal_exit`].
     fn set_exit_now(&mut self, nonce_id: usize) -> Result<(), SampleError> {
         let off = nonce_id * CTRL_STRIDE + CTRL_EXIT_NOW;
         self.stream_transfer
-            .memcpy_htod(&[1i32], &mut self.d_ctrl.slice_mut(off..=off))?;
+            .memcpy_htod(&[EXIT_AFTER_MODEL], &mut self.d_ctrl.slice_mut(off..=off))?;
         Ok(())
     }
 
+    /// Raise `EXIT_ABORT` on every active nonce. Nothing this session holds
+    /// is read after teardown, so the blocks leave mid-model rather than
+    /// finish work nobody will score, and the device comes back sooner.
     fn signal_exit(&mut self) -> Result<(), SampleError> {
         if !self.launched {
             return Ok(());
         }
-        let exit = vec![1i32; 1];
+        let exit = vec![EXIT_ABORT; 1];
         for nonce_id in 0..self.active_nonces {
             let off = nonce_id * CTRL_STRIDE + CTRL_EXIT_NOW;
             self.stream_transfer
@@ -1013,9 +1024,12 @@ impl SessionKey {
 /// # Errors
 ///
 /// - [`SampleError::GraphTooLarge`] if `graph` has more nodes than the
-///   chosen kernel's fixed-size per-thread/shared state supports. This is
-///   permanent for this backend — the limit is compiled into the kernel, so
-///   the caller should reject the job rather than retry it.
+///   ceiling this device opened with for the chosen kernel. This is
+///   permanent for this session — the ceiling is fixed at open, so the
+///   caller should reject the job rather than retry it.
+/// - [`SampleError::Unsupported`] if the chosen kernel cannot run this
+///   graph: for msa, a spin with more than `capacity::MSA_MAX_DEGREE`
+///   neighbours. Permanent for this graph.
 /// - [`SampleError::KernelTimeout`] if the kernel has not marked slot 0
 ///   COMPLETE within 120 seconds of launch.
 /// - [`SampleError::Cuda`] or [`SampleError::Driver`] for a CUDA driver
@@ -1166,7 +1180,8 @@ fn poll_until_complete(
 /// # Errors
 ///
 /// Same set as [`sample_one`]: [`SampleError::GraphTooLarge`] for an oversized
-/// graph, [`SampleError::KernelTimeout`] if the slot never completes within
+/// graph, [`SampleError::Unsupported`] for a graph the kernel cannot run,
+/// [`SampleError::KernelTimeout`] if the slot never completes within
 /// the deadline, and [`SampleError::Cuda`]/[`SampleError::Driver`] for any
 /// driver fault while building the session, creating events, uploading,
 /// launching, polling, or downloading.

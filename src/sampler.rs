@@ -31,14 +31,15 @@ pub enum SampleError {
     /// not `DeviceFault`.
     #[error("CUDA out of memory: {0}")]
     OutOfMemory(String),
-    /// The graph has more nodes than the chosen kernel's fixed-size
-    /// per-thread/shared state supports. Permanent for this backend: the
-    /// limit is compiled into the kernel, so retrying cannot help.
+    /// The graph has more nodes than the ceiling this device opened
+    /// with for the chosen kernel (`CudaDevice::max_nodes`, resolved by
+    /// `capacity::resolve`). Permanent for this session: the ceiling is
+    /// fixed at open, so retrying cannot help.
     #[error("graph N={n} exceeds self-feeding kernel limit {limit}")]
     GraphTooLarge {
         /// Node count of the rejected graph.
         n: usize,
-        /// The kernel's compiled-in node ceiling.
+        /// The node ceiling the device opened with.
         limit: usize,
     },
     /// The graph is well formed but this kernel cannot run it: for msa, a
