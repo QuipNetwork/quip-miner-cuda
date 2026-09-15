@@ -1,7 +1,8 @@
 //! CUDA Ising samplers.
 //!
-//! Two binaries share this library:
+//! Three binaries share this library:
 //! - `quip-cuda-sa` — Metropolis simulated annealing on one GPU
+//! - `quip-cuda-msa` — multi-spin coded simulated annealing, 64 reads per word
 //! - `quip-cuda-gibbs` — single-site heat-bath Gibbs on one GPU
 //!
 //! Kernels are the v0.2 self-feeding persistent kernels (`GPU/cuda_sa.cu` /
@@ -93,15 +94,16 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
     }
 }
 
-/// Adapt envelope for the multi-spin kernel (`quip-cuda-msa`).
+/// Adapt envelope for `quip-cuda-msa`.
 ///
-/// Reads are fixed at 128: the kernel packs 64 replicas per 64-bit word and
-/// two words per spin is what fits in the 99 KB shared-memory opt-in for a
-/// 4577-spin problem (four words would need 146 KB). Sweeps are far cheaper
-/// than in `sa.cu` (one bitwise update serves 64 replicas), so the envelope
-/// is deeper: measured on an RTX 5090 Laptop, 29568 x 128 takes ~4.5 s per
-/// model against the stock kernel's ~0.4 jobs/s at 7392 x 220, and the
-/// deep-solution rate keeps improving through 29568 (see the MR notes).
+/// Reads are pinned at `capacity::MSA_MAX_READS` (128): the kernel packs 64
+/// replicas per word and the session allocates two words per spin, which a
+/// 99 KB shared-memory opt-in holds at Zephyr scale.
+/// `tests/headless_api.rs` pins the two numbers together. Sweeps are far
+/// cheaper than in `sa.cu` (one bitwise update serves 64 replicas), so the
+/// envelope runs deeper: measured on an RTX 5090 Laptop against 24
+/// `advantage2-system1` problems (MR !26), the deep-solution rate keeps
+/// improving through 29568 sweeps.
 pub const CUDA_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
     quip_solver_core::adapt::AdaptBounds {
         min_sweeps: 7392,
@@ -113,7 +115,10 @@ pub const CUDA_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
         reads_solution_floor_factor: 0,
     };
 
-/// Backend identity for `quip-cuda-msa` at a resolved capacity.
+/// Backend identity for `quip-cuda-msa` at a resolved capacity. `max_nodes`
+/// is the shared-memory ceiling `capacity::msa_budget` derived at open: the
+/// kernel keeps its spin state in dynamic shared memory, so a job over this
+/// cannot be launched and must reject `TooLarge` rather than clamp.
 #[must_use]
 pub fn cuda_msa_identity(max_nodes: usize) -> BackendIdentity {
     BackendIdentity {
