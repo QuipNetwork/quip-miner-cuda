@@ -5,7 +5,7 @@
 use crate::capacity;
 use crate::jit_cache;
 use crate::kernel::KernelKind;
-use cudarc::driver::sys::CUdevice_attribute;
+use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
 use std::fmt;
@@ -168,6 +168,40 @@ fn compile_all_kernels(
     ))
 }
 
+/// Verify the loaded msa kernel's static shared memory matches
+/// [`capacity::MSA_STATIC_SHARED_BYTES`], opt it in to `shared_per_block_optin`
+/// less those static members, and return that dynamic-shared-memory budget.
+/// Kept out of [`CudaDevice::open_with_nodes`] to stay under the crate's
+/// function-length cap.
+fn configure_msa_shared_memory(
+    msa: &CudaFunction,
+    shared_per_block_optin: usize,
+) -> Result<usize, CudaError> {
+    // The msa kernel sizes its spin state as dynamic shared memory, and a
+    // block may only opt in to the device ceiling less the kernel's
+    // static members. `capacity::MSA_STATIC_SHARED_BYTES` mirrors those
+    // members; check the loaded function agrees, so the budget the
+    // capacity model derived is the budget the launch gets.
+    let static_shared = usize::try_from(msa.shared_size_bytes()?)
+        .map_err(|_| CudaError::Driver("CUDA reported negative static shared memory".into()))?;
+    if static_shared != capacity::MSA_STATIC_SHARED_BYTES {
+        return Err(CudaError::Driver(format!(
+            "msa kernel declares {static_shared} bytes of static shared memory, \
+             capacity::MSA_STATIC_SHARED_BYTES is {}",
+            capacity::MSA_STATIC_SHARED_BYTES
+        )));
+    }
+    let msa_dynamic_shared_bytes = capacity::msa_dynamic_shared_bytes(shared_per_block_optin);
+    let optin = i32::try_from(msa_dynamic_shared_bytes).map_err(|_| {
+        CudaError::Driver("opt-in shared memory does not fit the driver's int".into())
+    })?;
+    msa.set_attribute(
+        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        optin,
+    )?;
+    Ok(msa_dynamic_shared_bytes)
+}
+
 /// Loaded kernels + streams bound to a single device.
 ///
 /// Every handle field is `pub(crate)`: `open` switches cudarc's per-`CudaSlice`
@@ -200,8 +234,11 @@ pub struct CudaDevice {
     /// `cuda_msa_self_feeding` — persistent kernel, 1 block (1 SM) per
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
-    /// Largest dynamic shared memory a block may opt in to (bytes).
-    pub max_shared_optin: usize,
+    /// Dynamic shared memory one msa block may request: the device's opt-in
+    /// ceiling less the kernel's static members. `streaming` sizes msa
+    /// sessions against it; `capacity::msa_budget` derives `max_nodes` from
+    /// it when the process runs msa.
+    pub(crate) msa_dynamic_shared_bytes: usize,
     /// SMs on this device (`launch_self_feeding`'s `num_kernels` budget).
     pub max_sms: usize,
     /// Node capacity the running kernel was compiled for.
@@ -220,6 +257,7 @@ impl fmt::Debug for CudaDevice {
             .field("pci_bus_id", &self.pci_bus_id)
             .field("max_sms", &self.max_sms)
             .field("max_nodes", &self.max_nodes)
+            .field("msa_dynamic_shared_bytes", &self.msa_dynamic_shared_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -304,6 +342,10 @@ impl CudaDevice {
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
         )
         .map_err(|_| CudaError::Driver("CUDA reported negative shared memory".into()))?;
+        let shared_per_block_optin = usize::try_from(ctx.attribute(
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        )?)
+        .map_err(|_| CudaError::Driver("CUDA reported negative opt-in shared memory".into()))?;
         let threads_per_sm = usize::try_from(
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
         )
@@ -314,6 +356,7 @@ impl CudaDevice {
         let (free_bytes, _total_bytes) = ctx.mem_get_info()?;
         let limits = capacity::DeviceLimits {
             shared_bytes_per_block: shared_per_block,
+            shared_bytes_per_block_optin: shared_per_block_optin,
             free_bytes,
             sm_count: max_sms.max(1),
             threads_per_sm,
@@ -361,16 +404,7 @@ impl CudaDevice {
         let sa = sa_mod.load_function("cuda_sa_self_feeding")?;
         let msa = msa_mod.load_function("cuda_msa_self_feeding")?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
-        let max_shared_optin = usize::try_from(ctx.attribute(
-            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-        )?)
-        .unwrap_or(shared_per_block)
-        .max(shared_per_block);
-        let optin = i32::try_from(max_shared_optin.saturating_sub(4096)).unwrap_or(i32::MAX);
-        msa.set_attribute(
-            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            optin,
-        )?;
+        let msa_dynamic_shared_bytes = configure_msa_shared_memory(&msa, shared_per_block_optin)?;
 
         // Read before the struct is built so an unreadable attribute fails the
         // open rather than leaving a device whose governor can never bind.
@@ -388,7 +422,7 @@ impl CudaDevice {
             sa,
             gibbs,
             msa,
-            max_shared_optin,
+            msa_dynamic_shared_bytes,
             max_sms: max_sms.max(1),
             max_nodes: resolved,
             _sa_mod: sa_mod,

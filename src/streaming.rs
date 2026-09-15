@@ -15,6 +15,7 @@
 //! (bounded wait), and launches with however many nonces that filled — still
 //! correct, just not guaranteed to hit full width on a very short run.
 
+use crate::capacity;
 use crate::cuda_device::CudaDevice;
 use crate::driver_budget::{Bucket, DriverBudget};
 use crate::kernel::KernelKind;
@@ -105,15 +106,6 @@ const SLOT_COMPLETE: i32 = 3;
 /// Every scalar the kernel uses to bound a device buffer goes through here, so
 /// a job too large for that ABI fails loudly at the host/device boundary
 /// instead of wrapping into an in-range index at launch.
-/// Threads per block for the multi-spin kernel; `QUIP_MSC_THREADS` (256/512/1024) for benchmarking.
-fn msa_block_threads() -> u32 {
-    std::env::var("QUIP_MSC_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&t| t == 256 || t == 512 || t == 1024)
-        .unwrap_or(256)
-}
-
 fn to_kernel_i32(name: &str, value: usize) -> Result<i32, SampleError> {
     i32::try_from(value).map_err(|_| {
         SampleError::Driver(format!(
@@ -155,7 +147,7 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
         // the cap the kernel's shared-memory footprint was sized for.
         KernelKind::Msa => AlgoLimits {
             sms_per_nonce: 1,
-            max_reads: 128,
+            max_reads: capacity::MSA_MAX_READS,
         },
         // reads/nonce isn't block-capped (work is chunked across
         // `sms_per_nonce` blocks) but is held to the same 256 for a uniform,
@@ -356,54 +348,51 @@ enum AlgoState {
     },
 }
 
-/// Device buffers for the multi-spin kernel: replica-word fit against the
-/// shared-memory opt-in, the neighbour-budget check, and the colour classes.
+/// Device buffers for the multi-spin kernel: the colour classes plus the
+/// dynamic shared-memory footprint the launch asks for.
+///
+/// The kernel unrolls a fixed neighbour budget (`MSA_MAX_DEG` in
+/// `kernels/msa.cu`). A denser topology cannot run on it and is refused per
+/// job as `Unsupported`, which the wire maps to `Capacity`: permanent for
+/// this graph, harmless to the session.
 fn build_msa_state(
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
     topology: &SelfFeedingTopology,
     reads_per_nonce: usize,
 ) -> Result<AlgoState, SampleError> {
-    let fixed = 8192usize + 64 * 8;
-    let mut words = reads_per_nonce.div_ceil(64).next_power_of_two().clamp(1, 4);
-    // Consumer parts opt in to ~99 KB of shared memory: fit as many replica
-    // words as the budget allows and refuse a read count that needs more.
-    while words > 1 && topology.n.max(1) * words * 8 + fixed > device.max_shared_optin {
-        words /= 2;
-    }
-    // The kernel unrolls a fixed neighbour budget; a denser graph would read past it.
-    let max_deg = topology
-        .row_ptr
-        .windows(2)
-        .map(|w| usize::try_from(w[1] - w[0]).unwrap_or(0))
-        .max()
-        .unwrap_or(0);
-    if max_deg > 20 {
-        return Err(SampleError::Driver(format!(
-            "msa: topology max degree {max_deg} exceeds the kernel's 20-neighbour budget"
+    let max_deg = topology.max_degree();
+    if max_deg > capacity::MSA_MAX_DEGREE {
+        return Err(SampleError::Unsupported(format!(
+            "msa: topology max degree {max_deg} exceeds the kernel's {}-neighbour budget",
+            capacity::MSA_MAX_DEGREE
         )));
+    }
+    // One 64-lane word per 64 reads. `reads_per_nonce` is already capped at
+    // `MSA_MAX_READS`, so this is 1 or 2: a power of two, which the kernel's
+    // thread-to-word mask requires.
+    let words = reads_per_nonce
+        .div_ceil(capacity::MSA_LANES)
+        .next_power_of_two();
+    let shared = capacity::msa_shared_bytes(topology.n, words);
+    // Defense in depth, as the `n > device.max_nodes` guard in `build`: the
+    // node ceiling was resolved for two words at open, so this fires only
+    // if that derivation and this footprint drift apart.
+    if shared > device.msa_dynamic_shared_bytes {
+        return Err(SampleError::GraphTooLarge {
+            n: topology.n,
+            limit: capacity::msa_budget(device.msa_dynamic_shared_bytes),
+        });
     }
     tracing::info!(
         num_colors = topology.colors.num_colors,
         words,
         max_deg,
-        shared_bytes = topology.n.max(1) * words * 8 + fixed,
+        shared_bytes = shared,
         "msa session: colour classes and shared-memory footprint"
     );
-    if reads_per_nonce > 64 * words {
-        return Err(SampleError::Driver(format!(
-            "msa: {reads_per_nonce} reads need {} replica words but shared memory ({} B) fits {words}",
-            reads_per_nonce.div_ceil(64),
-            device.max_shared_optin
-        )));
-    }
-    let shared = topology.n.max(1) * words * 8 + fixed;
-    if shared > device.max_shared_optin {
-        return Err(SampleError::GraphTooLarge {
-            n: topology.n,
-            limit: device.max_shared_optin.saturating_sub(fixed) / (words * 8),
-        });
-    }
+    // Every array gets a one-element stand-in where it would be empty: a
+    // zero-length allocation has no device address for the kernel to index.
     let starts = if topology.colors.starts.is_empty() {
         vec![0i32]
     } else {
@@ -419,13 +408,18 @@ fn build_msa_state(
     } else {
         topology.colors.nodes.clone()
     };
+    let shared_bytes = u32::try_from(shared).map_err(|_| {
+        SampleError::Driver(format!(
+            "msa shared memory {shared} bytes does not fit the launch ABI"
+        ))
+    })?;
     Ok(AlgoState::Msa {
         d_color_starts: stream.clone_htod(&starts)?,
         d_color_counts: stream.clone_htod(&counts)?,
         d_color_nodes: stream.clone_htod(&nodes)?,
         num_colors: topology.colors.num_colors,
         words: to_kernel_i32("words", words)?,
-        shared_bytes: u32::try_from(shared).unwrap_or(u32::MAX),
+        shared_bytes,
     })
 }
 
@@ -764,14 +758,7 @@ impl<'a> SelfFeedingSession<'a> {
         })?;
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
-            block_dim: (
-                match &self.algo_state {
-                    AlgoState::Msa { .. } => msa_block_threads(),
-                    AlgoState::Sa { .. } | AlgoState::Gibbs { .. } => 256,
-                },
-                1,
-                1,
-            ),
+            block_dim: (256, 1, 1),
             shared_mem_bytes: match &self.algo_state {
                 AlgoState::Msa { shared_bytes, .. } => *shared_bytes,
                 AlgoState::Sa { .. } | AlgoState::Gibbs { .. } => 0,
@@ -2344,7 +2331,7 @@ mod tests {
     }
 
     #[test]
-    fn max_reads_reports_the_per_algorithm_cap() {
+    fn max_reads_mirrors_algo_limits_for_each_kernel() {
         assert_eq!(
             max_reads(KernelKind::Sa),
             algo_limits(KernelKind::Sa).max_reads as u32

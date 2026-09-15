@@ -16,7 +16,7 @@ use quip_miner_cuda::KernelKind;
 /// change.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn both_algorithms_open_at_pegasus_scale() {
+fn sa_and_gibbs_open_at_pegasus_scale() {
     if CudaDevice::device_count().unwrap_or(0) == 0 {
         eprintln!("no CUDA device visible; skipping");
         return;
@@ -27,6 +27,45 @@ fn both_algorithms_open_at_pegasus_scale() {
 
     let gibbs = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 5640).expect("Gibbs at 5640");
     assert_eq!(gibbs.max_nodes, 5640);
+}
+
+/// msa holds its spin state in dynamic shared memory. An A4000 opts in to
+/// 101376 bytes, which `capacity::msa_budget` puts at 5791 spins for two
+/// replica words, so Pegasus P16 fits. The open also checks the loaded
+/// kernel's static shared size against `MSA_STATIC_SHARED_BYTES`.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn msa_opens_at_pegasus_scale() {
+    if CudaDevice::device_count().unwrap_or(0) == 0 {
+        eprintln!("no CUDA device visible; skipping");
+        return;
+    }
+
+    let dev = CudaDevice::open_with_nodes(0, KernelKind::Msa, 5640).expect("msa at 5640");
+    assert_eq!(dev.max_nodes, 5640);
+}
+
+/// The msa ceiling comes from the opt-in shared memory, not a constant, so
+/// this refuses 65536 and names the shared-memory budget.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn msa_refuses_above_the_shared_memory_budget() {
+    if CudaDevice::device_count().unwrap_or(0) == 0 {
+        eprintln!("no CUDA device visible; skipping");
+        return;
+    }
+
+    let err = CudaDevice::open_with_nodes(0, KernelKind::Msa, 65536)
+        .expect_err("msa above the shared-memory budget must fail at open");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("65536"),
+        "message must name the request: {msg}"
+    );
+    assert!(
+        msg.contains("shared-memory budget"),
+        "message must name the resource that bound it: {msg}"
+    );
 }
 
 /// Gibbs holds its state in shared memory and measured flat cost per node out

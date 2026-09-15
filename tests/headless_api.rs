@@ -6,10 +6,14 @@
 //! `stream_width` requires a `&CudaDevice` and cannot run headless — deliberately
 //! not covered here. Run GPU tests with `cargo test -- --ignored` on a GPU host.
 
-use quip_miner_cuda::capacity::{GIBBS_DEFAULT_NODES, SA_DEFAULT_NODES};
+use quip_miner_cuda::capacity::{
+    GIBBS_DEFAULT_NODES, MSA_DEFAULT_NODES, MSA_MAX_READS, SA_DEFAULT_NODES,
+};
 use quip_miner_cuda::streaming::max_reads;
 use quip_miner_cuda::topology::{fill_h_j, SelfFeedingTopology};
-use quip_miner_cuda::{cuda_gibbs_identity, cuda_sa_identity, IsingGraph, KernelKind};
+use quip_miner_cuda::{
+    cuda_gibbs_identity, cuda_msa_identity, cuda_sa_identity, IsingGraph, KernelKind,
+};
 
 /// Read cap advertised by the streaming driver (kernel block size for SA).
 #[test]
@@ -38,6 +42,20 @@ fn identities_report_the_resolved_capacity() {
     // rejecting jobs the kernel can now accept.
     assert_eq!(cuda_sa_identity(8192).max_nodes, 8192);
     assert_eq!(cuda_gibbs_identity(32768).max_nodes, 32768);
+}
+
+/// The msa identity pins reads at the kernel's cap; the two must not drift.
+#[test]
+fn msa_identity_reads_match_the_kernel_read_cap() {
+    let msa = cuda_msa_identity(MSA_DEFAULT_NODES);
+    assert_eq!(msa.algorithm, "msa");
+    assert_eq!(msa.max_nodes, 5000);
+    assert_eq!(msa.adapt.min_reads, msa.adapt.max_reads);
+    assert_eq!(
+        usize::try_from(msa.adapt.max_reads).expect("small"),
+        MSA_MAX_READS
+    );
+    assert_eq!(max_reads(KernelKind::Msa), msa.adapt.max_reads);
 }
 
 /// Exercise `SelfFeedingTopology::build` + `fill_h_j` via the public API only.

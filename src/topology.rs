@@ -249,6 +249,15 @@ impl SelfFeedingTopology {
             colors,
         }
     }
+
+    /// Largest number of CSR neighbours any node has; 0 for an empty graph.
+    pub(crate) fn max_degree(&self) -> usize {
+        self.row_ptr
+            .windows(2)
+            .map(|w| usize::try_from(w[1] - w[0]).unwrap_or(0))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// Truncating cast to int8, saturating on overflow (Rust's `as` semantics
@@ -387,6 +396,20 @@ mod tests {
         let t = SelfFeedingTopology::build(&IsingGraph::new(vec![], vec![], vec![]));
         assert_eq!(t.n, 0);
         assert_eq!(t.colors.num_colors, 0);
+    }
+
+    #[test]
+    fn max_degree_counts_csr_neighbours() {
+        assert_eq!(SelfFeedingTopology::build(&g()).max_degree(), 2);
+        let empty = SelfFeedingTopology::build(&IsingGraph::new(vec![], vec![], vec![]));
+        assert_eq!(empty.max_degree(), 0);
+        // A star: node 0 touches every other node.
+        let star = IsingGraph::new(
+            vec![0.0; 5],
+            vec![1.0; 4],
+            vec![(0, 1), (0, 2), (0, 3), (0, 4)],
+        );
+        assert_eq!(SelfFeedingTopology::build(&star).max_degree(), 4);
     }
 
     // --- quip-miner-cuda-60l: targeted unit coverage ---
