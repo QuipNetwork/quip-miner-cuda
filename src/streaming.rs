@@ -137,6 +137,8 @@ struct AlgoLimits {
     sms_per_nonce: usize,
     /// Largest reads-per-nonce this driver allocates for.
     max_reads: usize,
+    /// Threads per launched block.
+    threads_per_block: u32,
 }
 
 fn algo_limits(kernel: KernelKind) -> AlgoLimits {
@@ -148,6 +150,7 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
         KernelKind::Sa => AlgoLimits {
             sms_per_nonce: 1,
             max_reads: 256,
+            threads_per_block: 256,
         },
         // 1 block (1 SM) per nonce, like SA. Reads are lanes of 64-bit
         // replica words; the session allocates two words, so 128 reads is
@@ -155,6 +158,7 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
         KernelKind::Msa => AlgoLimits {
             sms_per_nonce: 1,
             max_reads: capacity::MSA_MAX_READS,
+            threads_per_block: capacity::MSA_THREADS_PER_NONCE,
         },
         // reads/nonce isn't block-capped (work is chunked across
         // `sms_per_nonce` blocks) but is held to the same 256 for a uniform,
@@ -163,6 +167,7 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
         KernelKind::Gibbs => AlgoLimits {
             sms_per_nonce: 4,
             max_reads: 256,
+            threads_per_block: 256,
         },
     }
 }
@@ -777,7 +782,7 @@ impl<'a> SelfFeedingSession<'a> {
         })?;
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
-            block_dim: (256, 1, 1),
+            block_dim: (limits.threads_per_block, 1, 1),
             shared_mem_bytes: match &self.algo_state {
                 AlgoState::Msa { shared_bytes, .. } => *shared_bytes,
                 AlgoState::Sa { .. } | AlgoState::Gibbs { .. } => 0,
@@ -2420,16 +2425,22 @@ mod tests {
         let sa = algo_limits(KernelKind::Sa);
         assert_eq!(sa.sms_per_nonce, 1);
         assert_eq!(sa.max_reads, 256);
+        assert_eq!(sa.threads_per_block, 256);
 
         // msa: one block per nonce, two 64-lane replica words per spin.
         let msa = algo_limits(KernelKind::Msa);
         assert_eq!(msa.sms_per_nonce, 1);
         assert_eq!(msa.max_reads, 128);
+        assert_eq!(
+            msa.threads_per_block,
+            crate::capacity::MSA_THREADS_PER_NONCE
+        );
 
         // Gibbs: four blocks per nonce.
         let gibbs = algo_limits(KernelKind::Gibbs);
         assert_eq!(gibbs.sms_per_nonce, 4);
         assert_eq!(gibbs.max_reads, 256);
+        assert_eq!(gibbs.threads_per_block, 256);
     }
 
     #[test]

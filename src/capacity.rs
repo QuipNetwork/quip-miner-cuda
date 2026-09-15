@@ -135,8 +135,9 @@ pub const MSA_REPLICA_WORDS: usize = 2;
 pub const MSA_MAX_READS: usize = MSA_LANES * MSA_REPLICA_WORDS;
 
 /// Threads per block the msa kernel launches. Measured faster than 512 and
-/// 1024 on an RTX 5090 (MR !26). Mirrors `block_dim` in `streaming::launch`.
-pub const MSA_THREADS_PER_NONCE: usize = 256;
+/// 1024 on an RTX 5090 (MR !26). `streaming::algo_limits` carries it to the
+/// launch as the block size.
+pub const MSA_THREADS_PER_NONCE: u32 = 256;
 
 /// Neighbours per spin the msa kernel unrolls (`MSA_MAX_DEG` in
 /// `kernels/msa.cu`). Zephyr's degree is 20. A denser topology is refused
