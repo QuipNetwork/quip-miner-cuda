@@ -73,7 +73,7 @@ pub enum BenchAction {
 /// Arguments for `bench run`.
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// Reads per model.
+    /// Reads per model, at most the kernel's cap (256 for sa and gibbs, 128 for msa).
     #[arg(long, default_value_t = 8)]
     pub reads: u64,
     /// `num_sweeps` to bench at; repeat the flag for a multi-point grid
@@ -170,6 +170,9 @@ pub enum BenchError {
     /// `--source`/`--topology` corpus load or redraw failure (see [`crate::corpus`]).
     #[error("bench corpus: {0}")]
     Corpus(String),
+    /// A `bench run` argument outside what the kernel can execute.
+    #[error("bench args: {0}")]
+    Args(String),
 }
 
 /// One point in the bench config grid.
@@ -446,12 +449,27 @@ pub fn run_bench(
     }
 }
 
+/// Refuse a `--reads` the kernel would silently clamp. `bench_one` caps reads
+/// per nonce at `streaming::max_reads(kernel)`, and a clamped run would report
+/// the requested count against the clamped timing.
+fn check_reads(kernel: KernelKind, reads: u64) -> Result<(), BenchError> {
+    let max_reads = u64::from(crate::streaming::max_reads(kernel));
+    if (1..=max_reads).contains(&reads) {
+        return Ok(());
+    }
+    Err(BenchError::Args(format!(
+        "--reads {reads} is outside 1..={max_reads} for the {} kernel",
+        kernel.name()
+    )))
+}
+
 fn run_run(
     device_index: usize,
     kernel: KernelKind,
     max_nodes: usize,
     args: &RunArgs,
 ) -> Result<(), BenchError> {
+    check_reads(kernel, args.reads)?;
     std::fs::create_dir_all(&args.out).map_err(|e| BenchError::Io(e.to_string()))?;
     let sweeps: Vec<u64> = if args.sweeps.is_empty() {
         vec![1024]
@@ -664,9 +682,10 @@ fn fold_per_sweep(args: &FoldArgs) -> Result<Option<u64>, BenchError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_record, CellConfig, HostSpans, SpanAggregator};
+    use super::{assemble_record, check_reads, CellConfig, HostSpans, SpanAggregator};
     use crate::schema::Scope;
     use crate::streaming::DeviceTimings;
+    use crate::KernelKind;
     use std::sync::Arc;
     use tracing::info_span;
     use tracing_subscriber::prelude::*;
@@ -760,5 +779,24 @@ mod tests {
         assert!(first.contains_key("seam"));
         let second = super::take_cell(&totals);
         assert!(second.is_empty(), "totals must reset after take_cell");
+    }
+
+    #[test]
+    fn check_reads_refuses_counts_the_kernel_would_clamp() {
+        for (kernel, cap) in [
+            (KernelKind::Sa, 256),
+            (KernelKind::Msa, 128),
+            (KernelKind::Gibbs, 256),
+        ] {
+            assert!(check_reads(kernel, 1).is_ok(), "{kernel:?} 1");
+            assert!(check_reads(kernel, cap).is_ok(), "{kernel:?} cap");
+            assert!(check_reads(kernel, 0).is_err(), "{kernel:?} 0");
+            assert!(check_reads(kernel, cap + 1).is_err(), "{kernel:?} cap+1");
+        }
+        let err = check_reads(KernelKind::Msa, 256).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "bench args: --reads 256 is outside 1..=128 for the msa kernel"
+        );
     }
 }
