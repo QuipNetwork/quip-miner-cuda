@@ -1,14 +1,15 @@
 # quip-miner-cuda
 
 CUDA Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
-mining protocol: simulated annealing (`quip-cuda-sa`) and heat-bath Gibbs
-(`quip-cuda-gibbs`), shipped as separate binaries. **amd64 only.**
+mining protocol: simulated annealing (`quip-cuda-sa`), multi-spin coded
+simulated annealing (`quip-cuda-msa`) and heat-bath Gibbs (`quip-cuda-gibbs`),
+shipped as separate binaries. **amd64 only.**
 
 Each process binds one CUDA device (`--device N`) and drives it directly.
 The coordinator takes N from the `[cuda.N]` config section and passes it as
 `--device N`; the miner warns at startup when its `cuda-N` label and `--device`
 disagree, and the label never overrides the flag.
-Kernels (`kernels/sa.cu`, `kernels/gibbs.cu`) are JIT-compiled via NVRTC at
+Kernels (`kernels/sa.cu`, `kernels/msc.cu`, `kernels/gibbs.cu`) are JIT-compiled via NVRTC at
 runtime through `cudarc`'s dynamic-loading feature, so **building this crate
 does not require the CUDA toolkit** — only a CUDA GPU and driver are needed to
 *run* the binaries.
@@ -28,6 +29,7 @@ through the driver's forward-compatible PTX JIT. `SUPPORTED_ARCHS` in
 | binary | algorithm |
 |--------|-----------|
 | `quip-cuda-sa` | simulated annealing (Metropolis) |
+| `quip-cuda-msa` | multi-spin coded simulated annealing (64 replicas per word) |
 | `quip-cuda-gibbs` | heat-bath Gibbs |
 
 Prebuilt `amd64` binaries are attached to each
@@ -71,6 +73,39 @@ quip-coordinator drive --miner ./quip-cuda-sa \
 quip-cuda-sa --capabilities   # capabilities JSON
 quip-cuda-sa --check          # probe the backend is runnable
 ```
+
+## Multi-spin kernel (`quip-cuda-msa`)
+
+`kernels/msc.cu` is a CUDA port of the multi-spin coded simulated annealing
+in `quip-miner-cpu`'s `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer,
+*Optimised simulated annealing for Ising spin glasses*, Comput. Phys. Commun.
+192, 2015). 64 replicas share one 64-bit word per spin (two words per spin,
+128 reads per job), the Metropolis test is an integer comparison against a
+per-rung geometric threshold table, and spins are updated one colour class at
+a time (the host's greedy colouring, as the Gibbs kernel uses) so a whole
+block anneals one problem in shared memory. Energies are not computed on the
+device: the host rescores every sample with `energy_milli`, so results are
+consensus-scored exactly like the other kernels. It needs integer couplings
+and no fields, which the v0.3 problems satisfy; other graphs fall back to the
+host's checks at session build.
+
+Measured on an RTX 5090 Laptop (82 SMs) against the same 24 drawn problems:
+at 7392 x 128 it matches the CPU multi-spin solver's depth in 2.0 s per model
+on one SM, and in production at 29568 x 128 it runs ~32 jobs/s where the
+float kernel managed 0.4 jobs/s at 7392 x 220.
+
+Two host-side changes come with it and apply to `quip-cuda-sa` too:
+
+* **Abort on cancel.** When the coordinator cancels a round, in-flight models
+  are aborted at the next rung instead of running to completion, so the new
+  round starts within milliseconds rather than after a full batch.
+* **Parallel scoring.** Downloaded samples are rescored on
+  `QUIP_SCORE_THREADS` host threads (default 4). With one thread the sampler
+  capped a fast kernel at ~20 jobs/s and left the GPU idle between batches.
+
+Diagnostics: `QUIP_MSC_DIAG=1|2|3` adds `-DMSC_DIAG=N` at JIT time (no
+threshold rows, no spin updates, neither) to isolate kernel cost; pair it
+with `QUIP_CUDA_CACHE_DISABLE=1` since defines are not part of the cache key.
 
 ## Yielding to other GPU users
 

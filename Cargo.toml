@@ -19,6 +19,10 @@ path = "src/bin/quip_cuda_sa.rs"
 name = "quip-cuda-gibbs"
 path = "src/bin/quip_cuda_gibbs.rs"
 
+[[bin]]
+name = "quip-cuda-msa"
+path = "src/bin/quip_cuda_msa.rs"
+
 # The solver contract (quip-proto, quip-protocol, quip-solver-core) is
 # published to crates.io from quip.network/quip-solver-core. Bump the pinned
 # version to adopt newer shared code.

@@ -91,6 +91,40 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
     }
 }
 
+/// Adapt envelope for the multi-spin kernel (`quip-cuda-msa`).
+///
+/// Reads are fixed at 128: the kernel packs 64 replicas per 64-bit word and
+/// two words per spin is what fits in the 99 KB shared-memory opt-in for a
+/// 4577-spin problem (four words would need 146 KB). Sweeps are far cheaper
+/// than in `sa.cu` (one bitwise update serves 64 replicas), so the envelope
+/// is deeper: measured on an RTX 5090 Laptop, 29568 x 128 takes ~4.5 s per
+/// model against the stock kernel's ~0.4 jobs/s at 7392 x 220, and the
+/// deep-solution rate keeps improving through 29568 (see the MR notes).
+pub const CUDA_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
+    quip_solver_core::adapt::AdaptBounds {
+        min_sweeps: 7392,
+        max_sweeps: 29568,
+        min_reads: 128,
+        max_reads: 128,
+        reads_solution_min_factor: 0,
+        reads_solution_max_factor: 0,
+        reads_solution_floor_factor: 0,
+    };
+
+/// Backend identity for `quip-cuda-msa` at a resolved capacity.
+#[must_use]
+pub fn cuda_msa_identity(max_nodes: usize) -> BackendIdentity {
+    BackendIdentity {
+        backend: "cuda",
+        algorithm: "msa",
+        max_nodes: identity_max_nodes(max_nodes),
+        max_edges: DEFAULT_MAX_EDGES,
+        // Same capability set as `cuda_sa_identity`: streaming + governor.
+        features: &["streaming", "governor"],
+        adapt: CUDA_MSA_ADAPT,
+    }
+}
+
 /// Backend identity for `quip-cuda-gibbs` at a resolved capacity. `max_nodes`
 /// is the self-feeding Gibbs kernel's `shared_state` size in
 /// `kernels/gibbs.cu`.

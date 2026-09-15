@@ -14,6 +14,7 @@ use std::process::Command;
 fn invalid_log_level_is_rejected_at_parse_time() {
     for bin in [
         env!("CARGO_BIN_EXE_quip-cuda-sa"),
+        env!("CARGO_BIN_EXE_quip-cuda-msa"),
         env!("CARGO_BIN_EXE_quip-cuda-gibbs"),
     ] {
         let out = Command::new(bin)

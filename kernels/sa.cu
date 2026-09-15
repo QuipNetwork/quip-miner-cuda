@@ -276,9 +276,21 @@ __global__ void cuda_sa_self_feeding(
                 }
             }
             // === SA sweep loop ===
+            // Abort-on-cancel: the host raises this nonce's
+            // EXIT_NOW when the coordinator abandons the round. Stock code
+            // only reads the flag between models, so a cancelled model ran to
+            // completion. Peeking every few beta rungs costs one L2 read per
+            // thread per rung and lets the block leave mid-model. The flag is
+            // volatile, so this is a real read each time.
+            bool aborted = false;
             for (int beta_idx = 0;
                  beta_idx < num_betas;
                  beta_idx++) {
+                if ((beta_idx & 7) == 0 &&
+                    nonce_ctrl[ctrl_base + CTRL_EXIT_NOW]) {
+                    aborted = true;
+                    break;
+                }
                 float beta = __ldg(
                     &beta_schedule[beta_idx]);
                 float threshold = 22.18f / beta;
@@ -369,17 +381,20 @@ __global__ void cuda_sa_self_feeding(
                     packed_state);
             }
 
-            // Write packed samples to output
-            signed char* out_sample =
-                &slot_samples[
-                    sample_base
-                    + tid * max_packed_size];
-            for (int b = 0; b < packed_size; b++)
-                out_sample[b] = packed_state[b];
+            // Write packed samples to output (skipped for an aborted
+            // model: the host never reads a slot it did not see COMPLETE)
+            if (!aborted) {
+                signed char* out_sample =
+                    &slot_samples[
+                        sample_base
+                        + tid * max_packed_size];
+                for (int b = 0; b < packed_size; b++)
+                    out_sample[b] = packed_state[b];
 
-            // Write energy to output
-            slot_energies[energy_base + tid] =
-                current_energy;
+                // Write energy to output
+                slot_energies[energy_base + tid] =
+                    current_energy;
+            }
         }
 
         // All threads done writing energy + samples
@@ -399,14 +414,16 @@ __global__ void cuda_sa_self_feeding(
 
         // Thread 0: mark COMPLETE, find next READY
         if (tid == 0) {
-            nonce_ctrl[ctrl_base + active_slot] =
-                SLOT_COMPLETE;
-
-            // Check exit flag
+            // Check exit flag FIRST: an aborted or
+            // exiting model is never published as COMPLETE, so the host
+            // cannot download half-annealed samples by mistake.
             if (nonce_ctrl[
                     ctrl_base + CTRL_EXIT_NOW]) {
                 s_active_slot = -1;
             } else {
+                nonce_ctrl[ctrl_base + active_slot] =
+                    SLOT_COMPLETE;
+
                 // Find next READY slot. Wait through transient feeder
                 // starvation instead of the old bounded ~100ms retry
                 // (10000 x 10us): that cap let a momentarily-empty feeder
