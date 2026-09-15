@@ -898,7 +898,7 @@ impl<'a> SelfFeedingSession<'a> {
     }
 
     /// Pre-arm one nonce's `CTRL_EXIT_NOW` with `EXIT_AFTER_MODEL` before
-    /// launch, so the kernel anneals exactly one model, publishes it and
+    /// launch. The kernel then anneals exactly one model, publishes it and
     /// returns instead of spinning for the next slot. Used only by the
     /// isolated bench path ([`bench_one`]); the streaming path arms exit at
     /// teardown via [`Self::signal_exit`].
@@ -911,7 +911,7 @@ impl<'a> SelfFeedingSession<'a> {
 
     /// Raise `EXIT_ABORT` on every active nonce. Nothing this session holds
     /// is read after teardown, so the blocks leave mid-model rather than
-    /// finish work nobody will score, and the device comes back sooner.
+    /// finish work nobody will score. The device comes back sooner.
     fn signal_exit(&mut self) -> Result<(), SampleError> {
         if !self.launched {
             return Ok(());
@@ -925,8 +925,8 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(())
     }
 
-    /// Stop the persistent kernel right now: raise `EXIT_NOW` on every nonce
-    /// (the patched kernel peeks it inside the sweep loop) and wait for the
+    /// Stop the persistent kernel right now: raise `EXIT_ABORT` on every nonce
+    /// (the SA and msa kernels peek it inside the sweep loop) and wait for the
     /// blocks to leave. After this the session is unlaunched; `Drop` then
     /// has nothing left to wait for.
     fn abort_now(&mut self) -> Result<(), SampleError> {
@@ -1549,8 +1549,6 @@ fn answer_empty_graph(out: &Sender<StreamResult>, job: StreamJob) -> bool {
     .is_ok()
 }
 
-/// Reject every job these nonces still hold with `reason`, so none is dropped
-/// without a `StreamResult` — the coordinator is blocked on one per job.
 /// True when at least one model is ACTIVE on the device and every ACTIVE
 /// model belongs to a generation the coordinator has abandoned. NEXT slots
 /// are ignored: by the time the pump notices a cancel, `refill_slots` may
@@ -1588,6 +1586,8 @@ fn cancel_held(slots: &mut [SlotState], out: &Sender<StreamResult>, cancel: &Can
     n
 }
 
+/// Reject every job these nonces still hold with `reason`, so none is dropped
+/// without a `StreamResult` — the coordinator is blocked on one per job.
 fn reject_held(slots: &mut [SlotState], out: &Sender<StreamResult>, reason: &WireSampleError) {
     for slot in slots {
         for job in slot.drain_jobs() {
@@ -1776,20 +1776,19 @@ fn pump_session(
         if !exhausted && ctx.gov.should_throttle() {
             exhausted = true;
         }
-        if !exhausted {
-            halt = refill_slots(sess, slots, feed, ctx.budget);
-            exhausted = halt.is_exhausted();
-        }
-        // Abort-on-cancel. Once the coordinator has
-        // abandoned the generation of every job this session holds, the
-        // kernel is annealing models nobody will score. Raise EXIT_NOW so the
-        // blocks leave mid-model (kernels/sa.cu peeks the flag inside the
-        // sweep loop), wait for them, refund every held job as Cancelled, and
-        // end the session; `run_session` then seeds a fresh one from the new
-        // round's first job. Stock behaviour was to let the models finish and
-        // drop their results afterwards, which cost roughly half a batch of
-        // GPU time per round change.
+        // Abort-on-cancel, checked before the refill so a job from the new
+        // round is not admitted and then bounced. Once the coordinator has
+        // abandoned the generation of every model this session holds, the
+        // kernel is annealing models nobody will score. Raise EXIT_ABORT so
+        // the blocks leave mid-model (kernels/sa.cu and kernels/msa.cu peek
+        // the flag inside the sweep loop), wait for them, refund every held
+        // job, and end the session; `run_session` then seeds a fresh one from
+        // the new round's first job. Letting the models finish and dropping
+        // their results cost roughly half a batch of GPU time per round
+        // change.
         if abort_due(slots, feed.cancel) {
+            // Charged to Poll for lack of a bucket of its own: the wait is
+            // for the device, which is what Poll otherwise measures.
             let aborted = ctx.budget.mark();
             match sess.abort_now() {
                 Ok(()) => {
@@ -1800,15 +1799,23 @@ fn pump_session(
                     );
                 }
                 Err(e) => {
-                    // The kernel did not stop cleanly: fall back to the stock
-                    // drain path rather than tearing down under it.
-                    eprintln!("quip-miner-cuda: abort-on-cancel failed ({e}); draining instead");
+                    // Some nonces may already hold EXIT_ABORT and will leave
+                    // without publishing, so nothing held here can complete.
+                    // Same recovery as an unreadable ctrl mailbox: refund the
+                    // held jobs as DeviceBusy and rebuild.
+                    eprintln!(
+                        "quip-miner-cuda: abort-on-cancel failed ({e}); rebuilding the \
+                         self-feeding session"
+                    );
+                    reject_held(slots, feed.out, &WireSampleError::DeviceBusy);
                 }
             }
             ctx.budget.charge(Bucket::Poll, aborted);
-            if slots.iter().all(SlotState::is_vacant) {
-                break;
-            }
+            break;
+        }
+        if !exhausted {
+            halt = refill_slots(sess, slots, feed, ctx.budget);
+            exhausted = halt.is_exhausted();
         }
         let empty = slots.iter().all(SlotState::is_vacant);
         if exhausted && empty {
@@ -2103,6 +2110,74 @@ mod tests {
             params: SampleParams::default(),
             watermark: None,
         }
+    }
+
+    fn job_at(id: u8, watermark: u64) -> StreamJob {
+        let mut j = job(id);
+        j.watermark = Some(watermark);
+        j
+    }
+
+    #[test]
+    fn abort_is_due_only_when_every_active_model_is_abandoned() {
+        let cancel = CancelToken::default();
+        let mut slots = vec![SlotState::default(), SlotState::default()];
+        assert!(
+            !abort_due(&slots, &cancel),
+            "nothing active, nothing to abort"
+        );
+
+        slots[0].assign_active(0, job_at(1, 3));
+        slots[1].assign_active(0, job_at(2, 7));
+        assert!(!abort_due(&slots, &cancel), "no generation abandoned yet");
+
+        cancel.cancel_through(3);
+        assert!(
+            !abort_due(&slots, &cancel),
+            "a live model keeps the session"
+        );
+
+        cancel.cancel_through(7);
+        assert!(abort_due(&slots, &cancel));
+    }
+
+    #[test]
+    fn abort_ignores_a_live_next_job() {
+        let cancel = CancelToken::default();
+        let mut slots = vec![SlotState::default()];
+        slots[0].assign_active(0, job_at(1, 3));
+        slots[0].assign_next(1, job_at(2, 7));
+        cancel.cancel_through(3);
+        assert!(
+            abort_due(&slots, &cancel),
+            "a NEXT job from the new round must not block the abort"
+        );
+    }
+
+    #[test]
+    fn cancel_held_refunds_stale_jobs_and_bounces_live_ones() {
+        let (res_tx, mut res_rx) = channel::<StreamResult>(8);
+        let cancel = CancelToken::default();
+        let mut slots = vec![SlotState::default()];
+        slots[0].assign_active(0, job_at(1, 3));
+        slots[0].assign_next(1, job_at(2, 7));
+        cancel.cancel_through(3);
+
+        assert_eq!(cancel_held(&mut slots, &res_tx, &cancel), 2);
+        assert!(slots[0].is_vacant());
+
+        let stale = res_rx.try_recv().expect("the stale job was answered");
+        assert_eq!(stale.job_id, vec![1]);
+        let StreamOutcome::Cancelled = stale.outcome else {
+            panic!("a stale job is refunded as Cancelled");
+        };
+
+        let live = res_rx.try_recv().expect("the live job was answered");
+        assert_eq!(live.job_id, vec![2]);
+        let StreamOutcome::Completed(Err(reason)) = live.outcome else {
+            panic!("a live job is rejected so the coordinator re-stages it");
+        };
+        assert_eq!(reason, WireSampleError::DeviceBusy);
     }
 
     /// Behavior test: the `energy_score` span added around `score_spins` is
