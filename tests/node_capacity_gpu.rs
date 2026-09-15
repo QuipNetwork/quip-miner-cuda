@@ -31,8 +31,8 @@ fn sa_and_gibbs_open_at_pegasus_scale() {
 
 /// msa holds its spin state in dynamic shared memory. An A4000 opts in to
 /// 101376 bytes, which `capacity::msa_budget` puts at 5791 spins for two
-/// replica words, so Pegasus P16 fits. The open also checks the loaded
-/// kernel's static shared size against `MSA_STATIC_SHARED_BYTES`.
+/// replica words, so Pegasus P16 fits. The open also refuses a loaded
+/// kernel whose static shared size exceeds `MSA_STATIC_SHARED_BYTES`.
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn msa_opens_at_pegasus_scale() {

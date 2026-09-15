@@ -168,9 +168,10 @@ fn compile_all_kernels(
     ))
 }
 
-/// Verify the loaded msa kernel's static shared memory matches
-/// [`capacity::MSA_STATIC_SHARED_BYTES`], opt it in to `shared_per_block_optin`
-/// less those static members, and return that dynamic-shared-memory budget.
+/// Verify the loaded msa kernel declares no more static shared
+/// memory than [`capacity::MSA_STATIC_SHARED_BYTES`], opt it in to
+/// `shared_per_block_optin` less that constant, and return that
+/// dynamic-shared-memory budget.
 /// Kept out of [`CudaDevice::open_with_nodes`] to stay under the crate's
 /// function-length cap.
 fn configure_msa_shared_memory(
@@ -180,14 +181,14 @@ fn configure_msa_shared_memory(
     // The msa kernel sizes its spin state as dynamic shared memory, and a
     // block may only opt in to the device ceiling less the kernel's
     // static members. `capacity::MSA_STATIC_SHARED_BYTES` mirrors those
-    // members; check the loaded function agrees, so the budget the
-    // capacity model derived is the budget the launch gets.
+    // members; check the loaded function declares no more, so the budget the
+    // capacity model derived is never larger than the budget the launch gets.
     let static_shared = usize::try_from(msa.shared_size_bytes()?)
         .map_err(|_| CudaError::Driver("CUDA reported negative static shared memory".into()))?;
-    if static_shared != capacity::MSA_STATIC_SHARED_BYTES {
+    if static_shared > capacity::MSA_STATIC_SHARED_BYTES {
         return Err(CudaError::Driver(format!(
-            "msa kernel declares {static_shared} bytes of static shared memory, \
-             capacity::MSA_STATIC_SHARED_BYTES is {}",
+            "msa kernel declares {static_shared} bytes of static shared memory, above \
+             capacity::MSA_STATIC_SHARED_BYTES ({})",
             capacity::MSA_STATIC_SHARED_BYTES
         )));
     }
