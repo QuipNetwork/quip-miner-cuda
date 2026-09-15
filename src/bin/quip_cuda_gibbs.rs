@@ -9,7 +9,7 @@ use quip_miner_cuda::capacity::advertised_nodes;
 use quip_miner_cuda::capacity::GIBBS_DEFAULT_NODES;
 use quip_miner_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_miner_cuda::nvml_gov::UtilGovernor;
-use quip_miner_cuda::{cuda_gibbs_identity, Algorithm, CudaSampler};
+use quip_miner_cuda::{cuda_gibbs_identity, CudaSampler, KernelKind};
 use quip_solver_core::{run, CommonArgs, OpenError};
 use std::process::ExitCode;
 
@@ -54,7 +54,7 @@ enum Command {
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
     if let Some(Command::Bench(action)) = &cli.command {
-        return match run_bench(cli.device, Algorithm::Gibbs, cli.max_nodes, action) {
+        return match run_bench(cli.device, KernelKind::Gibbs, cli.max_nodes, action) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("bench failed: {e}");
@@ -99,17 +99,17 @@ fn main() -> ExitCode {
         );
     }
     run(
-        cuda_gibbs_identity(advertised_nodes(Algorithm::Gibbs, cli.max_nodes)),
+        cuda_gibbs_identity(advertised_nodes(KernelKind::Gibbs, cli.max_nodes)),
         &cli.common,
         || {
-            let device = CudaDevice::open_with_nodes(cli.device, Algorithm::Gibbs, cli.max_nodes)
+            let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Gibbs, cli.max_nodes)
                 .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
             // The governor binds by PCI bus id, not by ordinal: NVML's index
             // space is PCI-ordered and does not track the CUDA ordinal this
             // process opened. Taking it from the opened device means both
             // APIs name the same physical GPU by construction.
             let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
-            Ok(CudaSampler::new(device, gov, Algorithm::Gibbs))
+            Ok(CudaSampler::new(device, gov, KernelKind::Gibbs))
         },
     )
 }

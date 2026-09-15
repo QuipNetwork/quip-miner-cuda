@@ -9,8 +9,9 @@
 //! internal accept/reject decisions during annealing.
 
 use crate::cuda_device::CudaDevice;
+use crate::kernel::KernelKind;
 use crate::streaming;
-use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
 
 /// Failures from running one sampling job on the GPU.
@@ -30,16 +31,23 @@ pub enum SampleError {
     /// not `DeviceFault`.
     #[error("CUDA out of memory: {0}")]
     OutOfMemory(String),
-    /// The graph has more nodes than the chosen kernel's fixed-size
-    /// per-thread/shared state supports. Permanent for this backend: the
-    /// limit is compiled into the kernel, so retrying cannot help.
+    /// The graph has more nodes than the ceiling this device opened
+    /// with for the chosen kernel (`CudaDevice::max_nodes`, resolved by
+    /// `capacity::resolve`). Permanent for this session: the ceiling is
+    /// fixed at open, so retrying cannot help.
     #[error("graph N={n} exceeds self-feeding kernel limit {limit}")]
     GraphTooLarge {
         /// Node count of the rejected graph.
         n: usize,
-        /// The kernel's compiled-in node ceiling.
+        /// The node ceiling the device opened with.
         limit: usize,
     },
+    /// The graph is well formed but this kernel cannot run it: for msa, a
+    /// spin with more neighbours than the kernel's unrolled budget.
+    /// Permanent for this graph and harmless to the session, so it maps to
+    /// [`quip_solver_core::SampleError::Capacity`] like `GraphTooLarge`.
+    #[error("graph unsupported by the kernel: {0}")]
+    Unsupported(String),
     /// The persistent kernel never marked the slot COMPLETE before the
     /// driver's deadline: the device is wedged. Maps to
     /// [`quip_solver_core::SampleError::DeviceFault`] (see the `From` impl
@@ -80,18 +88,18 @@ impl From<SampleError> for quip_solver_core::SampleError {
     /// TYPE-4: name every device error variant explicitly, so a variant added
     /// to this enum later cannot silently fall through a wildcard.
     ///
-    /// `GraphTooLarge` is a permanent size bound (`Capacity`). `OutOfMemory`
-    /// is transient VRAM pressure from another process (`DeviceBusy`: reject
-    /// this job, keep the session). Every other variant here is a CUDA driver
-    /// or kernel condition this backend cannot tell apart from a genuinely
-    /// wedged device — cudarc surfaces a raw driver failure as an opaque
-    /// string, with nothing to say whether the context can still be trusted —
-    /// so each ends the session for a supervisor restart (`DeviceFault`)
-    /// rather than risking a job rejected forever against hardware that will
-    /// never recover.
+    /// `GraphTooLarge` and `Unsupported` are permanent per-graph conditions
+    /// (`Capacity`). `OutOfMemory` is transient VRAM pressure from another
+    /// process (`DeviceBusy`: reject this job, keep the session). Every other
+    /// variant here is a CUDA driver or kernel condition this backend cannot
+    /// tell apart from a genuinely wedged device — cudarc surfaces a raw
+    /// driver failure as an opaque string, with nothing to say whether the
+    /// context can still be trusted — so each ends the session for a
+    /// supervisor restart (`DeviceFault`) rather than risking a job rejected
+    /// forever against hardware that will never recover.
     fn from(e: SampleError) -> Self {
         match e {
-            SampleError::GraphTooLarge { .. } => Self::Capacity,
+            SampleError::GraphTooLarge { .. } | SampleError::Unsupported(_) => Self::Capacity,
             SampleError::OutOfMemory(_) => Self::DeviceBusy,
             SampleError::KernelTimeout | SampleError::Cuda(_) | SampleError::Driver(_) => {
                 Self::DeviceFault(e.to_string())
@@ -106,6 +114,8 @@ impl From<SampleError> for quip_solver_core::SampleError {
 ///
 /// - [`SampleError::GraphTooLarge`] if `graph` has more nodes than the chosen
 ///   kernel's fixed-size state supports. Permanent — retrying cannot help.
+/// - [`SampleError::Unsupported`] if the msa kernel cannot run this topology
+///   (a spin with more than 20 neighbours). Permanent.
 /// - [`SampleError::KernelTimeout`] if the persistent kernel never marks the
 ///   slot complete before the driver's deadline.
 /// - [`SampleError::Cuda`] if opening the device or compiling its kernels failed.
@@ -118,9 +128,9 @@ pub fn sample_ising(
     device: &CudaDevice,
     graph: &IsingGraph,
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: KernelKind,
 ) -> Result<Vec<SamplerResult>, SampleError> {
-    streaming::sample_one(device, graph, params, algorithm)
+    streaming::sample_one(device, graph, params, kernel)
 }
 
 #[cfg(test)]
@@ -172,5 +182,17 @@ mod tests {
         });
         assert_eq!(calls, 1);
         assert!(matches!(e, SampleError::Driver(_)));
+    }
+
+    /// A topology the kernel cannot run is permanent for that graph and
+    /// harmless to the session, so it is a per-job `Capacity` reject, not
+    /// a `DeviceFault` that restarts the miner.
+    #[test]
+    fn unsupported_graph_maps_to_capacity() {
+        let e = SampleError::Unsupported("msa: topology max degree 21 exceeds 20".to_owned());
+        assert_eq!(
+            quip_solver_core::SampleError::from(e),
+            quip_solver_core::SampleError::Capacity
+        );
     }
 }

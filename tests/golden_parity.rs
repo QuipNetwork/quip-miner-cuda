@@ -11,7 +11,7 @@
 
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::sampler::sample_ising;
-use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
+use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
 use quip_solver_conformance::GOLDEN_VECTORS;
@@ -94,7 +94,7 @@ fn truncation_matches_golden() {
     }
 }
 
-/// Live SA/Gibbs sample: every returned energy equals consensus scoring.
+/// Live SA, msa and Gibbs sample: every returned energy equals consensus scoring.
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
@@ -112,14 +112,14 @@ fn live_sample_energies_match_energy_milli() {
         ..Default::default()
     };
 
-    for algo in [Algorithm::Sa, Algorithm::Gibbs] {
-        let results = sample_ising(dev, &graph, &params, algo).expect("sample");
+    for kernel in [KernelKind::Sa, KernelKind::Msa, KernelKind::Gibbs] {
+        let results = sample_ising(dev, &graph, &params, kernel).expect("sample");
         assert_eq!(results.len(), 16);
         for r in &results {
             let expected = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
             assert_eq!(
                 r.energy_milli, expected,
-                "{algo:?} reported energy_milli {} != consensus {}",
+                "{kernel:?} reported energy_milli {} != consensus {}",
                 r.energy_milli, expected
             );
             assert!(r.spins.iter().all(|&s| s == 1 || s == -1));
@@ -142,10 +142,33 @@ fn sa_finds_ground_state_on_ferro() {
         seed: 42,
         ..Default::default()
     };
-    let results = sample_ising(dev, &graph, &params, Algorithm::Sa).expect("sa");
+    let results = sample_ising(dev, &graph, &params, KernelKind::Sa).expect("sa");
     assert!(
         results.iter().any(|r| r.energy_milli == -1000),
         "SA failed to find ferro ground: {:?}",
+        results.iter().map(|r| r.energy_milli).collect::<Vec<_>>()
+    );
+}
+
+/// msa finds the ground state of a ferro pair under positive fields. The
+/// untouched all-`+1` state scores `+1000`, so the assertion fails unless the
+/// kernel anneals; the ground state `(-1, -1)` scores `-3000`.
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+fn msa_finds_ground_state_on_ferro_with_fields() {
+    let dev = device();
+    let graph = IsingGraph::new(vec![1.0, 1.0], vec![-1.0], vec![(0, 1)]);
+    let params = SampleParams {
+        num_reads: 16,
+        num_sweeps: 128,
+        seed: 42,
+        ..Default::default()
+    };
+    let results = sample_ising(dev, &graph, &params, KernelKind::Msa).expect("msa");
+    assert!(
+        results.iter().any(|r| r.energy_milli == -3000),
+        "msa failed to find the ferro ground state under fields: {:?}",
         results.iter().map(|r| r.energy_milli).collect::<Vec<_>>()
     );
 }

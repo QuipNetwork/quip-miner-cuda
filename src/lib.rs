@@ -1,7 +1,8 @@
 //! CUDA Ising samplers.
 //!
-//! Two binaries share this library:
+//! Three binaries share this library:
 //! - `quip-cuda-sa` — Metropolis simulated annealing on one GPU
+//! - `quip-cuda-msa` — multi-spin coded simulated annealing, 64 reads per word
 //! - `quip-cuda-gibbs` — single-site heat-bath Gibbs on one GPU
 //!
 //! Kernels are the v0.2 self-feeding persistent kernels (`GPU/cuda_sa.cu` /
@@ -19,6 +20,7 @@ pub mod corpus;
 pub mod cuda_device;
 pub mod driver_budget;
 mod jit_cache;
+pub mod kernel;
 pub mod nsight;
 pub mod nvml_gov;
 pub mod sampler;
@@ -26,7 +28,8 @@ pub mod schema;
 pub mod streaming;
 pub mod topology;
 
-pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+pub use kernel::KernelKind;
+pub use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 pub use sampler::sample_ising;
 
 use cuda_device::CudaDevice;
@@ -91,15 +94,16 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
     }
 }
 
-/// Adapt envelope for the multi-spin kernel (`quip-cuda-msa`).
+/// Adapt envelope for `quip-cuda-msa`.
 ///
-/// Reads are fixed at 128: the kernel packs 64 replicas per 64-bit word and
-/// two words per spin is what fits in the 99 KB shared-memory opt-in for a
-/// 4577-spin problem (four words would need 146 KB). Sweeps are far cheaper
-/// than in `sa.cu` (one bitwise update serves 64 replicas), so the envelope
-/// is deeper: measured on an RTX 5090 Laptop, 29568 x 128 takes ~4.5 s per
-/// model against the stock kernel's ~0.4 jobs/s at 7392 x 220, and the
-/// deep-solution rate keeps improving through 29568 (see the MR notes).
+/// Reads are pinned at `capacity::MSA_MAX_READS` (128): the kernel packs 64
+/// replicas per word and the session allocates two words per spin, which a
+/// 99 KB shared-memory opt-in holds at Zephyr scale.
+/// `tests/headless_api.rs` pins the two numbers together. Sweeps are far
+/// cheaper than in `sa.cu` (one bitwise update serves 64 replicas), so the
+/// envelope runs deeper: measured on an RTX 5090 Laptop against 24
+/// `advantage2-system1` problems (MR !26), the deep-solution rate keeps
+/// improving through 29568 sweeps.
 pub const CUDA_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
     quip_solver_core::adapt::AdaptBounds {
         min_sweeps: 7392,
@@ -111,7 +115,10 @@ pub const CUDA_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
         reads_solution_floor_factor: 0,
     };
 
-/// Backend identity for `quip-cuda-msa` at a resolved capacity.
+/// Backend identity for `quip-cuda-msa` at a resolved capacity. `max_nodes`
+/// is the shared-memory ceiling `capacity::msa_budget` derived at open: the
+/// kernel keeps its spin state in dynamic shared memory, so a job over this
+/// cannot be launched and must reject `TooLarge` rather than clamp.
 #[must_use]
 pub fn cuda_msa_identity(max_nodes: usize) -> BackendIdentity {
     BackendIdentity {
@@ -146,17 +153,17 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
 pub struct CudaSampler {
     device: CudaDevice,
     gov: UtilGovernor,
-    algorithm: Algorithm,
+    kernel: KernelKind,
 }
 
 impl CudaSampler {
-    /// Bind an open device and its NVML governor into a sampler for `algorithm`.
+    /// Bind an open device and its NVML governor into a sampler for `kernel`.
     #[must_use]
-    pub fn new(device: CudaDevice, gov: UtilGovernor, algorithm: Algorithm) -> Self {
+    pub fn new(device: CudaDevice, gov: UtilGovernor, kernel: KernelKind) -> Self {
         Self {
             device,
             gov,
-            algorithm,
+            kernel,
         }
     }
 }
@@ -169,25 +176,25 @@ impl Sampler for CudaSampler {
     ) -> Result<Vec<SamplerResult>, SampleError> {
         // quip-miner-cuda-gp4: the device-error -> wire-error mapping lives on
         // `sampler::SampleError`'s `From` impl (TYPE-4: exhaustive, no wildcard).
-        sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
+        sample_ising(&self.device, graph, params, self.kernel).map_err(|e| {
             eprintln!("cuda sample failed: {e}");
             e.into()
         })
     }
 
-    /// Self-feeding kernel instances: `max_sms / sms_per_nonce` (1 for SA,
-    /// 4 for Gibbs), each a fully independent nonce group.
+    /// Self-feeding kernel instances: `max_sms / sms_per_nonce` (1 for SA and
+    /// msa, 4 for Gibbs), each a fully independent nonce group.
     fn sample_stream(
         &self,
         jobs: tokio::sync::mpsc::Receiver<StreamJob>,
         out: tokio::sync::mpsc::Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        streaming::run_stream(&self.device, self.algorithm, jobs, out, cancel, &self.gov);
+        streaming::run_stream(&self.device, self.kernel, jobs, out, cancel, &self.gov);
     }
 
     fn stream_width(&self) -> usize {
-        streaming::stream_width(&self.device, self.algorithm)
+        streaming::stream_width(&self.device, self.kernel)
     }
 
     /// The live width is `max_sms / sms_per_nonce` — a property of the opened
@@ -209,7 +216,7 @@ impl Sampler for CudaSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        streaming::max_reads(self.algorithm)
+        streaming::max_reads(self.kernel)
     }
 
     fn apply_config(&self, backend_toml: &str) {

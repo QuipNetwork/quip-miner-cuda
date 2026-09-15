@@ -4,10 +4,10 @@
 
 use crate::capacity;
 use crate::jit_cache;
-use cudarc::driver::sys::CUdevice_attribute;
+use crate::kernel::KernelKind;
+use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
-use quip_solver_core::Algorithm;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -15,24 +15,16 @@ use tracing::trace_span;
 
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
-/// Multi-spin coded SA, see `kernels/msc.cu`.
-const MSC_SRC: &str = include_str!("../kernels/msc.cu");
-/// Which self-feeding kernel a device runs for `Algorithm::Sa` jobs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KernelKind {
-    /// Stock float SA (`cuda_sa_self_feeding`).
-    Sa,
-    /// Multi-spin coded SA (`cuda_msc_self_feeding`).
-    Msc,
-}
+/// Multi-spin coded SA, see `kernels/msa.cu`.
+const MSA_SRC: &str = include_str!("../kernels/msa.cu");
 
 /// Every GPU architecture the miner supports: the intersection of what NVRTC
 /// 12.9 targets natively (`sm_50..sm_121`, measured via `nvrtcGetSupportedArchs`
-/// 2026-08-14) and what the kernels require — both call `__nanosleep`, an
+/// 2026-08-14) and what the kernels require — all three call `__nanosleep`, an
 /// `sm_70+` instruction, so the floor is Volta regardless of toolkit.
 ///
-/// This is the support contract: `tests/arch_coverage.rs` compiles both
-/// kernels for each entry and assembles the PTX with `ptxas`, so growing or
+/// This is the support contract: `tests/arch_coverage.rs` compiles every
+/// kernel for each entry and assembles the PTX with `ptxas`, so growing or
 /// shrinking this list is a reviewed, CI-checked decision rather than a side
 /// effect of a toolkit bump.
 pub const SUPPORTED_ARCHS: &[i32] = &[
@@ -111,22 +103,96 @@ fn compile_for_arch(src: &str, max_nodes: usize, arch: i32) -> Result<Ptx, CudaE
     // jit_cache key's max_nodes component (see `jit_cache`).
     let opts = CompileOptions {
         use_fast_math: Some(true),
-        options: {
-            let mut o = vec![
-                format!("-DQUIP_MAX_NODES={max_nodes}"),
-                format!("--gpu-architecture=compute_{arch}"),
-            ];
-            // Diagnostic compile switches for the msc kernel (benchmarking only;
-            // pair with QUIP_CUDA_CACHE_DISABLE=1 since defines are not in the cache key).
-            if let Ok(d) = std::env::var("QUIP_MSC_DIAG") {
-                o.push(format!("-DMSC_DIAG={d}"));
-            }
-            o
-        },
+        options: vec![
+            format!("-DQUIP_MAX_NODES={max_nodes}"),
+            format!("--gpu-architecture=compute_{arch}"),
+        ],
         ..Default::default()
     };
     compile_ptx_with_opts(src, opts)
         .map_err(|e| CudaError::Compile(format!("compute_{arch} compile failed: {e}")))
+}
+
+/// PTX modules for the three kernels, in `(sa, msa, gibbs)` order.
+type CompiledKernels = (Arc<CudaModule>, Arc<CudaModule>, Arc<CudaModule>);
+
+/// Compile all three kernels for `arch`, keyed by [`KernelKind::name`] in the
+/// JIT cache. Kept out of [`CudaDevice::open_with_nodes`] to stay under the
+/// crate's function-length cap.
+fn compile_all_kernels(
+    ctx: &Arc<CudaContext>,
+    arch: &str,
+    driver_ver: i32,
+    sa_nodes: usize,
+    msa_nodes: usize,
+    gibbs_nodes: usize,
+    sel: i32,
+) -> Result<CompiledKernels, CudaError> {
+    let _span = trace_span!("jit", kernels = 3).entered();
+    Ok((
+        jit_cache::load_or_compile(
+            ctx,
+            KernelKind::Sa.name(),
+            SA_SRC,
+            arch,
+            driver_ver,
+            sa_nodes,
+            || compile_for_arch(SA_SRC, sa_nodes, sel),
+        )?,
+        jit_cache::load_or_compile(
+            ctx,
+            KernelKind::Msa.name(),
+            MSA_SRC,
+            arch,
+            driver_ver,
+            msa_nodes,
+            || compile_for_arch(MSA_SRC, msa_nodes, sel),
+        )?,
+        jit_cache::load_or_compile(
+            ctx,
+            KernelKind::Gibbs.name(),
+            GIBBS_SRC,
+            arch,
+            driver_ver,
+            gibbs_nodes,
+            || compile_for_arch(GIBBS_SRC, gibbs_nodes, sel),
+        )?,
+    ))
+}
+
+/// Verify the loaded msa kernel declares no more static shared
+/// memory than [`capacity::MSA_STATIC_SHARED_BYTES`], opt it in to
+/// `shared_per_block_optin` less that constant, and return that
+/// dynamic-shared-memory budget.
+/// Kept out of [`CudaDevice::open_with_nodes`] to stay under the crate's
+/// function-length cap.
+fn configure_msa_shared_memory(
+    msa: &CudaFunction,
+    shared_per_block_optin: usize,
+) -> Result<usize, CudaError> {
+    // The msa kernel sizes its spin state as dynamic shared memory, and a
+    // block may only opt in to the device ceiling less the kernel's
+    // static members. `capacity::MSA_STATIC_SHARED_BYTES` mirrors those
+    // members; check the loaded function declares no more, so the budget the
+    // capacity model derived is never larger than the budget the launch gets.
+    let static_shared = usize::try_from(msa.shared_size_bytes()?)
+        .map_err(|_| CudaError::Driver("CUDA reported negative static shared memory".into()))?;
+    if static_shared > capacity::MSA_STATIC_SHARED_BYTES {
+        return Err(CudaError::Driver(format!(
+            "msa kernel declares {static_shared} bytes of static shared memory, above \
+             capacity::MSA_STATIC_SHARED_BYTES ({})",
+            capacity::MSA_STATIC_SHARED_BYTES
+        )));
+    }
+    let msa_dynamic_shared_bytes = capacity::msa_dynamic_shared_bytes(shared_per_block_optin);
+    let optin = i32::try_from(msa_dynamic_shared_bytes).map_err(|_| {
+        CudaError::Driver("opt-in shared memory does not fit the driver's int".into())
+    })?;
+    msa.set_attribute(
+        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        optin,
+    )?;
+    Ok(msa_dynamic_shared_bytes)
 }
 
 /// Loaded kernels + streams bound to a single device.
@@ -158,17 +224,21 @@ pub struct CudaDevice {
     /// `cuda_gibbs_self_feeding` — persistent kernel, `sms_per_nonce` blocks
     /// per nonce.
     pub(crate) gibbs: CudaFunction,
-    pub(crate) msc: Option<CudaFunction>,
-    pub(crate) kernel: KernelKind,
-    /// Largest dynamic shared memory a block may opt in to (bytes).
-    pub max_shared_optin: usize,
+    /// `cuda_msa_self_feeding` — persistent kernel, 1 block (1 SM) per
+    /// nonce, 64 reads per replica word.
+    pub(crate) msa: CudaFunction,
+    /// Dynamic shared memory one msa block may request: the device's opt-in
+    /// ceiling less the kernel's static members. `streaming` sizes msa
+    /// sessions against it; `capacity::msa_budget` derives `max_nodes` from
+    /// it when the process runs msa.
+    pub(crate) msa_dynamic_shared_bytes: usize,
     /// SMs on this device (`launch_self_feeding`'s `num_kernels` budget).
     pub max_sms: usize,
-    /// Node capacity the running algorithm's kernel was compiled for.
+    /// Node capacity the running kernel was compiled for.
     pub max_nodes: usize,
     _sa_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
-    _msc_mod: Option<Arc<CudaModule>>,
+    _msa_mod: Arc<CudaModule>,
 }
 
 // Scalar device facts only; the context, stream, kernel handles and loaded
@@ -180,6 +250,7 @@ impl fmt::Debug for CudaDevice {
             .field("pci_bus_id", &self.pci_bus_id)
             .field("max_sms", &self.max_sms)
             .field("max_nodes", &self.max_nodes)
+            .field("msa_dynamic_shared_bytes", &self.msa_dynamic_shared_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -205,64 +276,23 @@ impl CudaDevice {
     /// # Ok::<(), quip_miner_cuda::cuda_device::CudaError>(())
     /// ```
     pub fn open(device_index: usize) -> Result<Self, CudaError> {
-        Self::open_with_nodes(device_index, Algorithm::Sa, capacity::SA_DEFAULT_NODES)
+        Self::open_with_nodes(device_index, KernelKind::Sa, capacity::SA_DEFAULT_NODES)
     }
 
-    /// [`CudaDevice::open`], compiling `algorithm`'s kernel for `max_nodes`.
+    /// [`CudaDevice::open`], compiling `kernel` for `max_nodes`.
     ///
-    /// The other algorithm's kernel compiles at its own default. One process
-    /// drives one algorithm, so only `algorithm` needs the larger array, and a
-    /// bigger SA array would cost local memory for a kernel that never
-    /// launches here.
+    /// The other two kernels compile at their own defaults. One process
+    /// drives one kernel, so only `kernel` needs the larger array, and a
+    /// bigger array would cost memory for a kernel that never launches here.
     ///
     /// # Errors
     ///
     /// Everything [`CudaDevice::open`] returns, plus [`CudaError::Capacity`]
-    /// when `max_nodes` exceeds the algorithm bound or this device's
-    /// shared-memory budget.
+    /// when `max_nodes` exceeds the kernel's bound on this device.
     pub fn open_with_nodes(
         device_index: usize,
-        algorithm: Algorithm,
-        max_nodes: usize,
-    ) -> Result<Self, CudaError> {
-        Self::open_with_kernel(device_index, algorithm, max_nodes, KernelKind::Sa)
-    }
-
-    /// JIT-load the multi-spin kernel and raise its dynamic shared-memory
-    /// limit to the device's opt-in maximum. Static shared members count
-    /// against the same cap, so a margin is left below it (asking for the
-    /// exact maximum returns `CUDA_ERROR_INVALID_VALUE`).
-    fn load_msc(
-        ctx: &Arc<CudaContext>,
-        arch: &str,
-        driver_ver: i32,
-        nodes: usize,
-        sel: i32,
-        max_shared_optin: usize,
-    ) -> Result<(CudaFunction, Arc<CudaModule>), CudaError> {
-        let m = jit_cache::load_or_compile(ctx, "msc", MSC_SRC, arch, driver_ver, nodes, || {
-            compile_for_arch(MSC_SRC, nodes, sel)
-        })?;
-        let f = m.load_function("cuda_msc_self_feeding")?;
-        let optin = i32::try_from(max_shared_optin.saturating_sub(4096)).unwrap_or(i32::MAX);
-        f.set_attribute(
-            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            optin,
-        )?;
-        Ok((f, m))
-    }
-
-    /// Open a device and choose the self-feeding kernel for SA jobs.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `device_index` is out of range, a device attribute cannot
-    /// be read, or a kernel fails to compile or load.
-    pub fn open_with_kernel(
-        device_index: usize,
-        algorithm: Algorithm,
-        max_nodes: usize,
         kernel: KernelKind,
+        max_nodes: usize,
     ) -> Result<Self, CudaError> {
         // CUDA reports counts as i32; reject a negative driver response rather
         // than silent truncation into usize.
@@ -305,6 +335,10 @@ impl CudaDevice {
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
         )
         .map_err(|_| CudaError::Driver("CUDA reported negative shared memory".into()))?;
+        let shared_per_block_optin = usize::try_from(ctx.attribute(
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        )?)
+        .map_err(|_| CudaError::Driver("CUDA reported negative opt-in shared memory".into()))?;
         let threads_per_sm = usize::try_from(
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR)?,
         )
@@ -315,15 +349,24 @@ impl CudaDevice {
         let (free_bytes, _total_bytes) = ctx.mem_get_info()?;
         let limits = capacity::DeviceLimits {
             shared_bytes_per_block: shared_per_block,
+            shared_bytes_per_block_optin: shared_per_block_optin,
             free_bytes,
             sm_count: max_sms.max(1),
             threads_per_sm,
         };
-        let resolved = capacity::resolve(algorithm, max_nodes, &limits)?;
-        let (sa_nodes, gibbs_nodes) = match algorithm {
-            Algorithm::Sa => (resolved, capacity::GIBBS_DEFAULT_NODES),
-            Algorithm::Gibbs => (capacity::SA_DEFAULT_NODES, resolved),
+        let resolved = capacity::resolve(kernel, max_nodes, &limits)?;
+        // The selected kernel gets the resolved capacity; the other two
+        // compile at their defaults.
+        let nodes_for = |k: KernelKind| {
+            if k == kernel {
+                resolved
+            } else {
+                capacity::default_nodes(k)
+            }
         };
+        let sa_nodes = nodes_for(KernelKind::Sa);
+        let msa_nodes = nodes_for(KernelKind::Msa);
+        let gibbs_nodes = nodes_for(KernelKind::Gibbs);
 
         // Detected capability -> clamped compile target. An unreadable
         // attribute degrades to the floor (70) rather than failing the open:
@@ -341,43 +384,20 @@ impl CudaDevice {
         let arch = format!("sm_{sel}");
         let driver_ver = driver_version()?;
 
-        let (sa_mod, gibbs_mod) = {
-            let _span = trace_span!("jit", kernels = 2).entered();
-            (
-                jit_cache::load_or_compile(
-                    &ctx,
-                    "sa",
-                    SA_SRC,
-                    &arch,
-                    driver_ver,
-                    sa_nodes,
-                    || compile_for_arch(SA_SRC, sa_nodes, sel),
-                )?,
-                jit_cache::load_or_compile(
-                    &ctx,
-                    "gibbs",
-                    GIBBS_SRC,
-                    &arch,
-                    driver_ver,
-                    gibbs_nodes,
-                    || compile_for_arch(GIBBS_SRC, gibbs_nodes, sel),
-                )?,
-            )
-        };
+        let (sa_mod, msa_mod, gibbs_mod) = compile_all_kernels(
+            &ctx,
+            &arch,
+            driver_ver,
+            sa_nodes,
+            msa_nodes,
+            gibbs_nodes,
+            sel,
+        )?;
 
         let sa = sa_mod.load_function("cuda_sa_self_feeding")?;
+        let msa = msa_mod.load_function("cuda_msa_self_feeding")?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
-        let max_shared_optin = usize::try_from(ctx.attribute(
-            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-        )?)
-        .unwrap_or(shared_per_block)
-        .max(shared_per_block);
-        let (msc, msc_mod) = if kernel == KernelKind::Msc {
-            let (f, m) = Self::load_msc(&ctx, &arch, driver_ver, sa_nodes, sel, max_shared_optin)?;
-            (Some(f), Some(m))
-        } else {
-            (None, None)
-        };
+        let msa_dynamic_shared_bytes = configure_msa_shared_memory(&msa, shared_per_block_optin)?;
 
         // Read before the struct is built so an unreadable attribute fails the
         // open rather than leaving a device whose governor can never bind.
@@ -394,14 +414,13 @@ impl CudaDevice {
             stream,
             sa,
             gibbs,
-            msc,
-            kernel,
-            max_shared_optin,
+            msa,
+            msa_dynamic_shared_bytes,
             max_sms: max_sms.max(1),
             max_nodes: resolved,
             _sa_mod: sa_mod,
             _gibbs_mod: gibbs_mod,
-            _msc_mod: msc_mod,
+            _msa_mod: msa_mod,
         })
     }
 

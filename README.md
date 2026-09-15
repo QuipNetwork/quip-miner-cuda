@@ -9,7 +9,7 @@ Each process binds one CUDA device (`--device N`) and drives it directly.
 The coordinator takes N from the `[cuda.N]` config section and passes it as
 `--device N`; the miner warns at startup when its `cuda-N` label and `--device`
 disagree, and the label never overrides the flag.
-Kernels (`kernels/sa.cu`, `kernels/msc.cu`, `kernels/gibbs.cu`) are JIT-compiled via NVRTC at
+Kernels (`kernels/sa.cu`, `kernels/msa.cu`, `kernels/gibbs.cu`) are JIT-compiled via NVRTC at
 runtime through `cudarc`'s dynamic-loading feature, so **building this crate
 does not require the CUDA toolkit** — only a CUDA GPU and driver are needed to
 *run* the binaries.
@@ -23,13 +23,16 @@ through the driver's forward-compatible PTX JIT. `SUPPORTED_ARCHS` in
 `src/cuda_device.rs` is the contract and `tests/arch_coverage.rs` enforces it
 (`make test-archs`). Energies are scored with the canonical
 `quip_protocol::scoring::energy_milli` so results match consensus.
+`quip-cuda-msa` also needs at least 96 KB of opt-in shared memory per block
+to open at its default capacity. Every supported architecture except Turing
+(sm_75, 64 KB) provides that.
 
 ## Binaries
 
 | binary | algorithm |
 |--------|-----------|
 | `quip-cuda-sa` | simulated annealing (Metropolis) |
-| `quip-cuda-msa` | multi-spin coded simulated annealing (64 replicas per word) |
+| `quip-cuda-msa` | multi-spin coded simulated annealing, 64 reads per word |
 | `quip-cuda-gibbs` | heat-bath Gibbs |
 
 Prebuilt `amd64` binaries are attached to each
@@ -76,36 +79,35 @@ quip-cuda-sa --check          # probe the backend is runnable
 
 ## Multi-spin kernel (`quip-cuda-msa`)
 
-`kernels/msc.cu` is a CUDA port of the multi-spin coded simulated annealing
+`kernels/msa.cu` is a CUDA port of the multi-spin coded simulated annealing
 in `quip-miner-cpu`'s `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer,
 *Optimised simulated annealing for Ising spin glasses*, Comput. Phys. Commun.
-192, 2015). 64 replicas share one 64-bit word per spin (two words per spin,
-128 reads per job), the Metropolis test is an integer comparison against a
-per-rung geometric threshold table, and spins are updated one colour class at
-a time (the host's greedy colouring, as the Gibbs kernel uses) so a whole
-block anneals one problem in shared memory. Energies are not computed on the
-device: the host rescores every sample with `energy_milli`, so results are
-consensus-scored exactly like the other kernels. It needs integer couplings
-and no fields, which the v0.3 problems satisfy; other graphs fall back to the
-host's checks at session build.
+192, 2015). 64 replicas share one 64-bit word per spin. A job of 128 reads is
+two words. The Metropolis test is an integer comparison against a per-rung
+threshold table. Spins update one colour class at a time, with the same greedy
+colouring the Gibbs kernel uses. One block anneals one problem in shared
+memory. The device computes no energies. The host rescores every sample with
+`energy_milli`, so results are consensus-scored like the other kernels.
 
-Measured on an RTX 5090 Laptop (82 SMs) against the same 24 drawn problems:
-at 7392 x 128 it matches the CPU multi-spin solver's depth in 2.0 s per model
-on one SM, and in production at 29568 x 128 it runs ~32 jobs/s where the
-float kernel managed 0.4 jobs/s at 7392 x 220.
+The kernel uses couplings and fields by sign. Consensus problems have `J` in
+{-1, 1} and `h` in {-1, 0, 1}, which it represents exactly. Other values
+degrade the anneal but never the scoring. A spin with more than 20 neighbours
+cannot run on this kernel. Such a job is rejected as `TooLarge`.
 
-Two host-side changes come with it and apply to `quip-cuda-sa` too:
+Node capacity comes from the device. The spin state is dynamic shared memory,
+so the ceiling is the opt-in shared memory per block less 8720 bytes, divided
+by 16. That is 5791 spins on a 99 KB part and 5599 on Volta. `--max-nodes`
+above the ceiling is an error at open, never a silent clamp. Reads are fixed at
+128.
+
+Two host-side changes came with it and apply to `quip-cuda-sa` too:
 
 * **Abort on cancel.** When the coordinator cancels a round, in-flight models
-  are aborted at the next rung instead of running to completion, so the new
-  round starts within milliseconds rather than after a full batch.
-* **Parallel scoring.** Downloaded samples are rescored on
-  `QUIP_SCORE_THREADS` host threads (default 4). With one thread the sampler
-  capped a fast kernel at ~20 jobs/s and left the GPU idle between batches.
-
-Diagnostics: `QUIP_MSC_DIAG=1|2|3` adds `-DMSC_DIAG=N` at JIT time (no
-threshold rows, no spin updates, neither) to isolate kernel cost; pair it
-with `QUIP_CUDA_CACHE_DISABLE=1` since defines are not part of the cache key.
+  stop at the next rung instead of running to completion. The new round
+  starts within milliseconds rather than after a full batch.
+* **Parallel scoring.** Downloaded samples are rescored on `QUIP_SCORE_THREADS`
+  host threads (default 4). With one thread the sampler capped a fast kernel at
+  about 20 jobs per second and left the GPU idle between batches.
 
 ## Yielding to other GPU users
 
@@ -151,13 +153,15 @@ quip-miner-cuda: no slot completed in 612.4s; rebuilding the self-feeding sessio
 The stream driver can account for its own wall clock, one window at a time.
 Use it to find where driver time goes when throughput falls.
 
-Accounting is off by default. Three environment variables control it:
+Accounting is off by default. The table lists the environment variables.
+`QUIP_SCORE_THREADS` applies to every binary, with or without accounting.
 
 | Variable | Effect |
 | -- | -- |
 | `QUIP_DRIVER_BUDGET` | Set to `1` to turn accounting on. Any other value leaves it off. |
 | `QUIP_DRIVER_BUDGET_WINDOW` | Report period in seconds. Default 60. |
 | `QUIP_DRIVER_BUDGET_OUT` | Path to append one JSON object per window. Optional. |
+| `QUIP_SCORE_THREADS` | Host threads that score one job's reads. Default 4. Values below 1 fall back to the default. |
 
 Each window logs one line:
 

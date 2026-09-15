@@ -15,8 +15,10 @@
 //! (bounded wait), and launches with however many nonces that filled — still
 //! correct, just not guaranteed to hit full width on a very short run.
 
-use crate::cuda_device::{CudaDevice, KernelKind};
+use crate::capacity;
+use crate::cuda_device::CudaDevice;
 use crate::driver_budget::{Bucket, DriverBudget};
+use crate::kernel::KernelKind;
 use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
 use crate::topology::{fill_h_j, SelfFeedingTopology};
@@ -26,8 +28,7 @@ use quip_protocol::scoring::energy_milli;
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 use quip_solver_core::SampleError as WireSampleError;
 use quip_solver_core::{
-    Algorithm, CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome,
-    StreamResult,
+    CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,6 +38,13 @@ use tracing::trace_span;
 
 const CTRL_STRIDE: usize = 8;
 const CTRL_EXIT_NOW: usize = 6;
+/// Values the host writes to a nonce's `CTRL_EXIT_NOW` word. The kernels end
+/// their slot waits on any nonzero value; only [`EXIT_ABORT`] makes the SA
+/// and msa kernels leave mid-model without publishing the slot. Gibbs
+/// finishes its model on either value.
+const EXIT_AFTER_MODEL: i32 = 1;
+/// See [`EXIT_AFTER_MODEL`].
+const EXIT_ABORT: i32 = 2;
 /// How long the driver stands down for, per check, while yielding.
 ///
 /// Only ever slept with no session running, so this is real time the GPU is
@@ -105,15 +113,6 @@ const SLOT_COMPLETE: i32 = 3;
 /// Every scalar the kernel uses to bound a device buffer goes through here, so
 /// a job too large for that ABI fails loudly at the host/device boundary
 /// instead of wrapping into an in-range index at launch.
-/// Threads per block for the multi-spin kernel; `QUIP_MSC_THREADS` (256/512/1024) for benchmarking.
-fn msc_block_threads() -> u32 {
-    std::env::var("QUIP_MSC_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&t| t == 256 || t == 512 || t == 1024)
-        .unwrap_or(256)
-}
-
 fn to_kernel_i32(name: &str, value: usize) -> Result<i32, SampleError> {
     i32::try_from(value).map_err(|_| {
         SampleError::Driver(format!(
@@ -138,25 +137,37 @@ struct AlgoLimits {
     sms_per_nonce: usize,
     /// Largest reads-per-nonce this driver allocates for.
     max_reads: usize,
+    /// Threads per launched block.
+    threads_per_block: u32,
 }
 
-fn algo_limits(algorithm: Algorithm) -> AlgoLimits {
-    match algorithm {
+fn algo_limits(kernel: KernelKind) -> AlgoLimits {
+    match kernel {
         // 1 block (1 SM) per nonce; `if (tid < num_reads)` in a 256-thread
         // block hard-caps reads/nonce. N is capped by the kernel's
         // `unpacked_state[QUIP_MAX_NODES]`, which is resolved per process and
         // carried on `CudaDevice::max_nodes` rather than fixed here.
-        Algorithm::Sa => AlgoLimits {
+        KernelKind::Sa => AlgoLimits {
             sms_per_nonce: 1,
             max_reads: 256,
+            threads_per_block: 256,
+        },
+        // 1 block (1 SM) per nonce, like SA. Reads are lanes of 64-bit
+        // replica words; the session allocates two words, so 128 reads is
+        // the cap the kernel's shared-memory footprint was sized for.
+        KernelKind::Msa => AlgoLimits {
+            sms_per_nonce: 1,
+            max_reads: capacity::MSA_MAX_READS,
+            threads_per_block: capacity::MSA_THREADS_PER_NONCE,
         },
         // reads/nonce isn't block-capped (work is chunked across
         // `sms_per_nonce` blocks) but is held to the same 256 for a uniform,
         // generous device-memory bound. N is capped by
         // `shared_state[QUIP_MAX_NODES]`, see above.
-        Algorithm::Gibbs => AlgoLimits {
+        KernelKind::Gibbs => AlgoLimits {
             sms_per_nonce: 4,
             max_reads: 256,
+            threads_per_block: 256,
         },
     }
 }
@@ -170,18 +181,20 @@ fn algo_limits(algorithm: Algorithm) -> AlgoLimits {
 ///
 /// ```
 /// use quip_miner_cuda::streaming::max_reads;
-/// use quip_miner_cuda::Algorithm;
+/// use quip_miner_cuda::KernelKind;
 ///
-/// // Both kernels are held to one 256-thread block's worth of reads.
-/// assert_eq!(max_reads(Algorithm::Sa), 256);
-/// assert_eq!(max_reads(Algorithm::Gibbs), 256);
+/// // SA and Gibbs are held to one 256-thread block's worth of reads; msa is
+/// // capped at 128 by its shared-memory replica-word budget.
+/// assert_eq!(max_reads(KernelKind::Sa), 256);
+/// assert_eq!(max_reads(KernelKind::Gibbs), 256);
+/// assert_eq!(max_reads(KernelKind::Msa), 128);
 /// ```
 #[must_use]
-// The cap is a compile-time constant per algorithm (256 for both kernels; see
-// `algo_limits`), so this is a width change and not a narrowing.
+// The cap is a compile-time constant per kernel (256 for SA/Gibbs, 128 for
+// msa; see `algo_limits`), so this is a width change and not a narrowing.
 #[allow(clippy::cast_possible_truncation)]
-pub fn max_reads(algorithm: Algorithm) -> u32 {
-    algo_limits(algorithm).max_reads as u32
+pub fn max_reads(kernel: KernelKind) -> u32 {
+    algo_limits(kernel).max_reads as u32
 }
 
 fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
@@ -223,22 +236,27 @@ pub(crate) fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     }
 }
 
-/// Host scoring threads per job. The single sampler
-/// thread scored every read serially and capped the device at ~20 jobs/s at
-/// any sweep count (2026-09-15); `QUIP_SCORE_THREADS` overrides the default.
-fn score_threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("QUIP_SCORE_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(4)
-    })
+/// Host scoring threads per completed job, from `QUIP_SCORE_THREADS`.
+///
+/// The single sampler thread scored every read serially and capped a fast
+/// kernel at about 20 jobs per second with the GPU idle between batches
+/// (MR !26, 2026-09-15). Four is the default rather than
+/// `available_parallelism` because a CPU miner often shares the host.
+fn score_threads_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
 }
 
-/// Score one job's reads on up to `score_threads()` scoped host threads,
-/// preserving read order. Falls back to the serial path for one thread.
+/// [`score_threads_from`] over the real environment, read once.
+fn score_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| score_threads_from(std::env::var("QUIP_SCORE_THREADS").ok().as_deref()))
+}
+
+/// Score one job's reads on up to [`score_threads`] scoped host threads,
+/// preserving read order. One thread, or one read, takes the serial path.
 fn score_reads_parallel(reads: &[Vec<i8>], graph: &IsingGraph) -> Vec<SamplerResult> {
     let n = score_threads().min(reads.len().max(1));
     if n <= 1 {
@@ -250,10 +268,17 @@ fn score_reads_parallel(reads: &[Vec<i8>], graph: &IsingGraph) -> Vec<SamplerRes
             .chunks(chunk)
             .map(|c| sc.spawn(move || c.iter().map(|s| score_spins(s, graph)).collect::<Vec<_>>()))
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("score thread panicked"))
-            .collect()
+        let mut out = Vec::with_capacity(reads.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(scored) => out.extend(scored),
+                // `energy_milli` over a well-formed graph does not panic. If
+                // it ever does, that is a bug to surface on the driver
+                // thread, not a short result set to hand the coordinator.
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        out
     })
 }
 
@@ -280,7 +305,7 @@ fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
 /// no other code independently frees these slices first.
 struct SelfFeedingSession<'a> {
     device: &'a CudaDevice,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     topology: SelfFeedingTopology,
     active_nonces: usize,
     reads_per_nonce: usize,
@@ -320,13 +345,13 @@ struct KernelDims {
     reads_per_nonce: i32,
 }
 
-/// Algorithm-specific buffers, kept out of `Option`s: which variant is
-/// populated always matches `SelfFeedingSession::algorithm` by construction,
+/// Kernel-specific buffers, kept out of `Option`s: which variant is
+/// populated always matches `SelfFeedingSession::kernel` by construction,
 /// so `launch()` destructures it directly instead of unwrapping an `Option`
 /// known-Some-by-invariant.
 enum AlgoState {
     /// Multi-spin kernel: colour classes plus its shared-memory footprint.
-    Msc {
+    Msa {
         d_color_starts: CudaSlice<i32>,
         d_color_counts: CudaSlice<i32>,
         d_color_nodes: CudaSlice<i32>,
@@ -347,54 +372,51 @@ enum AlgoState {
     },
 }
 
-/// Device buffers for the multi-spin kernel: replica-word fit against the
-/// shared-memory opt-in, the neighbour-budget check, and the colour classes.
-fn build_msc_state(
+/// Device buffers for the multi-spin kernel: the colour classes plus the
+/// dynamic shared-memory footprint the launch asks for.
+///
+/// The kernel unrolls a fixed neighbour budget (`MSA_MAX_DEG` in
+/// `kernels/msa.cu`). A denser topology cannot run on it and is refused per
+/// job as `Unsupported`, which the wire maps to `Capacity`: permanent for
+/// this graph, harmless to the session.
+fn build_msa_state(
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
     topology: &SelfFeedingTopology,
     reads_per_nonce: usize,
 ) -> Result<AlgoState, SampleError> {
-    let fixed = 8192usize + 64 * 8;
-    let mut words = reads_per_nonce.div_ceil(64).next_power_of_two().clamp(1, 4);
-    // Consumer parts opt in to ~99 KB of shared memory: fit as many replica
-    // words as the budget allows and refuse a read count that needs more.
-    while words > 1 && topology.n.max(1) * words * 8 + fixed > device.max_shared_optin {
-        words /= 2;
-    }
-    // The kernel unrolls a fixed neighbour budget; a denser graph would read past it.
-    let max_deg = topology
-        .row_ptr
-        .windows(2)
-        .map(|w| usize::try_from(w[1] - w[0]).unwrap_or(0))
-        .max()
-        .unwrap_or(0);
-    if max_deg > 20 {
-        return Err(SampleError::Driver(format!(
-            "msc: topology max degree {max_deg} exceeds the kernel's 20-neighbour budget"
+    let max_deg = topology.max_degree();
+    if max_deg > capacity::MSA_MAX_DEGREE {
+        return Err(SampleError::Unsupported(format!(
+            "msa: topology max degree {max_deg} exceeds the kernel's {}-neighbour budget",
+            capacity::MSA_MAX_DEGREE
         )));
+    }
+    // One 64-lane word per 64 reads. `reads_per_nonce` is already capped at
+    // `MSA_MAX_READS`, so this is 1 or 2: a power of two, which the kernel's
+    // thread-to-word mask requires.
+    let words = reads_per_nonce
+        .div_ceil(capacity::MSA_LANES)
+        .next_power_of_two();
+    let shared = capacity::msa_shared_bytes(topology.n, words);
+    // Defense in depth, as the `n > device.max_nodes` guard in `build`: the
+    // node ceiling was resolved for two words at open, so this fires only
+    // if that derivation and this footprint drift apart.
+    if shared > device.msa_dynamic_shared_bytes {
+        return Err(SampleError::GraphTooLarge {
+            n: topology.n,
+            limit: capacity::msa_budget(device.msa_dynamic_shared_bytes),
+        });
     }
     tracing::info!(
         num_colors = topology.colors.num_colors,
         words,
         max_deg,
-        shared_bytes = topology.n.max(1) * words * 8 + fixed,
-        "msc session: colour classes and shared-memory footprint"
+        shared_bytes = shared,
+        "msa session: colour classes and shared-memory footprint"
     );
-    if reads_per_nonce > 64 * words {
-        return Err(SampleError::Driver(format!(
-            "msc: {reads_per_nonce} reads need {} replica words but shared memory ({} B) fits {words}",
-            reads_per_nonce.div_ceil(64),
-            device.max_shared_optin
-        )));
-    }
-    let shared = topology.n.max(1) * words * 8 + fixed;
-    if shared > device.max_shared_optin {
-        return Err(SampleError::GraphTooLarge {
-            n: topology.n,
-            limit: device.max_shared_optin.saturating_sub(fixed) / (words * 8),
-        });
-    }
+    // Every array gets a one-element stand-in where it would be empty: a
+    // zero-length allocation has no device address for the kernel to index.
     let starts = if topology.colors.starts.is_empty() {
         vec![0i32]
     } else {
@@ -410,13 +432,18 @@ fn build_msc_state(
     } else {
         topology.colors.nodes.clone()
     };
-    Ok(AlgoState::Msc {
+    let shared_bytes = u32::try_from(shared).map_err(|_| {
+        SampleError::Driver(format!(
+            "msa shared memory {shared} bytes does not fit the launch ABI"
+        ))
+    })?;
+    Ok(AlgoState::Msa {
         d_color_starts: stream.clone_htod(&starts)?,
         d_color_counts: stream.clone_htod(&counts)?,
         d_color_nodes: stream.clone_htod(&nodes)?,
         num_colors: topology.colors.num_colors,
         words: to_kernel_i32("words", words)?,
-        shared_bytes: u32::try_from(shared).unwrap_or(u32::MAX),
+        shared_bytes,
     })
 }
 
@@ -430,23 +457,21 @@ fn build_algo_state(
     // stream by `&Arc<Self>` so the returned slices can keep it alive.
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     topology: &SelfFeedingTopology,
     num_nonces: usize,
     reads_per_nonce: usize,
 ) -> Result<AlgoState, SampleError> {
-    let limits = algo_limits(algorithm);
-    match algorithm {
-        Algorithm::Sa if device.kernel == KernelKind::Msc => {
-            build_msc_state(device, stream, topology, reads_per_nonce)
-        }
-        Algorithm::Sa => {
+    let limits = algo_limits(kernel);
+    match kernel {
+        KernelKind::Msa => build_msa_state(device, stream, topology, reads_per_nonce),
+        KernelKind::Sa => {
             let total_threads = num_nonces * 256;
             Ok(AlgoState::Sa {
                 d_delta_energy: stream.alloc_zeros::<i8>(total_threads * topology.n.max(1))?,
             })
         }
-        Algorithm::Gibbs => {
+        KernelKind::Gibbs => {
             let starts = tile_i32(&topology.colors.starts, num_nonces);
             let counts = tile_i32(&topology.colors.counts, num_nonces);
             let starts = if starts.is_empty() {
@@ -482,7 +507,7 @@ fn build_algo_state(
 impl<'a> SelfFeedingSession<'a> {
     fn build(
         device: &'a CudaDevice,
-        algorithm: Algorithm,
+        kernel: KernelKind,
         topology: SelfFeedingTopology,
         num_nonces: usize,
         reads_per_nonce: usize,
@@ -541,7 +566,7 @@ impl<'a> SelfFeedingSession<'a> {
         let algo_state = build_algo_state(
             device,
             &stream_compute,
-            algorithm,
+            kernel,
             &topology,
             num_nonces,
             reads_per_nonce,
@@ -566,7 +591,7 @@ impl<'a> SelfFeedingSession<'a> {
 
         Ok(Self {
             device,
-            algorithm,
+            kernel,
             topology,
             active_nonces: 0,
             reads_per_nonce,
@@ -690,14 +715,14 @@ impl<'a> SelfFeedingSession<'a> {
     }
 
     /// Launch arm for the multi-spin kernel.
-    fn launch_msc(
+    fn launch_msa(
         &self,
         cfg: LaunchConfig,
         num_betas: i32,
         sweeps_per_beta: i32,
         seed: u32,
     ) -> Result<(), SampleError> {
-        let AlgoState::Msc {
+        let AlgoState::Msa {
             d_color_starts,
             d_color_counts,
             d_color_nodes,
@@ -706,15 +731,10 @@ impl<'a> SelfFeedingSession<'a> {
             ..
         } = &self.algo_state
         else {
-            return Err(SampleError::Driver("launch_msc without msc state".into()));
+            return Err(SampleError::Driver("launch_msa without msa state".into()));
         };
-        let f = self
-            .device
-            .msc
-            .as_ref()
-            .ok_or_else(|| SampleError::Driver("msc kernel not loaded".into()))?;
         let dims = &self.dims;
-        let mut b = self.stream_compute.launch_builder(f);
+        let mut b = self.stream_compute.launch_builder(&self.device.msa);
         b.arg(&self.d_row_ptr);
         b.arg(&self.d_col_ind);
         b.arg(d_color_starts);
@@ -736,8 +756,8 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(&dims.max_packed);
         b.arg(&seed);
         b.arg(words);
-        // SAFETY: the 21 `b.arg` calls above mirror `cuda_msc_self_feeding` in
-        // `kernels/msc.cu` in order, type and count; every buffer is sized by
+        // SAFETY: the 21 `b.arg` calls above mirror `cuda_msa_self_feeding` in
+        // `kernels/msa.cu` in order, type and count; every buffer is sized by
         // `build` from the same `dims` the kernel receives, and the colour
         // buffers are bounded by `num_colors` / `dims.n`.
         unsafe { b.launch(cfg) }?;
@@ -753,7 +773,7 @@ impl<'a> SelfFeedingSession<'a> {
     ) -> Result<(), SampleError> {
         let _span = trace_span!("launch", active_nonces).entered();
         self.active_nonces = active_nonces;
-        let limits = algo_limits(self.algorithm);
+        let limits = algo_limits(self.kernel);
         let blocks = active_nonces * limits.sms_per_nonce;
         let num_blocks = u32::try_from(blocks).map_err(|_| {
             SampleError::Driver(format!(
@@ -762,17 +782,10 @@ impl<'a> SelfFeedingSession<'a> {
         })?;
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
-            block_dim: (
-                match &self.algo_state {
-                    AlgoState::Msc { .. } => msc_block_threads(),
-                    _ => 256,
-                },
-                1,
-                1,
-            ),
+            block_dim: (limits.threads_per_block, 1, 1),
             shared_mem_bytes: match &self.algo_state {
-                AlgoState::Msc { shared_bytes, .. } => *shared_bytes,
-                _ => 0,
+                AlgoState::Msa { shared_bytes, .. } => *shared_bytes,
+                AlgoState::Sa { .. } | AlgoState::Gibbs { .. } => 0,
             },
         };
         let num_betas = to_kernel_i32("num_betas", num_betas)?;
@@ -804,8 +817,8 @@ impl<'a> SelfFeedingSession<'a> {
         // cudarc's read/write distinction is inert here — the kernel's own
         // volatile ctrl protocol is the actual synchronization.
         match &self.algo_state {
-            AlgoState::Msc { .. } => {
-                self.launch_msc(cfg, num_betas, sweeps_per_beta, seed)?;
+            AlgoState::Msa { .. } => {
+                self.launch_msa(cfg, num_betas, sweeps_per_beta, seed)?;
             }
             AlgoState::Sa { d_delta_energy } => {
                 let mut b = self.stream_compute.launch_builder(&self.device.sa);
@@ -901,22 +914,26 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(())
     }
 
-    /// Pre-arm one nonce's `CTRL_EXIT_NOW` before launch, so the kernel
-    /// processes exactly one model and returns instead of spinning for the
-    /// next slot. Used only by the isolated bench path ([`bench_one`]); the
-    /// streaming path arms exit at teardown via [`Self::signal_exit`].
+    /// Pre-arm one nonce's `CTRL_EXIT_NOW` with `EXIT_AFTER_MODEL` before
+    /// launch. The kernel then anneals exactly one model, publishes it and
+    /// returns instead of spinning for the next slot. Used only by the
+    /// isolated bench path ([`bench_one`]); the streaming path arms exit at
+    /// teardown via [`Self::signal_exit`].
     fn set_exit_now(&mut self, nonce_id: usize) -> Result<(), SampleError> {
         let off = nonce_id * CTRL_STRIDE + CTRL_EXIT_NOW;
         self.stream_transfer
-            .memcpy_htod(&[1i32], &mut self.d_ctrl.slice_mut(off..=off))?;
+            .memcpy_htod(&[EXIT_AFTER_MODEL], &mut self.d_ctrl.slice_mut(off..=off))?;
         Ok(())
     }
 
+    /// Raise `EXIT_ABORT` on every active nonce. Nothing this session holds
+    /// is read after teardown, so the blocks leave mid-model rather than
+    /// finish work nobody will score. The device comes back sooner.
     fn signal_exit(&mut self) -> Result<(), SampleError> {
         if !self.launched {
             return Ok(());
         }
-        let exit = vec![1i32; 1];
+        let exit = vec![EXIT_ABORT; 1];
         for nonce_id in 0..self.active_nonces {
             let off = nonce_id * CTRL_STRIDE + CTRL_EXIT_NOW;
             self.stream_transfer
@@ -925,8 +942,8 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(())
     }
 
-    /// Stop the persistent kernel right now: raise `EXIT_NOW` on every nonce
-    /// (the patched kernel peeks it inside the sweep loop) and wait for the
+    /// Stop the persistent kernel right now. Raise `EXIT_ABORT` on every nonce
+    /// (the SA and msa kernels peek it inside the sweep loop) and wait for the
     /// blocks to leave. After this the session is unlaunched; `Drop` then
     /// has nothing left to wait for.
     fn abort_now(&mut self) -> Result<(), SampleError> {
@@ -1024,9 +1041,12 @@ impl SessionKey {
 /// # Errors
 ///
 /// - [`SampleError::GraphTooLarge`] if `graph` has more nodes than the
-///   chosen kernel's fixed-size per-thread/shared state supports. This is
-///   permanent for this backend — the limit is compiled into the kernel, so
-///   the caller should reject the job rather than retry it.
+///   ceiling this device opened with for the chosen kernel. This is
+///   permanent for this session — the ceiling is fixed at open, so the
+///   caller should reject the job rather than retry it.
+/// - [`SampleError::Unsupported`] if the chosen kernel cannot run this
+///   graph: for msa, a spin with more than `capacity::MSA_MAX_DEGREE`
+///   neighbours. Permanent for this graph.
 /// - [`SampleError::KernelTimeout`] if the kernel has not marked slot 0
 ///   COMPLETE within 120 seconds of launch.
 /// - [`SampleError::Cuda`] or [`SampleError::Driver`] for a CUDA driver
@@ -1039,7 +1059,7 @@ impl SessionKey {
 /// ```no_run
 /// use quip_miner_cuda::cuda_device::CudaDevice;
 /// use quip_miner_cuda::streaming::sample_one;
-/// use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
+/// use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = CudaDevice::open(0)?;
@@ -1048,7 +1068,7 @@ impl SessionKey {
 ///     num_reads: 8,
 ///     ..SampleParams::default()
 /// };
-/// let reads = sample_one(&device, &graph, &params, Algorithm::Sa)?;
+/// let reads = sample_one(&device, &graph, &params, KernelKind::Sa)?;
 /// let best = reads.iter().map(|r| r.energy_milli).min();
 /// # let _ = best;
 /// # Ok(())
@@ -1058,7 +1078,7 @@ pub fn sample_one(
     device: &CudaDevice,
     graph: &IsingGraph,
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: KernelKind,
 ) -> Result<Vec<SamplerResult>, SampleError> {
     let n = graph.num_nodes();
     if n == 0 {
@@ -1071,7 +1091,7 @@ pub fn sample_one(
             .collect());
     }
 
-    let limits = algo_limits(algorithm);
+    let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_beta_schedule(
         graph,
@@ -1082,7 +1102,7 @@ pub fn sample_one(
     let topology = SelfFeedingTopology::build(graph);
 
     let mut sess =
-        SelfFeedingSession::build(device, algorithm, topology, 1, reads_per_nonce, beta.len())?;
+        SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
     let seed = seed_low_u32(params.seed).wrapping_add(1);
@@ -1172,12 +1192,13 @@ fn poll_until_complete(
 /// Unlike [`sample_one`], this pre-arms `CTRL_EXIT_NOW` before launch so the
 /// kernel anneals exactly one model and returns with no persistent spin,
 /// making the launch a discrete instance `nsys`/`ncu` attribute cleanly.
-/// Reuses both `.cu` kernels unchanged — no device code is added.
+/// Reuses the `.cu` kernels unchanged — no device code is added.
 ///
 /// # Errors
 ///
 /// Same set as [`sample_one`]: [`SampleError::GraphTooLarge`] for an oversized
-/// graph, [`SampleError::KernelTimeout`] if the slot never completes within
+/// graph, [`SampleError::Unsupported`] for a graph the kernel cannot run,
+/// [`SampleError::KernelTimeout`] if the slot never completes within
 /// the deadline, and [`SampleError::Cuda`]/[`SampleError::Driver`] for any
 /// driver fault while building the session, creating events, uploading,
 /// launching, polling, or downloading.
@@ -1185,7 +1206,7 @@ pub fn bench_one(
     device: &CudaDevice,
     graph: &IsingGraph,
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: KernelKind,
 ) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
     let n = graph.num_nodes();
     if n == 0 {
@@ -1198,7 +1219,7 @@ pub fn bench_one(
             .collect();
         return Ok((empty, DeviceTimings::default()));
     }
-    let limits = algo_limits(algorithm);
+    let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_beta_schedule(
         graph,
@@ -1208,7 +1229,7 @@ pub fn bench_one(
     );
     let topology = SelfFeedingTopology::build(graph);
     let mut sess =
-        SelfFeedingSession::build(device, algorithm, topology, 1, reads_per_nonce, beta.len())?;
+        SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
 
     // --- Timed upload (beta + slot 0 + exit flag) on the transfer stream. ---
     let up0 = timing_event(device)?;
@@ -1366,18 +1387,18 @@ impl SlotState {
 /// ```no_run
 /// use quip_miner_cuda::cuda_device::CudaDevice;
 /// use quip_miner_cuda::streaming::stream_width;
-/// use quip_miner_cuda::Algorithm;
+/// use quip_miner_cuda::KernelKind;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = CudaDevice::open(0)?;
 /// // Gibbs spends 4 SMs per nonce, so it runs a quarter of SA's width.
-/// assert!(stream_width(&device, Algorithm::Sa) >= stream_width(&device, Algorithm::Gibbs));
+/// assert!(stream_width(&device, KernelKind::Sa) >= stream_width(&device, KernelKind::Gibbs));
 /// # Ok(())
 /// # }
 /// ```
 #[must_use]
-pub fn stream_width(device: &CudaDevice, algorithm: Algorithm) -> usize {
-    (device.max_sms / algo_limits(algorithm).sms_per_nonce).max(1)
+pub fn stream_width(device: &CudaDevice, kernel: KernelKind) -> usize {
+    (device.max_sms / algo_limits(kernel).sms_per_nonce).max(1)
 }
 
 enum Pull {
@@ -1545,8 +1566,6 @@ fn answer_empty_graph(out: &Sender<StreamResult>, job: StreamJob) -> bool {
     .is_ok()
 }
 
-/// Reject every job these nonces still hold with `reason`, so none is dropped
-/// without a `StreamResult` — the coordinator is blocked on one per job.
 /// True when at least one model is ACTIVE on the device and every ACTIVE
 /// model belongs to a generation the coordinator has abandoned. NEXT slots
 /// are ignored: by the time the pump notices a cancel, `refill_slots` may
@@ -1584,6 +1603,8 @@ fn cancel_held(slots: &mut [SlotState], out: &Sender<StreamResult>, cancel: &Can
     n
 }
 
+/// Reject every job these nonces still hold with `reason`, so none is dropped
+/// without a `StreamResult` — the coordinator is blocked on one per job.
 fn reject_held(slots: &mut [SlotState], out: &Sender<StreamResult>, reason: &WireSampleError) {
     for slot in slots {
         for job in slot.drain_jobs() {
@@ -1762,8 +1783,8 @@ fn pump_session(
     loop {
         ctx.budget.maybe_report();
         // Yielding ends the session rather than pausing inside it. The
-        // persistent kernel holds its SMs until an explicit EXIT_NOW
-        // (`kernels/sa.cu`, the indefinite READY wait), so a driver that
+        // persistent kernel holds its SMs until its `CTRL_EXIT_NOW` flag is
+        // raised (`kernels/sa.cu`, the indefinite READY wait), so a driver that
         // merely slept would leave the kernel resident and spinning — starving
         // ourselves without freeing anything for the process we meant to yield
         // to. Stopping the refill drains what is in flight; the teardown in
@@ -1772,20 +1793,19 @@ fn pump_session(
         if !exhausted && ctx.gov.should_throttle() {
             exhausted = true;
         }
-        if !exhausted {
-            halt = refill_slots(sess, slots, feed, ctx.budget);
-            exhausted = halt.is_exhausted();
-        }
-        // Abort-on-cancel. Once the coordinator has
-        // abandoned the generation of every job this session holds, the
-        // kernel is annealing models nobody will score. Raise EXIT_NOW so the
-        // blocks leave mid-model (kernels/sa.cu peeks the flag inside the
-        // sweep loop), wait for them, refund every held job as Cancelled, and
-        // end the session; `run_session` then seeds a fresh one from the new
-        // round's first job. Stock behaviour was to let the models finish and
-        // drop their results afterwards, which cost roughly half a batch of
-        // GPU time per round change.
+        // Abort-on-cancel, checked before the refill so a job from the new
+        // round is not admitted and then bounced. Once the coordinator has
+        // abandoned the generation of every model this session holds, the
+        // kernel is annealing models nobody will score. Raise EXIT_ABORT so
+        // the blocks leave mid-model (kernels/sa.cu and kernels/msa.cu peek
+        // the flag inside the sweep loop), wait for them, refund every held
+        // job, and end the session; `run_session` then seeds a fresh one from
+        // the new round's first job. Letting the models finish and dropping
+        // their results cost roughly half a batch of GPU time per round
+        // change.
         if abort_due(slots, feed.cancel) {
+            // Charged to Poll for lack of a bucket of its own: the wait is
+            // for the device, which is what Poll otherwise measures.
             let aborted = ctx.budget.mark();
             match sess.abort_now() {
                 Ok(()) => {
@@ -1796,15 +1816,23 @@ fn pump_session(
                     );
                 }
                 Err(e) => {
-                    // The kernel did not stop cleanly: fall back to the stock
-                    // drain path rather than tearing down under it.
-                    eprintln!("quip-miner-cuda: abort-on-cancel failed ({e}); draining instead");
+                    // Some nonces may already hold EXIT_ABORT and will leave
+                    // without publishing, so nothing held here can complete.
+                    // Same recovery as an unreadable ctrl mailbox: refund the
+                    // held jobs as DeviceBusy and rebuild.
+                    eprintln!(
+                        "quip-miner-cuda: abort-on-cancel failed ({e}); rebuilding the \
+                         self-feeding session"
+                    );
+                    reject_held(slots, feed.out, &WireSampleError::DeviceBusy);
                 }
             }
             ctx.budget.charge(Bucket::Poll, aborted);
-            if slots.iter().all(SlotState::is_vacant) {
-                break;
-            }
+            break;
+        }
+        if !exhausted {
+            halt = refill_slots(sess, slots, feed, ctx.budget);
+            exhausted = halt.is_exhausted();
         }
         let empty = slots.iter().all(SlotState::is_vacant);
         if exhausted && empty {
@@ -1888,7 +1916,7 @@ fn pump_session(
 /// successor.
 fn run_session(
     device: &CudaDevice,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     seed: StreamJob,
     jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
@@ -1913,8 +1941,8 @@ fn run_session(
         return jobs.blocking_recv();
     }
 
-    let width = stream_width(device, algorithm);
-    let limits = algo_limits(algorithm);
+    let width = stream_width(device, kernel);
+    let limits = algo_limits(kernel);
     let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
     let job_seed = seed.params.seed;
     let key = SessionKey::seed(&seed, reads_per_nonce);
@@ -1934,7 +1962,7 @@ fn run_session(
 
     let mut sess = match SelfFeedingSession::build(
         device,
-        algorithm,
+        kernel,
         topology,
         width,
         reads_per_nonce,
@@ -2022,7 +2050,7 @@ fn run_session(
 /// use quip_miner_cuda::cuda_device::CudaDevice;
 /// use quip_miner_cuda::nvml_gov::UtilGovernor;
 /// use quip_miner_cuda::streaming::run_stream;
-/// use quip_miner_cuda::Algorithm;
+/// use quip_miner_cuda::KernelKind;
 /// use tokio::sync::mpsc::channel;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2034,7 +2062,7 @@ fn run_session(
 /// // A real caller feeds `job_tx` from another task; closing it is what
 /// // eventually lets `run_stream` return.
 /// drop(job_tx);
-/// run_stream(&device, Algorithm::Sa, job_rx, res_tx, CancelToken::default(), &gov);
+/// run_stream(&device, KernelKind::Sa, job_rx, res_tx, CancelToken::default(), &gov);
 /// # Ok(())
 /// # }
 /// ```
@@ -2045,7 +2073,7 @@ fn run_session(
 #[allow(clippy::needless_pass_by_value)]
 pub fn run_stream(
     device: &CudaDevice,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     mut jobs: Receiver<StreamJob>,
     out: Sender<StreamResult>,
     cancel: CancelToken,
@@ -2069,7 +2097,7 @@ pub fn run_stream(
         // per swing (buffer allocation plus a launch, with the kernel PTX
         // already cached). If that ever shows up as a real cost, measure it
         // before adding hysteresis.
-        pending = run_session(device, algorithm, seed, &mut jobs, &out, &cancel, &mut ctx);
+        pending = run_session(device, kernel, seed, &mut jobs, &out, &cancel, &mut ctx);
     }
 }
 
@@ -2099,6 +2127,74 @@ mod tests {
             params: SampleParams::default(),
             watermark: None,
         }
+    }
+
+    fn job_at(id: u8, watermark: u64) -> StreamJob {
+        let mut j = job(id);
+        j.watermark = Some(watermark);
+        j
+    }
+
+    #[test]
+    fn abort_is_due_only_when_every_active_model_is_abandoned() {
+        let cancel = CancelToken::default();
+        let mut slots = vec![SlotState::default(), SlotState::default()];
+        assert!(
+            !abort_due(&slots, &cancel),
+            "nothing active, nothing to abort"
+        );
+
+        slots[0].assign_active(0, job_at(1, 3));
+        slots[1].assign_active(0, job_at(2, 7));
+        assert!(!abort_due(&slots, &cancel), "no generation abandoned yet");
+
+        cancel.cancel_through(3);
+        assert!(
+            !abort_due(&slots, &cancel),
+            "a live model keeps the session"
+        );
+
+        cancel.cancel_through(7);
+        assert!(abort_due(&slots, &cancel));
+    }
+
+    #[test]
+    fn abort_ignores_a_live_next_job() {
+        let cancel = CancelToken::default();
+        let mut slots = vec![SlotState::default()];
+        slots[0].assign_active(0, job_at(1, 3));
+        slots[0].assign_next(1, job_at(2, 7));
+        cancel.cancel_through(3);
+        assert!(
+            abort_due(&slots, &cancel),
+            "a NEXT job from the new round must not block the abort"
+        );
+    }
+
+    #[test]
+    fn cancel_held_refunds_stale_jobs_and_bounces_live_ones() {
+        let (res_tx, mut res_rx) = channel::<StreamResult>(8);
+        let cancel = CancelToken::default();
+        let mut slots = vec![SlotState::default()];
+        slots[0].assign_active(0, job_at(1, 3));
+        slots[0].assign_next(1, job_at(2, 7));
+        cancel.cancel_through(3);
+
+        assert_eq!(cancel_held(&mut slots, &res_tx, &cancel), 2);
+        assert!(slots[0].is_vacant());
+
+        let stale = res_rx.try_recv().expect("the stale job was answered");
+        assert_eq!(stale.job_id, vec![1]);
+        let StreamOutcome::Cancelled = stale.outcome else {
+            panic!("a stale job is refunded as Cancelled");
+        };
+
+        let live = res_rx.try_recv().expect("the live job was answered");
+        assert_eq!(live.job_id, vec![2]);
+        let StreamOutcome::Completed(Err(reason)) = live.outcome else {
+            panic!("a live job is rejected so the coordinator re-stages it");
+        };
+        assert_eq!(reason, WireSampleError::DeviceBusy);
     }
 
     /// Behavior test: the `energy_score` span added around `score_spins` is
@@ -2326,25 +2422,40 @@ mod tests {
     fn algo_limits_match_the_kernels_fixed_size_arrays() {
         // SA: one block per nonce. N is bounded by the resolved capacity on
         // the device, not by this table.
-        let sa = algo_limits(Algorithm::Sa);
+        let sa = algo_limits(KernelKind::Sa);
         assert_eq!(sa.sms_per_nonce, 1);
         assert_eq!(sa.max_reads, 256);
+        assert_eq!(sa.threads_per_block, 256);
+
+        // msa: one block per nonce, two 64-lane replica words per spin.
+        let msa = algo_limits(KernelKind::Msa);
+        assert_eq!(msa.sms_per_nonce, 1);
+        assert_eq!(msa.max_reads, 128);
+        assert_eq!(
+            msa.threads_per_block,
+            crate::capacity::MSA_THREADS_PER_NONCE
+        );
 
         // Gibbs: four blocks per nonce.
-        let gibbs = algo_limits(Algorithm::Gibbs);
+        let gibbs = algo_limits(KernelKind::Gibbs);
         assert_eq!(gibbs.sms_per_nonce, 4);
         assert_eq!(gibbs.max_reads, 256);
+        assert_eq!(gibbs.threads_per_block, 256);
     }
 
     #[test]
-    fn max_reads_reports_the_per_algorithm_cap() {
+    fn max_reads_mirrors_algo_limits_for_each_kernel() {
         assert_eq!(
-            max_reads(Algorithm::Sa),
-            algo_limits(Algorithm::Sa).max_reads as u32
+            max_reads(KernelKind::Sa),
+            algo_limits(KernelKind::Sa).max_reads as u32
         );
         assert_eq!(
-            max_reads(Algorithm::Gibbs),
-            algo_limits(Algorithm::Gibbs).max_reads as u32
+            max_reads(KernelKind::Msa),
+            algo_limits(KernelKind::Msa).max_reads as u32
+        );
+        assert_eq!(
+            max_reads(KernelKind::Gibbs),
+            algo_limits(KernelKind::Gibbs).max_reads as u32
         );
     }
 
@@ -2505,5 +2616,41 @@ mod tests {
         assert_eq!(to_kernel_i32("N", 5000).expect("5000 fits an i32"), 5000);
         let err = to_kernel_i32("N", usize::MAX).expect_err("usize::MAX does not");
         assert!(matches!(err, SampleError::Driver(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn score_threads_default_and_parse() {
+        assert_eq!(score_threads_from(None), 4);
+        assert_eq!(score_threads_from(Some("2")), 2);
+        assert_eq!(
+            score_threads_from(Some("0")),
+            4,
+            "zero threads is not a thing"
+        );
+        assert_eq!(score_threads_from(Some("many")), 4);
+        assert_eq!(score_threads_from(Some("")), 4);
+    }
+
+    /// Chunks are scored on separate threads and stitched back in read
+    /// order, so result `i` must be read `i` for every read count.
+    #[test]
+    fn score_reads_parallel_preserves_read_order() {
+        let g = graph();
+        for count in [0usize, 1, 3, 4, 9, 17] {
+            let reads: Vec<Vec<i8>> = (0..count)
+                .map(|i| {
+                    (0..4)
+                        .map(|k| if (i >> k) & 1 == 1 { -1 } else { 1 })
+                        .collect()
+                })
+                .collect();
+            let serial: Vec<SamplerResult> = reads.iter().map(|s| score_spins(s, &g)).collect();
+            let parallel = score_reads_parallel(&reads, &g);
+            assert_eq!(parallel.len(), serial.len(), "{count} reads");
+            for (p, s) in parallel.iter().zip(&serial) {
+                assert_eq!(p.spins, s.spins);
+                assert_eq!(p.energy_milli, s.energy_milli);
+            }
+        }
     }
 }

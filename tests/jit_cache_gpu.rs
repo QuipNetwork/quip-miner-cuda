@@ -20,18 +20,22 @@ fn second_open_uses_cached_ptx() {
         return;
     }
 
-    // Cold open: compiles both kernels via NVRTC and writes the cache.
+    // Cold open: compiles every kernel via NVRTC and writes the cache.
     let t0 = Instant::now();
     let _cold_dev = CudaDevice::open(0).expect("first open");
     let cold = t0.elapsed();
 
-    // One PTX file per kernel (sa + gibbs) must exist after the first open.
+    // One PTX file per kernel (sa + msa + gibbs) must exist after the first open.
     let ptx: Vec<_> = std::fs::read_dir(&dir)
         .expect("cache dir")
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "ptx"))
         .collect();
-    assert_eq!(ptx.len(), 2, "expected sa + gibbs cached PTX, got {ptx:?}");
+    assert_eq!(
+        ptx.len(),
+        3,
+        "expected sa + msa + gibbs cached PTX, got {ptx:?}"
+    );
 
     // Warm open: same process, same dir — loads the cached PTX, no NVRTC.
     let t1 = Instant::now();

@@ -43,7 +43,7 @@ use crate::cuda_device::CudaDevice;
 use crate::nsight;
 use crate::schema::{BenchRecord, Part, Scope, Source};
 use crate::streaming::{bench_one, DeviceTimings};
-use crate::{Algorithm, IsingGraph, SampleParams};
+use crate::{IsingGraph, KernelKind, SampleParams};
 use clap::{Args, Subcommand};
 use std::collections::HashMap;
 use std::fs::File;
@@ -73,7 +73,7 @@ pub enum BenchAction {
 /// Arguments for `bench run`.
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// Reads per model.
+    /// Reads per model, at most the kernel's cap (256 for sa and gibbs, 128 for msa).
     #[arg(long, default_value_t = 8)]
     pub reads: u64,
     /// `num_sweeps` to bench at; repeat the flag for a multi-point grid
@@ -170,6 +170,9 @@ pub enum BenchError {
     /// `--source`/`--topology` corpus load or redraw failure (see [`crate::corpus`]).
     #[error("bench corpus: {0}")]
     Corpus(String),
+    /// A `bench run` argument outside what the kernel can execute.
+    #[error("bench args: {0}")]
+    Args(String),
 }
 
 /// One point in the bench config grid.
@@ -358,10 +361,11 @@ fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
         .collect())
 }
 
-fn backend_name(algorithm: Algorithm) -> &'static str {
-    match algorithm {
-        Algorithm::Sa => "cuda-sa",
-        Algorithm::Gibbs => "cuda-gibbs",
+fn backend_name(kernel: KernelKind) -> &'static str {
+    match kernel {
+        KernelKind::Sa => "cuda-sa",
+        KernelKind::Msa => "cuda-msa",
+        KernelKind::Gibbs => "cuda-gibbs",
     }
 }
 
@@ -419,7 +423,7 @@ fn take_cell(totals: &Arc<Mutex<HashMap<String, u64>>>) -> HashMap<String, u64> 
 /// Open device + identity, threaded through the grid loop.
 struct BenchContext<'a> {
     device: &'a CudaDevice,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     backend: &'static str,
     device_name: String,
     totals: Arc<Mutex<HashMap<String, u64>>>,
@@ -435,22 +439,37 @@ struct BenchContext<'a> {
 /// if `--source`/`--topology` fail to load or a nonce fails to redraw.
 pub fn run_bench(
     device_index: usize,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     max_nodes: usize,
     action: &BenchAction,
 ) -> Result<(), BenchError> {
     match action {
-        BenchAction::Run(args) => run_run(device_index, algorithm, max_nodes, args),
+        BenchAction::Run(args) => run_run(device_index, kernel, max_nodes, args),
         BenchAction::Fold(args) => run_fold(args),
     }
 }
 
+/// Refuse a `--reads` the kernel would silently clamp. `bench_one` caps reads
+/// per nonce at `streaming::max_reads(kernel)`, and a clamped run would report
+/// the requested count against the clamped timing.
+fn check_reads(kernel: KernelKind, reads: u64) -> Result<(), BenchError> {
+    let max_reads = u64::from(crate::streaming::max_reads(kernel));
+    if (1..=max_reads).contains(&reads) {
+        return Ok(());
+    }
+    Err(BenchError::Args(format!(
+        "--reads {reads} is outside 1..={max_reads} for the {} kernel",
+        kernel.name()
+    )))
+}
+
 fn run_run(
     device_index: usize,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     max_nodes: usize,
     args: &RunArgs,
 ) -> Result<(), BenchError> {
+    check_reads(kernel, args.reads)?;
     std::fs::create_dir_all(&args.out).map_err(|e| BenchError::Io(e.to_string()))?;
     let sweeps: Vec<u64> = if args.sweeps.is_empty() {
         vec![1024]
@@ -474,10 +493,10 @@ fn run_run(
         .with(flame_layer);
 
     tracing::subscriber::with_default(subscriber, || -> Result<(), BenchError> {
-        // Open for the algorithm actually being benched, at the requested
+        // Open for the kernel actually being benched, at the requested
         // capacity: the defaulting `open` would compile SA at 5000 and reject
         // any larger graph regardless of which binary is running.
-        let device = CudaDevice::open_with_nodes(device_index, algorithm, max_nodes)
+        let device = CudaDevice::open_with_nodes(device_index, kernel, max_nodes)
             .map_err(|e| BenchError::Device(e.to_string()))?;
         let device_name = device
             .name()
@@ -487,8 +506,8 @@ fn run_run(
         let mut jit_ns = take_cell(&totals).get("jit").copied();
         let ctx = BenchContext {
             device: &device,
-            algorithm,
-            backend: backend_name(algorithm),
+            kernel,
+            backend: backend_name(kernel),
             device_name,
             totals,
         };
@@ -566,7 +585,7 @@ fn run_model(
     for i in 0..(args.warmup + args.repeats) {
         take_cell(&ctx.totals); // clear stale totals before the measured call
         let model_start = Instant::now();
-        let (_reads, dev) = bench_one(ctx.device, graph, &params, ctx.algorithm)
+        let (_reads, dev) = bench_one(ctx.device, graph, &params, ctx.kernel)
             .map_err(|e| BenchError::Device(e.to_string()))?;
         let model_total_ns = u64::try_from(model_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let spans = take_cell(&ctx.totals);
@@ -663,9 +682,10 @@ fn fold_per_sweep(args: &FoldArgs) -> Result<Option<u64>, BenchError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_record, CellConfig, HostSpans, SpanAggregator};
+    use super::{assemble_record, check_reads, CellConfig, HostSpans, SpanAggregator};
     use crate::schema::Scope;
     use crate::streaming::DeviceTimings;
+    use crate::KernelKind;
     use std::sync::Arc;
     use tracing::info_span;
     use tracing_subscriber::prelude::*;
@@ -759,5 +779,24 @@ mod tests {
         assert!(first.contains_key("seam"));
         let second = super::take_cell(&totals);
         assert!(second.is_empty(), "totals must reset after take_cell");
+    }
+
+    #[test]
+    fn check_reads_refuses_counts_the_kernel_would_clamp() {
+        for (kernel, cap) in [
+            (KernelKind::Sa, 256),
+            (KernelKind::Msa, 128),
+            (KernelKind::Gibbs, 256),
+        ] {
+            assert!(check_reads(kernel, 1).is_ok(), "{kernel:?} 1");
+            assert!(check_reads(kernel, cap).is_ok(), "{kernel:?} cap");
+            assert!(check_reads(kernel, 0).is_err(), "{kernel:?} 0");
+            assert!(check_reads(kernel, cap + 1).is_err(), "{kernel:?} cap+1");
+        }
+        let err = check_reads(KernelKind::Msa, 256).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "bench args: --reads 256 is outside 1..=128 for the msa kernel"
+        );
     }
 }

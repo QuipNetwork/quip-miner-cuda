@@ -1,12 +1,14 @@
 //! On-disk cache for NVRTC-compiled kernel PTX.
 //!
-//! NVRTC compiling `kernels/sa.cu` / `kernels/gibbs.cu` to PTX costs tens of
-//! seconds at every process start, which distorts throughput/timing
-//! measurements. The kernels take the graph as runtime device buffers, so no
-//! specific topology is baked in, but the state array is sized at compile time
-//! by `-D QUIP_MAX_NODES`. One cached PTX per (source, GPU arch,
-//! driver/NVRTC version, node capacity) therefore serves every topology and
-//! model that fits that capacity.
+//! NVRTC compiling `kernels/sa.cu`, `kernels/msa.cu` and `kernels/gibbs.cu`
+//! to PTX costs tens of seconds at every process start, which distorts
+//! throughput/timing measurements. The kernels take the graph as runtime
+//! device buffers, so no specific topology is baked in. The SA and Gibbs
+//! state arrays are sized at compile time by `-D QUIP_MAX_NODES`. The msa
+//! kernel keeps its state in dynamic shared memory and ignores the define.
+//! One cached PTX per (source, GPU arch, driver/NVRTC version, node
+//! capacity) therefore serves every topology and model that fits that
+//! capacity.
 //!
 //! [`load_or_compile`] loads the module from cached PTX when a matching entry
 //! exists and recompiles (then rewrites the cache) otherwise. A corrupt or

@@ -42,6 +42,10 @@
 #define CTRL_EXIT_NOW     6
 #define CTRL_GENERATION   7
 
+// CTRL_EXIT_NOW carries EXIT_AFTER_MODEL (1) or EXIT_ABORT (2), see sa.cu.
+// This kernel treats both as "leave after the current model": it never
+// aborts mid-model.
+
 // ==============================================================================
 // xoshiro128** RNG
 // ==============================================================================

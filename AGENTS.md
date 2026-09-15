@@ -52,11 +52,17 @@ cp -rf source dest          # NOT: cp -r source dest
 ## Card support requirement
 
 Supported GPUs: compute capability 7.0 (Volta) through 12.1 (consumer
-Blackwell). The floor is a kernel property (both kernels use `__nanosleep`,
+Blackwell). The floor is a kernel property (all three kernels use `__nanosleep`,
 an sm_70+ instruction); the ceiling comes from NVRTC 12.9, which the
 `cuda-12090` cudarc pin in `Cargo.toml` selects. The pin decides which
 `libnvrtc.so.N` the miner dlopens at runtime, so it moves together with the
 `cuda-nvrtc-12-9` package in quip-miner's `docker/Dockerfile.quip-miner-cuda`. `SUPPORTED_ARCHS` in
-`src/cuda_device.rs` is the contract; `tests/arch_coverage.rs` compiles both
-kernels for every entry (`make test-archs`). Changing card support is a
+`src/cuda_device.rs` is the contract; `tests/arch_coverage.rs` compiles every
+kernel for every entry (`make test-archs`). Changing card support is a
 reviewed edit to that list, never a side effect of a toolkit bump.
+
+`quip-cuda-msa` keeps its spin state in dynamic shared memory. It needs at
+least 96 KB of opt-in shared memory per block to open at its default
+capacity. Turing (sm_75, 64 KB) compiles the kernel but refuses to open it,
+with a message that names the budget. This is the one exception to the table
+above.
