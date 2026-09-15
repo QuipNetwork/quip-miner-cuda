@@ -3,8 +3,8 @@
 //! Three self-feeding kernels share the host: `kernels/sa.cu`,
 //! `kernels/msa.cu` and `kernels/gibbs.cu`. Everything that varies by kernel
 //! (capacity, read cap, blocks per nonce, launch arguments, identity) keys on
-//! this enum, so a fourth kernel is a compile error at every site that must
-//! know about it rather than a silent fall-through.
+//! this enum. A fourth kernel is therefore a compile error at every site that
+//! must know about it, not a silent fall-through.
 
 /// Which self-feeding kernel to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

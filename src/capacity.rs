@@ -1,9 +1,10 @@
 //! Node-capacity policy for the self-feeding kernels.
 //!
-//! The kernels size their state arrays from a `QUIP_MAX_NODES` macro that
-//! `cuda_device` supplies at NVRTC compile time. This module owns every
-//! bound on that value so the binaries, the device, and the backend
-//! identities cannot disagree.
+//! The sa and gibbs kernels size their state arrays from a `QUIP_MAX_NODES`
+//! macro that `cuda_device` supplies at NVRTC compile time. The msa kernel
+//! keeps its state in dynamic shared memory sized per launch. This module
+//! owns every bound on those values so the binaries, the device, and the
+//! backend identities cannot disagree.
 
 use crate::kernel::KernelKind;
 use thiserror::Error;

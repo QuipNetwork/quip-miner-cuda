@@ -1192,7 +1192,7 @@ fn poll_until_complete(
 /// Unlike [`sample_one`], this pre-arms `CTRL_EXIT_NOW` before launch so the
 /// kernel anneals exactly one model and returns with no persistent spin,
 /// making the launch a discrete instance `nsys`/`ncu` attribute cleanly.
-/// Reuses both `.cu` kernels unchanged — no device code is added.
+/// Reuses the `.cu` kernels unchanged — no device code is added.
 ///
 /// # Errors
 ///
