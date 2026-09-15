@@ -5,7 +5,7 @@
 //! bound on that value so the binaries, the device, and the backend
 //! identities cannot disagree.
 
-use quip_solver_core::Algorithm;
+use crate::kernel::KernelKind;
 use thiserror::Error;
 
 /// Shipped `unpacked_state` size in `kernels/sa.cu`. Also the floor: a
@@ -114,7 +114,7 @@ pub const GIBBS_DEFAULT_NODES: usize = 4800;
 /// `s_chunk` and `s_arrival`, one `int` each.
 pub const GIBBS_FIXED_SHARED_BYTES: usize = 8;
 
-/// Which device limit bounds an algorithm's capacity.
+/// Which device limit bounds a kernel's capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetResource {
     /// Gibbs holds its spin state in shared memory, per block.
@@ -137,7 +137,7 @@ impl std::fmt::Display for BudgetResource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CapacityError {
     /// Above what this device can hold. `resource` names which limit bound
-    /// it, because the two algorithms are bounded by different ones and a
+    /// it, because SA/msa and Gibbs are bounded by different ones and a
     /// message naming the wrong resource sends the reader to the wrong knob.
     #[error("requested {requested} nodes exceeds the device {resource} budget of {budget}")]
     AboveDeviceBudget {
@@ -159,31 +159,31 @@ pub fn gibbs_budget(shared_bytes_per_block: usize) -> usize {
 
 /// Capacity used when `--max-nodes` is absent.
 #[must_use]
-pub fn default_nodes(algorithm: Algorithm) -> usize {
-    match algorithm {
-        Algorithm::Sa => SA_DEFAULT_NODES,
-        Algorithm::Gibbs => GIBBS_DEFAULT_NODES,
+pub fn default_nodes(kernel: KernelKind) -> usize {
+    match kernel {
+        KernelKind::Sa | KernelKind::Msa => SA_DEFAULT_NODES,
+        KernelKind::Gibbs => GIBBS_DEFAULT_NODES,
     }
 }
 
 /// Capacity to advertise in `--capabilities`, which must answer without
 /// opening the device.
 ///
-/// Applies the floor and every bound knowable without a device. Both
-/// algorithms are now bounded by device properties rather than a static
+/// Applies the floor and every bound knowable without a device. Every
+/// kernel is now bounded by device properties rather than a static
 /// ceiling, so the request passes through and `open_with_nodes` is what
 /// refuses. The per-thread local-memory cap is the one hardware bound that
-/// holds on every CUDA device, so SA is clamped to it here.
+/// holds on every CUDA device, so SA and msa are clamped to it here.
 #[must_use]
-pub fn advertised_nodes(algorithm: Algorithm, requested: usize) -> usize {
-    let want = requested.max(default_nodes(algorithm));
-    match algorithm {
-        Algorithm::Sa => want.min(LOCAL_MEM_BYTES_PER_THREAD * 8 / 9),
-        Algorithm::Gibbs => want,
+pub fn advertised_nodes(kernel: KernelKind, requested: usize) -> usize {
+    let want = requested.max(default_nodes(kernel));
+    match kernel {
+        KernelKind::Sa | KernelKind::Msa => want.min(LOCAL_MEM_BYTES_PER_THREAD * 8 / 9),
+        KernelKind::Gibbs => want,
     }
 }
 
-/// Resolve a requested capacity against the algorithm and the device.
+/// Resolve a requested capacity against the kernel and the device.
 ///
 /// A request below the default is raised to the default. A request above a
 /// bound is an error, never a silent clamp.
@@ -193,15 +193,15 @@ pub fn advertised_nodes(algorithm: Algorithm, requested: usize) -> usize {
 /// [`CapacityError::AboveDeviceBudget`] when the request exceeds
 /// [`sa_budget`] or [`gibbs_budget`] for this device.
 pub fn resolve(
-    algorithm: Algorithm,
+    kernel: KernelKind,
     requested: usize,
     limits: &DeviceLimits,
 ) -> Result<usize, CapacityError> {
-    let floor = default_nodes(algorithm);
+    let floor = default_nodes(kernel);
     let want = requested.max(floor);
-    let (budget, resource) = match algorithm {
-        Algorithm::Sa => (sa_budget(limits), BudgetResource::DeviceMemory),
-        Algorithm::Gibbs => (
+    let (budget, resource) = match kernel {
+        KernelKind::Sa | KernelKind::Msa => (sa_budget(limits), BudgetResource::DeviceMemory),
+        KernelKind::Gibbs => (
             gibbs_budget(limits.shared_bytes_per_block),
             BudgetResource::SharedMemory,
         ),
@@ -219,7 +219,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quip_solver_core::Algorithm;
+    use crate::kernel::KernelKind;
 
     /// A4000 reports 49152 bytes of shared memory per block. `s_chunk` and
     /// `s_arrival` take 8 of them, so 49144 nodes is the Gibbs ceiling.
@@ -232,14 +232,14 @@ mod tests {
     #[test]
     fn resolve_accepts_a_request_inside_both_bounds() {
         let limits = a4000(A4000_FREE);
-        assert_eq!(resolve(Algorithm::Gibbs, 5640, &limits), Ok(5640));
-        assert_eq!(resolve(Algorithm::Sa, 5640, &limits), Ok(5640));
+        assert_eq!(resolve(KernelKind::Gibbs, 5640, &limits), Ok(5640));
+        assert_eq!(resolve(KernelKind::Sa, 5640, &limits), Ok(5640));
     }
 
     #[test]
     fn resolve_rejects_gibbs_above_the_device_budget() {
         assert_eq!(
-            resolve(Algorithm::Gibbs, 65536, &a4000(A4000_FREE)),
+            resolve(KernelKind::Gibbs, 65536, &a4000(A4000_FREE)),
             Err(CapacityError::AboveDeviceBudget {
                 requested: 65536,
                 budget: 49144,
@@ -253,17 +253,17 @@ mod tests {
     #[test]
     fn resolve_raises_a_small_request_to_the_default() {
         let limits = a4000(A4000_FREE);
-        assert_eq!(resolve(Algorithm::Sa, 64, &limits), Ok(SA_DEFAULT_NODES));
+        assert_eq!(resolve(KernelKind::Sa, 64, &limits), Ok(SA_DEFAULT_NODES));
         assert_eq!(
-            resolve(Algorithm::Gibbs, 64, &limits),
+            resolve(KernelKind::Gibbs, 64, &limits),
             Ok(GIBBS_DEFAULT_NODES)
         );
     }
 
     #[test]
     fn defaults_match_the_shipped_kernel_arrays() {
-        assert_eq!(default_nodes(Algorithm::Sa), 5000);
-        assert_eq!(default_nodes(Algorithm::Gibbs), 4800);
+        assert_eq!(default_nodes(KernelKind::Sa), 5000);
+        assert_eq!(default_nodes(KernelKind::Gibbs), 4800);
     }
 
     /// An A4000 as this code sees it: 48 SMs, 1536 resident threads each,
@@ -338,9 +338,9 @@ mod tests {
     fn resolve_sa_accepts_at_the_budget_and_rejects_above_it() {
         let limits = a4000(A4000_FREE);
         let budget = sa_budget(&limits);
-        assert_eq!(resolve(Algorithm::Sa, budget, &limits), Ok(budget));
+        assert_eq!(resolve(KernelKind::Sa, budget, &limits), Ok(budget));
         assert_eq!(
-            resolve(Algorithm::Sa, budget + 1, &limits),
+            resolve(KernelKind::Sa, budget + 1, &limits),
             Err(CapacityError::AboveDeviceBudget {
                 requested: budget + 1,
                 budget,
@@ -355,9 +355,9 @@ mod tests {
         let limits = a4000(A4000_FREE);
         let budget = gibbs_budget(limits.shared_bytes_per_block);
         assert_eq!(budget, 49144);
-        assert_eq!(resolve(Algorithm::Gibbs, budget, &limits), Ok(budget));
+        assert_eq!(resolve(KernelKind::Gibbs, budget, &limits), Ok(budget));
         assert_eq!(
-            resolve(Algorithm::Gibbs, budget + 1, &limits),
+            resolve(KernelKind::Gibbs, budget + 1, &limits),
             Err(CapacityError::AboveDeviceBudget {
                 requested: budget + 1,
                 budget,
@@ -378,7 +378,7 @@ mod tests {
             "a 1 MiB card cannot afford the default: budget {budget}"
         );
         assert_eq!(
-            resolve(Algorithm::Sa, SA_DEFAULT_NODES, &limits),
+            resolve(KernelKind::Sa, SA_DEFAULT_NODES, &limits),
             Err(CapacityError::AboveDeviceBudget {
                 requested: SA_DEFAULT_NODES,
                 budget,
@@ -392,7 +392,7 @@ mod tests {
     fn an_ordinary_card_affords_the_default() {
         let limits = a4000(A4000_FREE);
         assert_eq!(
-            resolve(Algorithm::Sa, SA_DEFAULT_NODES, &limits),
+            resolve(KernelKind::Sa, SA_DEFAULT_NODES, &limits),
             Ok(SA_DEFAULT_NODES)
         );
     }
@@ -403,16 +403,16 @@ mod tests {
     #[test]
     fn advertised_clamps_sa_to_the_per_thread_local_cap() {
         let cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
-        assert_eq!(advertised_nodes(Algorithm::Sa, cap * 2), cap);
-        assert_eq!(advertised_nodes(Algorithm::Sa, 5640), 5640);
-        assert_eq!(advertised_nodes(Algorithm::Sa, 64), SA_DEFAULT_NODES);
+        assert_eq!(advertised_nodes(KernelKind::Sa, cap * 2), cap);
+        assert_eq!(advertised_nodes(KernelKind::Sa, 5640), 5640);
+        assert_eq!(advertised_nodes(KernelKind::Sa, 64), SA_DEFAULT_NODES);
     }
 
     /// Gibbs has no static ceiling — its bound comes from the device — so the
     /// request passes through and `open_with_nodes` is what refuses.
     #[test]
     fn advertised_passes_gibbs_through_above_the_default() {
-        assert_eq!(advertised_nodes(Algorithm::Gibbs, 32768), 32768);
-        assert_eq!(advertised_nodes(Algorithm::Gibbs, 64), GIBBS_DEFAULT_NODES);
+        assert_eq!(advertised_nodes(KernelKind::Gibbs, 32768), 32768);
+        assert_eq!(advertised_nodes(KernelKind::Gibbs, 64), GIBBS_DEFAULT_NODES);
     }
 }

@@ -21,15 +21,15 @@
 #define CTRL_STRIDE       8
 #define CTRL_ACTIVE_SLOT  3
 #define CTRL_EXIT_NOW     6
-#define MSC_PLANES    6
-#define MSC_MAX_COUNT 63
-#define MSC_MAX_FIELD 63
-#define MSC_ROW       8192
-#define MSC_ROW_MASK  8191
-#ifndef MSC_DIAG
-#define MSC_DIAG 0   // 1: no threshold rows (M=0), 2: no spin updates, 3: neither
+#define MSA_PLANES    6
+#define MSA_MAX_COUNT 63
+#define MSA_MAX_FIELD 63
+#define MSA_ROW       8192
+#define MSA_ROW_MASK  8191
+#ifndef MSA_DIAG
+#define MSA_DIAG 0   // 1: no threshold rows (M=0), 2: no spin updates, 3: neither
 #endif
-#define MSC_MAX_DEG   20   // Zephyr (advantage2) degree bound; larger graphs fall back on the host
+#define MSA_MAX_DEG   20   // Zephyr (advantage2) degree bound; larger graphs fall back on the host
 
 typedef unsigned long long u64;
 
@@ -48,7 +48,7 @@ __device__ __forceinline__ u64 splitmix64(u64 x) {
 __device__ __forceinline__ void add_plane(u64* planes, u64 l) {
     u64 carry = l;
     #pragma unroll
-    for (int p = 0; p < MSC_PLANES; ++p) {
+    for (int p = 0; p < MSA_PLANES; ++p) {
         u64 next = planes[p] & carry;
         planes[p] ^= carry;
         carry = next;
@@ -84,10 +84,10 @@ __device__ __forceinline__ void popcount21(const u64* x, u64* planes) {
 // Lanes whose 6-bit counter is <= limit (bit-serial compare, LSB first).
 __device__ __forceinline__ u64 le_constant(const u64* planes, int limit) {
     int bound = limit + 1;
-    if (bound > MSC_MAX_COUNT) return ~0ull;
+    if (bound > MSA_MAX_COUNT) return ~0ull;
     u64 ge = ~0ull;
     #pragma unroll
-    for (int k = 0; k < MSC_PLANES; ++k) {
+    for (int k = 0; k < MSA_PLANES; ++k) {
         u64 set = 0ull - (u64)((bound >> k) & 1);
         u64 p = planes[k];
         u64 both = p & ge;
@@ -97,7 +97,7 @@ __device__ __forceinline__ u64 le_constant(const u64* planes, int limit) {
     return ~ge;
 }
 
-__global__ void cuda_msc_self_feeding(
+__global__ void cuda_msa_self_feeding(
     const int* __restrict__ csr_row_ptr,
     const int* __restrict__ csr_col_ind,
     const int* __restrict__ color_starts,
@@ -122,8 +122,8 @@ __global__ void cuda_msc_self_feeding(
 ) {
     extern __shared__ u64 smem[];
     u64* state = smem;                                   // N * words
-    u64* cut = smem + (size_t)N * (size_t)words;         // MSC_MAX_FIELD + 1
-    unsigned char* row = (unsigned char*)(cut + (MSC_MAX_FIELD + 1)); // MSC_ROW
+    u64* cut = smem + (size_t)N * (size_t)words;         // MSA_MAX_FIELD + 1
+    unsigned char* row = (unsigned char*)(cut + (MSA_MAX_FIELD + 1)); // MSA_ROW
     __shared__ int s_active_slot;
     __shared__ int s_abort;
 
@@ -182,28 +182,28 @@ __global__ void cuda_msc_self_feeding(
                 if (s_abort) { aborted = true; break; }
             }
             float beta = __ldg(&beta_schedule[beta_idx]);
-            if (tid <= MSC_MAX_FIELD) {
+            if (tid <= MSA_MAX_FIELD) {
                 double p = exp(-2.0 * (double)beta * (double)tid);
                 cut[tid] = (p >= 1.0) ? ~0ull : (u64)(p * 18446744073709551616.0);
             }
             __syncthreads();
-#if MSC_DIAG == 1 || MSC_DIAG == 3
-            for (int i = tid; i < MSC_ROW; i += blockDim.x) row[i] = 0;
+#if MSA_DIAG == 1 || MSA_DIAG == 3
+            for (int i = tid; i < MSA_ROW; i += blockDim.x) row[i] = 0;
 #else
-            for (int i = tid; i < MSC_ROW; i += blockDim.x) {
+            for (int i = tid; i < MSA_ROW; i += blockDim.x) {
                 u64 u = xs64(rng);
                 int m = 0;
                 if (u < cut[1]) {
                     m = 1;
-                    while (m < MSC_MAX_FIELD && u < cut[m + 1]) ++m;
+                    while (m < MSA_MAX_FIELD && u < cut[m + 1]) ++m;
                 }
                 row[i] = (unsigned char)m;
             }
 #endif
             __syncthreads();
             for (int sweep = 0; sweep < sweeps_per_beta; ++sweep) {
-                int off = (int)(splitmix64(slot_seed ^ ((u64)beta_idx << 20) ^ (u64)sweep) & MSC_ROW_MASK);
-#if MSC_DIAG == 2 || MSC_DIAG == 3
+                int off = (int)(splitmix64(slot_seed ^ ((u64)beta_idx << 20) ^ (u64)sweep) & MSA_ROW_MASK);
+#if MSA_DIAG == 2 || MSA_DIAG == 3
                 for (int c = 0; c < num_colors; ++c) { __syncthreads(); }
                 if (0)
 #endif
@@ -217,31 +217,31 @@ __global__ void cuda_msc_self_feeding(
                         int h = __ldg(&my_h[var]);
                         // Prefetch every neighbour index and coupling (independent
                         // global loads, L1-resident) before touching shared memory.
-                        int nb[MSC_MAX_DEG];
-                        int jj[MSC_MAX_DEG];
+                        int nb[MSA_MAX_DEG];
+                        int jj[MSA_MAX_DEG];
                         #pragma unroll
-                        for (int q = 0; q < MSC_MAX_DEG; ++q) {
+                        for (int q = 0; q < MSA_MAX_DEG; ++q) {
                             int p = pstart + q;
                             bool ok = p < pend;
                             nb[q] = ok ? __ldg(&csr_col_ind[p]) : 0;
                             jj[q] = ok ? (int)__ldg(&my_J[p]) : 0;
                         }
                         u64 bi = state[var * words + w];
-                        u64 x[MSC_MAX_DEG + 1];
+                        u64 x[MSA_MAX_DEG + 1];
                         int d = 0;
                         #pragma unroll
-                        for (int q = 0; q < MSC_MAX_DEG; ++q) {
+                        for (int q = 0; q < MSA_MAX_DEG; ++q) {
                             int J = jj[q];
                             u64 sj = state[nb[q] * words + w];
                             u64 l = ((J < 0) ? ~0ull : 0ull) ^ bi ^ sj;
                             x[q] = (J != 0) ? l : 0ull;
                             d += (J != 0);
                         }
-                        x[MSC_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0ull;
+                        x[MSA_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0ull;
                         d += (h != 0);
-                        u64 planes[MSC_PLANES];
+                        u64 planes[MSA_PLANES];
                         popcount21(x, planes);
-                        int m = row[(var + off) & MSC_ROW_MASK];
+                        int m = row[(var + off) & MSA_ROW_MASK];
                         int limit = (d + m) >> 1;
                         u64 accept = (limit >= d) ? ~0ull : le_constant(planes, limit);
                         state[var * words + w] = bi ^ accept;

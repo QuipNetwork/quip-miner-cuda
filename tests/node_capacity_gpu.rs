@@ -9,7 +9,7 @@
 
 use quip_miner_cuda::capacity::GIBBS_DEFAULT_NODES;
 use quip_miner_cuda::cuda_device::CudaDevice;
-use quip_miner_cuda::Algorithm;
+use quip_miner_cuda::KernelKind;
 
 /// Pegasus P16 has 5640 nodes, above both shipped defaults (5000 / 4800).
 /// Both kernels must compile and open there, which is the whole point of the
@@ -22,10 +22,10 @@ fn both_algorithms_open_at_pegasus_scale() {
         return;
     }
 
-    let sa = CudaDevice::open_with_nodes(0, Algorithm::Sa, 5640).expect("SA at 5640");
+    let sa = CudaDevice::open_with_nodes(0, KernelKind::Sa, 5640).expect("SA at 5640");
     assert_eq!(sa.max_nodes, 5640);
 
-    let gibbs = CudaDevice::open_with_nodes(0, Algorithm::Gibbs, 5640).expect("Gibbs at 5640");
+    let gibbs = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 5640).expect("Gibbs at 5640");
     assert_eq!(gibbs.max_nodes, 5640);
 }
 
@@ -39,7 +39,7 @@ fn gibbs_opens_well_above_the_shared_default() {
         return;
     }
 
-    let dev = CudaDevice::open_with_nodes(0, Algorithm::Gibbs, 32768).expect("Gibbs at 32768");
+    let dev = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 32768).expect("Gibbs at 32768");
     assert_eq!(dev.max_nodes, 32768);
 }
 
@@ -54,7 +54,7 @@ fn sa_refuses_above_the_device_memory_budget() {
         return;
     }
 
-    let err = CudaDevice::open_with_nodes(0, Algorithm::Sa, 10_000_000)
+    let err = CudaDevice::open_with_nodes(0, KernelKind::Sa, 10_000_000)
         .expect_err("SA above the device memory budget must fail at open");
     let msg = err.to_string();
     assert!(
@@ -77,7 +77,7 @@ fn sa_opens_at_the_original_illegal_address_repro() {
         return;
     }
 
-    let dev = CudaDevice::open_with_nodes(0, Algorithm::Sa, 16384).expect("SA at 16384");
+    let dev = CudaDevice::open_with_nodes(0, KernelKind::Sa, 16384).expect("SA at 16384");
     assert_eq!(dev.max_nodes, 16384);
 }
 
@@ -91,7 +91,7 @@ fn gibbs_refuses_above_the_device_budget() {
         return;
     }
 
-    let err = CudaDevice::open_with_nodes(0, Algorithm::Gibbs, 65536)
+    let err = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 65536)
         .expect_err("Gibbs above the device budget must fail at open");
     let msg = err.to_string();
     assert!(
@@ -116,10 +116,10 @@ fn two_capacities_in_one_process_do_not_cross_serve() {
         return;
     }
 
-    let small = CudaDevice::open_with_nodes(0, Algorithm::Gibbs, GIBBS_DEFAULT_NODES)
+    let small = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, GIBBS_DEFAULT_NODES)
         .expect("Gibbs at the default");
     assert_eq!(small.max_nodes, GIBBS_DEFAULT_NODES);
 
-    let large = CudaDevice::open_with_nodes(0, Algorithm::Gibbs, 16384).expect("Gibbs at 16384");
+    let large = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 16384).expect("Gibbs at 16384");
     assert_eq!(large.max_nodes, 16384);
 }

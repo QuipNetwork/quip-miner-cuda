@@ -19,6 +19,7 @@ pub mod corpus;
 pub mod cuda_device;
 pub mod driver_budget;
 mod jit_cache;
+pub mod kernel;
 pub mod nsight;
 pub mod nvml_gov;
 pub mod sampler;
@@ -26,7 +27,8 @@ pub mod schema;
 pub mod streaming;
 pub mod topology;
 
-pub use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+pub use kernel::KernelKind;
+pub use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 pub use sampler::sample_ising;
 
 use cuda_device::CudaDevice;
@@ -146,17 +148,17 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
 pub struct CudaSampler {
     device: CudaDevice,
     gov: UtilGovernor,
-    algorithm: Algorithm,
+    kernel: KernelKind,
 }
 
 impl CudaSampler {
-    /// Bind an open device and its NVML governor into a sampler for `algorithm`.
+    /// Bind an open device and its NVML governor into a sampler for `kernel`.
     #[must_use]
-    pub fn new(device: CudaDevice, gov: UtilGovernor, algorithm: Algorithm) -> Self {
+    pub fn new(device: CudaDevice, gov: UtilGovernor, kernel: KernelKind) -> Self {
         Self {
             device,
             gov,
-            algorithm,
+            kernel,
         }
     }
 }
@@ -169,25 +171,25 @@ impl Sampler for CudaSampler {
     ) -> Result<Vec<SamplerResult>, SampleError> {
         // quip-miner-cuda-gp4: the device-error -> wire-error mapping lives on
         // `sampler::SampleError`'s `From` impl (TYPE-4: exhaustive, no wildcard).
-        sample_ising(&self.device, graph, params, self.algorithm).map_err(|e| {
+        sample_ising(&self.device, graph, params, self.kernel).map_err(|e| {
             eprintln!("cuda sample failed: {e}");
             e.into()
         })
     }
 
-    /// Self-feeding kernel instances: `max_sms / sms_per_nonce` (1 for SA,
-    /// 4 for Gibbs), each a fully independent nonce group.
+    /// Self-feeding kernel instances: `max_sms / sms_per_nonce` (1 for SA and
+    /// msa, 4 for Gibbs), each a fully independent nonce group.
     fn sample_stream(
         &self,
         jobs: tokio::sync::mpsc::Receiver<StreamJob>,
         out: tokio::sync::mpsc::Sender<StreamResult>,
         cancel: CancelToken,
     ) {
-        streaming::run_stream(&self.device, self.algorithm, jobs, out, cancel, &self.gov);
+        streaming::run_stream(&self.device, self.kernel, jobs, out, cancel, &self.gov);
     }
 
     fn stream_width(&self) -> usize {
-        streaming::stream_width(&self.device, self.algorithm)
+        streaming::stream_width(&self.device, self.kernel)
     }
 
     /// The live width is `max_sms / sms_per_nonce` — a property of the opened
@@ -209,7 +211,7 @@ impl Sampler for CudaSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        streaming::max_reads(self.algorithm)
+        streaming::max_reads(self.kernel)
     }
 
     fn apply_config(&self, backend_toml: &str) {

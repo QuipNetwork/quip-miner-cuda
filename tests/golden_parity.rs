@@ -11,7 +11,7 @@
 
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::sampler::sample_ising;
-use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
+use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
 use quip_solver_conformance::GOLDEN_VECTORS;
@@ -112,7 +112,7 @@ fn live_sample_energies_match_energy_milli() {
         ..Default::default()
     };
 
-    for algo in [Algorithm::Sa, Algorithm::Gibbs] {
+    for algo in [KernelKind::Sa, KernelKind::Gibbs] {
         let results = sample_ising(dev, &graph, &params, algo).expect("sample");
         assert_eq!(results.len(), 16);
         for r in &results {
@@ -142,7 +142,7 @@ fn sa_finds_ground_state_on_ferro() {
         seed: 42,
         ..Default::default()
     };
-    let results = sample_ising(dev, &graph, &params, Algorithm::Sa).expect("sa");
+    let results = sample_ising(dev, &graph, &params, KernelKind::Sa).expect("sa");
     assert!(
         results.iter().any(|r| r.energy_milli == -1000),
         "SA failed to find ferro ground: {:?}",

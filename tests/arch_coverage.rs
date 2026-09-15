@@ -20,7 +20,7 @@ use std::process::{Command, Stdio};
 
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
-const MSC_SRC: &str = include_str!("../kernels/msc.cu");
+const MSA_SRC: &str = include_str!("../kernels/msa.cu");
 
 /// Reports whether the caller must return without testing anything, and says
 /// so on stderr when it does.
@@ -107,7 +107,7 @@ fn every_supported_arch_compiles_and_assembles_both_kernels() {
         for (name, src, nodes) in [
             ("sa", SA_SRC, 512),
             ("gibbs", GIBBS_SRC, 4800),
-            ("msc", MSC_SRC, 4800),
+            ("msa", MSA_SRC, 4800),
         ] {
             if let Err(e) = compile_and_assemble(name, src, nodes, arch) {
                 failures.push(e);

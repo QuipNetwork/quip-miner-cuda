@@ -15,8 +15,9 @@
 //! (bounded wait), and launches with however many nonces that filled — still
 //! correct, just not guaranteed to hit full width on a very short run.
 
-use crate::cuda_device::{CudaDevice, KernelKind};
+use crate::cuda_device::CudaDevice;
 use crate::driver_budget::{Bucket, DriverBudget};
+use crate::kernel::KernelKind;
 use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
 use crate::topology::{fill_h_j, SelfFeedingTopology};
@@ -26,8 +27,7 @@ use quip_protocol::scoring::energy_milli;
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 use quip_solver_core::SampleError as WireSampleError;
 use quip_solver_core::{
-    Algorithm, CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome,
-    StreamResult,
+    CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -106,7 +106,7 @@ const SLOT_COMPLETE: i32 = 3;
 /// a job too large for that ABI fails loudly at the host/device boundary
 /// instead of wrapping into an in-range index at launch.
 /// Threads per block for the multi-spin kernel; `QUIP_MSC_THREADS` (256/512/1024) for benchmarking.
-fn msc_block_threads() -> u32 {
+fn msa_block_threads() -> u32 {
     std::env::var("QUIP_MSC_THREADS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -140,21 +140,28 @@ struct AlgoLimits {
     max_reads: usize,
 }
 
-fn algo_limits(algorithm: Algorithm) -> AlgoLimits {
-    match algorithm {
+fn algo_limits(kernel: KernelKind) -> AlgoLimits {
+    match kernel {
         // 1 block (1 SM) per nonce; `if (tid < num_reads)` in a 256-thread
         // block hard-caps reads/nonce. N is capped by the kernel's
         // `unpacked_state[QUIP_MAX_NODES]`, which is resolved per process and
         // carried on `CudaDevice::max_nodes` rather than fixed here.
-        Algorithm::Sa => AlgoLimits {
+        KernelKind::Sa => AlgoLimits {
             sms_per_nonce: 1,
             max_reads: 256,
+        },
+        // 1 block (1 SM) per nonce, like SA. Reads are lanes of 64-bit
+        // replica words; the session allocates two words, so 128 reads is
+        // the cap the kernel's shared-memory footprint was sized for.
+        KernelKind::Msa => AlgoLimits {
+            sms_per_nonce: 1,
+            max_reads: 128,
         },
         // reads/nonce isn't block-capped (work is chunked across
         // `sms_per_nonce` blocks) but is held to the same 256 for a uniform,
         // generous device-memory bound. N is capped by
         // `shared_state[QUIP_MAX_NODES]`, see above.
-        Algorithm::Gibbs => AlgoLimits {
+        KernelKind::Gibbs => AlgoLimits {
             sms_per_nonce: 4,
             max_reads: 256,
         },
@@ -170,18 +177,20 @@ fn algo_limits(algorithm: Algorithm) -> AlgoLimits {
 ///
 /// ```
 /// use quip_miner_cuda::streaming::max_reads;
-/// use quip_miner_cuda::Algorithm;
+/// use quip_miner_cuda::KernelKind;
 ///
-/// // Both kernels are held to one 256-thread block's worth of reads.
-/// assert_eq!(max_reads(Algorithm::Sa), 256);
-/// assert_eq!(max_reads(Algorithm::Gibbs), 256);
+/// // SA and Gibbs are held to one 256-thread block's worth of reads; msa is
+/// // capped at 128 by its shared-memory replica-word budget.
+/// assert_eq!(max_reads(KernelKind::Sa), 256);
+/// assert_eq!(max_reads(KernelKind::Gibbs), 256);
+/// assert_eq!(max_reads(KernelKind::Msa), 128);
 /// ```
 #[must_use]
-// The cap is a compile-time constant per algorithm (256 for both kernels; see
-// `algo_limits`), so this is a width change and not a narrowing.
+// The cap is a compile-time constant per kernel (256 for SA/Gibbs, 128 for
+// msa; see `algo_limits`), so this is a width change and not a narrowing.
 #[allow(clippy::cast_possible_truncation)]
-pub fn max_reads(algorithm: Algorithm) -> u32 {
-    algo_limits(algorithm).max_reads as u32
+pub fn max_reads(kernel: KernelKind) -> u32 {
+    algo_limits(kernel).max_reads as u32
 }
 
 fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
@@ -280,7 +289,7 @@ fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
 /// no other code independently frees these slices first.
 struct SelfFeedingSession<'a> {
     device: &'a CudaDevice,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     topology: SelfFeedingTopology,
     active_nonces: usize,
     reads_per_nonce: usize,
@@ -320,13 +329,13 @@ struct KernelDims {
     reads_per_nonce: i32,
 }
 
-/// Algorithm-specific buffers, kept out of `Option`s: which variant is
-/// populated always matches `SelfFeedingSession::algorithm` by construction,
+/// Kernel-specific buffers, kept out of `Option`s: which variant is
+/// populated always matches `SelfFeedingSession::kernel` by construction,
 /// so `launch()` destructures it directly instead of unwrapping an `Option`
 /// known-Some-by-invariant.
 enum AlgoState {
     /// Multi-spin kernel: colour classes plus its shared-memory footprint.
-    Msc {
+    Msa {
         d_color_starts: CudaSlice<i32>,
         d_color_counts: CudaSlice<i32>,
         d_color_nodes: CudaSlice<i32>,
@@ -349,7 +358,7 @@ enum AlgoState {
 
 /// Device buffers for the multi-spin kernel: replica-word fit against the
 /// shared-memory opt-in, the neighbour-budget check, and the colour classes.
-fn build_msc_state(
+fn build_msa_state(
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
     topology: &SelfFeedingTopology,
@@ -371,7 +380,7 @@ fn build_msc_state(
         .unwrap_or(0);
     if max_deg > 20 {
         return Err(SampleError::Driver(format!(
-            "msc: topology max degree {max_deg} exceeds the kernel's 20-neighbour budget"
+            "msa: topology max degree {max_deg} exceeds the kernel's 20-neighbour budget"
         )));
     }
     tracing::info!(
@@ -379,11 +388,11 @@ fn build_msc_state(
         words,
         max_deg,
         shared_bytes = topology.n.max(1) * words * 8 + fixed,
-        "msc session: colour classes and shared-memory footprint"
+        "msa session: colour classes and shared-memory footprint"
     );
     if reads_per_nonce > 64 * words {
         return Err(SampleError::Driver(format!(
-            "msc: {reads_per_nonce} reads need {} replica words but shared memory ({} B) fits {words}",
+            "msa: {reads_per_nonce} reads need {} replica words but shared memory ({} B) fits {words}",
             reads_per_nonce.div_ceil(64),
             device.max_shared_optin
         )));
@@ -410,7 +419,7 @@ fn build_msc_state(
     } else {
         topology.colors.nodes.clone()
     };
-    Ok(AlgoState::Msc {
+    Ok(AlgoState::Msa {
         d_color_starts: stream.clone_htod(&starts)?,
         d_color_counts: stream.clone_htod(&counts)?,
         d_color_nodes: stream.clone_htod(&nodes)?,
@@ -430,23 +439,21 @@ fn build_algo_state(
     // stream by `&Arc<Self>` so the returned slices can keep it alive.
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     topology: &SelfFeedingTopology,
     num_nonces: usize,
     reads_per_nonce: usize,
 ) -> Result<AlgoState, SampleError> {
-    let limits = algo_limits(algorithm);
-    match algorithm {
-        Algorithm::Sa if device.kernel == KernelKind::Msc => {
-            build_msc_state(device, stream, topology, reads_per_nonce)
-        }
-        Algorithm::Sa => {
+    let limits = algo_limits(kernel);
+    match kernel {
+        KernelKind::Msa => build_msa_state(device, stream, topology, reads_per_nonce),
+        KernelKind::Sa => {
             let total_threads = num_nonces * 256;
             Ok(AlgoState::Sa {
                 d_delta_energy: stream.alloc_zeros::<i8>(total_threads * topology.n.max(1))?,
             })
         }
-        Algorithm::Gibbs => {
+        KernelKind::Gibbs => {
             let starts = tile_i32(&topology.colors.starts, num_nonces);
             let counts = tile_i32(&topology.colors.counts, num_nonces);
             let starts = if starts.is_empty() {
@@ -482,7 +489,7 @@ fn build_algo_state(
 impl<'a> SelfFeedingSession<'a> {
     fn build(
         device: &'a CudaDevice,
-        algorithm: Algorithm,
+        kernel: KernelKind,
         topology: SelfFeedingTopology,
         num_nonces: usize,
         reads_per_nonce: usize,
@@ -541,7 +548,7 @@ impl<'a> SelfFeedingSession<'a> {
         let algo_state = build_algo_state(
             device,
             &stream_compute,
-            algorithm,
+            kernel,
             &topology,
             num_nonces,
             reads_per_nonce,
@@ -566,7 +573,7 @@ impl<'a> SelfFeedingSession<'a> {
 
         Ok(Self {
             device,
-            algorithm,
+            kernel,
             topology,
             active_nonces: 0,
             reads_per_nonce,
@@ -690,14 +697,14 @@ impl<'a> SelfFeedingSession<'a> {
     }
 
     /// Launch arm for the multi-spin kernel.
-    fn launch_msc(
+    fn launch_msa(
         &self,
         cfg: LaunchConfig,
         num_betas: i32,
         sweeps_per_beta: i32,
         seed: u32,
     ) -> Result<(), SampleError> {
-        let AlgoState::Msc {
+        let AlgoState::Msa {
             d_color_starts,
             d_color_counts,
             d_color_nodes,
@@ -706,15 +713,10 @@ impl<'a> SelfFeedingSession<'a> {
             ..
         } = &self.algo_state
         else {
-            return Err(SampleError::Driver("launch_msc without msc state".into()));
+            return Err(SampleError::Driver("launch_msa without msa state".into()));
         };
-        let f = self
-            .device
-            .msc
-            .as_ref()
-            .ok_or_else(|| SampleError::Driver("msc kernel not loaded".into()))?;
         let dims = &self.dims;
-        let mut b = self.stream_compute.launch_builder(f);
+        let mut b = self.stream_compute.launch_builder(&self.device.msa);
         b.arg(&self.d_row_ptr);
         b.arg(&self.d_col_ind);
         b.arg(d_color_starts);
@@ -736,8 +738,8 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(&dims.max_packed);
         b.arg(&seed);
         b.arg(words);
-        // SAFETY: the 21 `b.arg` calls above mirror `cuda_msc_self_feeding` in
-        // `kernels/msc.cu` in order, type and count; every buffer is sized by
+        // SAFETY: the 21 `b.arg` calls above mirror `cuda_msa_self_feeding` in
+        // `kernels/msa.cu` in order, type and count; every buffer is sized by
         // `build` from the same `dims` the kernel receives, and the colour
         // buffers are bounded by `num_colors` / `dims.n`.
         unsafe { b.launch(cfg) }?;
@@ -753,7 +755,7 @@ impl<'a> SelfFeedingSession<'a> {
     ) -> Result<(), SampleError> {
         let _span = trace_span!("launch", active_nonces).entered();
         self.active_nonces = active_nonces;
-        let limits = algo_limits(self.algorithm);
+        let limits = algo_limits(self.kernel);
         let blocks = active_nonces * limits.sms_per_nonce;
         let num_blocks = u32::try_from(blocks).map_err(|_| {
             SampleError::Driver(format!(
@@ -764,15 +766,15 @@ impl<'a> SelfFeedingSession<'a> {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (
                 match &self.algo_state {
-                    AlgoState::Msc { .. } => msc_block_threads(),
-                    _ => 256,
+                    AlgoState::Msa { .. } => msa_block_threads(),
+                    AlgoState::Sa { .. } | AlgoState::Gibbs { .. } => 256,
                 },
                 1,
                 1,
             ),
             shared_mem_bytes: match &self.algo_state {
-                AlgoState::Msc { shared_bytes, .. } => *shared_bytes,
-                _ => 0,
+                AlgoState::Msa { shared_bytes, .. } => *shared_bytes,
+                AlgoState::Sa { .. } | AlgoState::Gibbs { .. } => 0,
             },
         };
         let num_betas = to_kernel_i32("num_betas", num_betas)?;
@@ -804,8 +806,8 @@ impl<'a> SelfFeedingSession<'a> {
         // cudarc's read/write distinction is inert here — the kernel's own
         // volatile ctrl protocol is the actual synchronization.
         match &self.algo_state {
-            AlgoState::Msc { .. } => {
-                self.launch_msc(cfg, num_betas, sweeps_per_beta, seed)?;
+            AlgoState::Msa { .. } => {
+                self.launch_msa(cfg, num_betas, sweeps_per_beta, seed)?;
             }
             AlgoState::Sa { d_delta_energy } => {
                 let mut b = self.stream_compute.launch_builder(&self.device.sa);
@@ -1039,7 +1041,7 @@ impl SessionKey {
 /// ```no_run
 /// use quip_miner_cuda::cuda_device::CudaDevice;
 /// use quip_miner_cuda::streaming::sample_one;
-/// use quip_miner_cuda::{Algorithm, IsingGraph, SampleParams};
+/// use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = CudaDevice::open(0)?;
@@ -1048,7 +1050,7 @@ impl SessionKey {
 ///     num_reads: 8,
 ///     ..SampleParams::default()
 /// };
-/// let reads = sample_one(&device, &graph, &params, Algorithm::Sa)?;
+/// let reads = sample_one(&device, &graph, &params, KernelKind::Sa)?;
 /// let best = reads.iter().map(|r| r.energy_milli).min();
 /// # let _ = best;
 /// # Ok(())
@@ -1058,7 +1060,7 @@ pub fn sample_one(
     device: &CudaDevice,
     graph: &IsingGraph,
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: KernelKind,
 ) -> Result<Vec<SamplerResult>, SampleError> {
     let n = graph.num_nodes();
     if n == 0 {
@@ -1071,7 +1073,7 @@ pub fn sample_one(
             .collect());
     }
 
-    let limits = algo_limits(algorithm);
+    let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_beta_schedule(
         graph,
@@ -1082,7 +1084,7 @@ pub fn sample_one(
     let topology = SelfFeedingTopology::build(graph);
 
     let mut sess =
-        SelfFeedingSession::build(device, algorithm, topology, 1, reads_per_nonce, beta.len())?;
+        SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
     let seed = seed_low_u32(params.seed).wrapping_add(1);
@@ -1185,7 +1187,7 @@ pub fn bench_one(
     device: &CudaDevice,
     graph: &IsingGraph,
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: KernelKind,
 ) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
     let n = graph.num_nodes();
     if n == 0 {
@@ -1198,7 +1200,7 @@ pub fn bench_one(
             .collect();
         return Ok((empty, DeviceTimings::default()));
     }
-    let limits = algo_limits(algorithm);
+    let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_beta_schedule(
         graph,
@@ -1208,7 +1210,7 @@ pub fn bench_one(
     );
     let topology = SelfFeedingTopology::build(graph);
     let mut sess =
-        SelfFeedingSession::build(device, algorithm, topology, 1, reads_per_nonce, beta.len())?;
+        SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
 
     // --- Timed upload (beta + slot 0 + exit flag) on the transfer stream. ---
     let up0 = timing_event(device)?;
@@ -1366,18 +1368,18 @@ impl SlotState {
 /// ```no_run
 /// use quip_miner_cuda::cuda_device::CudaDevice;
 /// use quip_miner_cuda::streaming::stream_width;
-/// use quip_miner_cuda::Algorithm;
+/// use quip_miner_cuda::KernelKind;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = CudaDevice::open(0)?;
 /// // Gibbs spends 4 SMs per nonce, so it runs a quarter of SA's width.
-/// assert!(stream_width(&device, Algorithm::Sa) >= stream_width(&device, Algorithm::Gibbs));
+/// assert!(stream_width(&device, KernelKind::Sa) >= stream_width(&device, KernelKind::Gibbs));
 /// # Ok(())
 /// # }
 /// ```
 #[must_use]
-pub fn stream_width(device: &CudaDevice, algorithm: Algorithm) -> usize {
-    (device.max_sms / algo_limits(algorithm).sms_per_nonce).max(1)
+pub fn stream_width(device: &CudaDevice, kernel: KernelKind) -> usize {
+    (device.max_sms / algo_limits(kernel).sms_per_nonce).max(1)
 }
 
 enum Pull {
@@ -1888,7 +1890,7 @@ fn pump_session(
 /// successor.
 fn run_session(
     device: &CudaDevice,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     seed: StreamJob,
     jobs: &mut Receiver<StreamJob>,
     out: &Sender<StreamResult>,
@@ -1913,8 +1915,8 @@ fn run_session(
         return jobs.blocking_recv();
     }
 
-    let width = stream_width(device, algorithm);
-    let limits = algo_limits(algorithm);
+    let width = stream_width(device, kernel);
+    let limits = algo_limits(kernel);
     let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
     let job_seed = seed.params.seed;
     let key = SessionKey::seed(&seed, reads_per_nonce);
@@ -1934,7 +1936,7 @@ fn run_session(
 
     let mut sess = match SelfFeedingSession::build(
         device,
-        algorithm,
+        kernel,
         topology,
         width,
         reads_per_nonce,
@@ -2022,7 +2024,7 @@ fn run_session(
 /// use quip_miner_cuda::cuda_device::CudaDevice;
 /// use quip_miner_cuda::nvml_gov::UtilGovernor;
 /// use quip_miner_cuda::streaming::run_stream;
-/// use quip_miner_cuda::Algorithm;
+/// use quip_miner_cuda::KernelKind;
 /// use tokio::sync::mpsc::channel;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2034,7 +2036,7 @@ fn run_session(
 /// // A real caller feeds `job_tx` from another task; closing it is what
 /// // eventually lets `run_stream` return.
 /// drop(job_tx);
-/// run_stream(&device, Algorithm::Sa, job_rx, res_tx, CancelToken::default(), &gov);
+/// run_stream(&device, KernelKind::Sa, job_rx, res_tx, CancelToken::default(), &gov);
 /// # Ok(())
 /// # }
 /// ```
@@ -2045,7 +2047,7 @@ fn run_session(
 #[allow(clippy::needless_pass_by_value)]
 pub fn run_stream(
     device: &CudaDevice,
-    algorithm: Algorithm,
+    kernel: KernelKind,
     mut jobs: Receiver<StreamJob>,
     out: Sender<StreamResult>,
     cancel: CancelToken,
@@ -2069,7 +2071,7 @@ pub fn run_stream(
         // per swing (buffer allocation plus a launch, with the kernel PTX
         // already cached). If that ever shows up as a real cost, measure it
         // before adding hysteresis.
-        pending = run_session(device, algorithm, seed, &mut jobs, &out, &cancel, &mut ctx);
+        pending = run_session(device, kernel, seed, &mut jobs, &out, &cancel, &mut ctx);
     }
 }
 
@@ -2326,12 +2328,17 @@ mod tests {
     fn algo_limits_match_the_kernels_fixed_size_arrays() {
         // SA: one block per nonce. N is bounded by the resolved capacity on
         // the device, not by this table.
-        let sa = algo_limits(Algorithm::Sa);
+        let sa = algo_limits(KernelKind::Sa);
         assert_eq!(sa.sms_per_nonce, 1);
         assert_eq!(sa.max_reads, 256);
 
+        // msa: one block per nonce, two 64-lane replica words per spin.
+        let msa = algo_limits(KernelKind::Msa);
+        assert_eq!(msa.sms_per_nonce, 1);
+        assert_eq!(msa.max_reads, 128);
+
         // Gibbs: four blocks per nonce.
-        let gibbs = algo_limits(Algorithm::Gibbs);
+        let gibbs = algo_limits(KernelKind::Gibbs);
         assert_eq!(gibbs.sms_per_nonce, 4);
         assert_eq!(gibbs.max_reads, 256);
     }
@@ -2339,12 +2346,16 @@ mod tests {
     #[test]
     fn max_reads_reports_the_per_algorithm_cap() {
         assert_eq!(
-            max_reads(Algorithm::Sa),
-            algo_limits(Algorithm::Sa).max_reads as u32
+            max_reads(KernelKind::Sa),
+            algo_limits(KernelKind::Sa).max_reads as u32
         );
         assert_eq!(
-            max_reads(Algorithm::Gibbs),
-            algo_limits(Algorithm::Gibbs).max_reads as u32
+            max_reads(KernelKind::Msa),
+            algo_limits(KernelKind::Msa).max_reads as u32
+        );
+        assert_eq!(
+            max_reads(KernelKind::Gibbs),
+            algo_limits(KernelKind::Gibbs).max_reads as u32
         );
     }
 

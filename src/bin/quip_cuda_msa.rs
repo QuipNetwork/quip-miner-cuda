@@ -4,9 +4,9 @@
 use clap::Parser;
 use quip_miner_cuda::capacity::advertised_nodes;
 use quip_miner_cuda::capacity::SA_DEFAULT_NODES;
-use quip_miner_cuda::cuda_device::{device_label_mismatch, CudaDevice, KernelKind};
+use quip_miner_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_miner_cuda::nvml_gov::UtilGovernor;
-use quip_miner_cuda::{cuda_msa_identity, Algorithm, CudaSampler};
+use quip_miner_cuda::{cuda_msa_identity, CudaSampler, KernelKind};
 use quip_solver_core::{run, CommonArgs, OpenError};
 use std::process::ExitCode;
 
@@ -46,18 +46,13 @@ fn main() -> ExitCode {
         );
     }
     run(
-        cuda_msa_identity(advertised_nodes(Algorithm::Sa, cli.max_nodes)),
+        cuda_msa_identity(advertised_nodes(KernelKind::Msa, cli.max_nodes)),
         &cli.common,
         || {
-            let device = CudaDevice::open_with_kernel(
-                cli.device,
-                Algorithm::Sa,
-                cli.max_nodes,
-                KernelKind::Msc,
-            )
-            .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
+            let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, cli.max_nodes)
+                .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
             let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
-            Ok(CudaSampler::new(device, gov, Algorithm::Sa))
+            Ok(CudaSampler::new(device, gov, KernelKind::Msa))
         },
     )
 }

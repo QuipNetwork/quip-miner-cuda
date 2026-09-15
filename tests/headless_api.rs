@@ -9,13 +9,14 @@
 use quip_miner_cuda::capacity::{GIBBS_DEFAULT_NODES, SA_DEFAULT_NODES};
 use quip_miner_cuda::streaming::max_reads;
 use quip_miner_cuda::topology::{fill_h_j, SelfFeedingTopology};
-use quip_miner_cuda::{cuda_gibbs_identity, cuda_sa_identity, Algorithm, IsingGraph};
+use quip_miner_cuda::{cuda_gibbs_identity, cuda_sa_identity, IsingGraph, KernelKind};
 
 /// Read cap advertised by the streaming driver (kernel block size for SA).
 #[test]
-fn max_reads_is_256_for_sa_and_gibbs() {
-    assert_eq!(max_reads(Algorithm::Sa), 256);
-    assert_eq!(max_reads(Algorithm::Gibbs), 256);
+fn max_reads_is_the_kernel_read_cap() {
+    assert_eq!(max_reads(KernelKind::Sa), 256);
+    assert_eq!(max_reads(KernelKind::Gibbs), 256);
+    assert_eq!(max_reads(KernelKind::Msa), 128);
 }
 
 /// Identity `max_nodes` must mirror whatever capacity the process resolved,

@@ -35,7 +35,8 @@
 use quip_miner_cuda::cuda_device::CudaDevice;
 use quip_miner_cuda::nvml_gov::UtilGovernor;
 use quip_miner_cuda::streaming::run_stream;
-use quip_solver_core::{Algorithm, CancelToken, IsingGraph, SampleParams, StreamJob};
+use quip_miner_cuda::KernelKind;
+use quip_solver_core::{CancelToken, IsingGraph, SampleParams, StreamJob};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -259,7 +260,7 @@ fn stream_driver_soak() {
         s.spawn(move || {
             run_stream(
                 device_ref,
-                Algorithm::Sa,
+                KernelKind::Sa,
                 job_rx,
                 res_tx,
                 CancelToken::default(),

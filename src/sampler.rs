@@ -9,8 +9,9 @@
 //! internal accept/reject decisions during annealing.
 
 use crate::cuda_device::CudaDevice;
+use crate::kernel::KernelKind;
 use crate::streaming;
-use quip_solver_core::{Algorithm, IsingGraph, SampleParams, SamplerResult};
+use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 use thiserror::Error;
 
 /// Failures from running one sampling job on the GPU.
@@ -118,9 +119,9 @@ pub fn sample_ising(
     device: &CudaDevice,
     graph: &IsingGraph,
     params: &SampleParams,
-    algorithm: Algorithm,
+    kernel: KernelKind,
 ) -> Result<Vec<SamplerResult>, SampleError> {
-    streaming::sample_one(device, graph, params, algorithm)
+    streaming::sample_one(device, graph, params, kernel)
 }
 
 #[cfg(test)]
