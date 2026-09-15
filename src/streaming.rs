@@ -231,22 +231,27 @@ pub(crate) fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     }
 }
 
-/// Host scoring threads per job. The single sampler
-/// thread scored every read serially and capped the device at ~20 jobs/s at
-/// any sweep count (2026-09-15); `QUIP_SCORE_THREADS` overrides the default.
-fn score_threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("QUIP_SCORE_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(4)
-    })
+/// Host scoring threads per completed job, from `QUIP_SCORE_THREADS`.
+///
+/// The single sampler thread scored every read serially and capped a fast
+/// kernel at about 20 jobs per second with the GPU idle between batches
+/// (MR !26, 2026-09-15). Four is the default rather than
+/// `available_parallelism` because a CPU miner often shares the host.
+fn score_threads_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
 }
 
-/// Score one job's reads on up to `score_threads()` scoped host threads,
-/// preserving read order. Falls back to the serial path for one thread.
+/// [`score_threads_from`] over the real environment, read once.
+fn score_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| score_threads_from(std::env::var("QUIP_SCORE_THREADS").ok().as_deref()))
+}
+
+/// Score one job's reads on up to [`score_threads`] scoped host threads,
+/// preserving read order. One thread, or one read, takes the serial path.
 fn score_reads_parallel(reads: &[Vec<i8>], graph: &IsingGraph) -> Vec<SamplerResult> {
     let n = score_threads().min(reads.len().max(1));
     if n <= 1 {
@@ -258,10 +263,17 @@ fn score_reads_parallel(reads: &[Vec<i8>], graph: &IsingGraph) -> Vec<SamplerRes
             .chunks(chunk)
             .map(|c| sc.spawn(move || c.iter().map(|s| score_spins(s, graph)).collect::<Vec<_>>()))
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("score thread panicked"))
-            .collect()
+        let mut out = Vec::with_capacity(reads.len());
+        for handle in handles {
+            match handle.join() {
+                Ok(scored) => out.extend(scored),
+                // `energy_milli` over a well-formed graph does not panic. If
+                // it ever does, that is a bug to surface on the driver
+                // thread, not a short result set to hand the coordinator.
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        out
     })
 }
 
@@ -925,7 +937,7 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(())
     }
 
-    /// Stop the persistent kernel right now: raise `EXIT_ABORT` on every nonce
+    /// Stop the persistent kernel right now. Raise `EXIT_ABORT` on every nonce
     /// (the SA and msa kernels peek it inside the sweep loop) and wait for the
     /// blocks to leave. After this the session is unlaunched; `Drop` then
     /// has nothing left to wait for.
@@ -1766,8 +1778,8 @@ fn pump_session(
     loop {
         ctx.budget.maybe_report();
         // Yielding ends the session rather than pausing inside it. The
-        // persistent kernel holds its SMs until an explicit EXIT_NOW
-        // (`kernels/sa.cu`, the indefinite READY wait), so a driver that
+        // persistent kernel holds its SMs until its `CTRL_EXIT_NOW` flag is
+        // raised (`kernels/sa.cu`, the indefinite READY wait), so a driver that
         // merely slept would leave the kernel resident and spinning — starving
         // ourselves without freeing anything for the process we meant to yield
         // to. Stopping the refill drains what is in flight; the teardown in
@@ -2593,5 +2605,41 @@ mod tests {
         assert_eq!(to_kernel_i32("N", 5000).expect("5000 fits an i32"), 5000);
         let err = to_kernel_i32("N", usize::MAX).expect_err("usize::MAX does not");
         assert!(matches!(err, SampleError::Driver(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn score_threads_default_and_parse() {
+        assert_eq!(score_threads_from(None), 4);
+        assert_eq!(score_threads_from(Some("2")), 2);
+        assert_eq!(
+            score_threads_from(Some("0")),
+            4,
+            "zero threads is not a thing"
+        );
+        assert_eq!(score_threads_from(Some("many")), 4);
+        assert_eq!(score_threads_from(Some("")), 4);
+    }
+
+    /// Chunks are scored on separate threads and stitched back in read
+    /// order, so result `i` must be read `i` for every read count.
+    #[test]
+    fn score_reads_parallel_preserves_read_order() {
+        let g = graph();
+        for count in [0usize, 1, 3, 4, 9, 17] {
+            let reads: Vec<Vec<i8>> = (0..count)
+                .map(|i| {
+                    (0..4)
+                        .map(|k| if (i >> k) & 1 == 1 { -1 } else { 1 })
+                        .collect()
+                })
+                .collect();
+            let serial: Vec<SamplerResult> = reads.iter().map(|s| score_spins(s, &g)).collect();
+            let parallel = score_reads_parallel(&reads, &g);
+            assert_eq!(parallel.len(), serial.len(), "{count} reads");
+            for (p, s) in parallel.iter().zip(&serial) {
+                assert_eq!(p.spins, s.spins);
+                assert_eq!(p.energy_milli, s.energy_milli);
+            }
+        }
     }
 }
