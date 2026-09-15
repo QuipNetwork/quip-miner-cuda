@@ -1,4 +1,5 @@
-//! Protocol conformance: spawn SA and Gibbs miners against quip-solver-conformance's driver.
+//! Protocol conformance: spawn SA, multi-spin SA and Gibbs miners against
+//! quip-solver-conformance's driver.
 //!
 //! GPU-backed drive tests are `#[ignore]` so default `cargo test` on headless CI
 //! never confuses "self-skipped" with "passed" ([quip-miner-cuda-gp2] part b).
@@ -19,6 +20,24 @@ async fn quip_cuda_sa_passes_conformance() {
     let miner = profile_bin("quip-cuda-sa");
     let socket = format!(
         "/tmp/quip-cuda-sa-conf-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    assert!(report.is_conformant(), "{}", report.summary());
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+async fn quip_cuda_msa_passes_conformance() {
+    ensure_built(&["quip-cuda-msa"]);
+    let miner = profile_bin("quip-cuda-msa");
+    let socket = format!(
+        "/tmp/quip-cuda-msa-conf-{}-{}.sock",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -60,9 +79,13 @@ async fn quip_cuda_gibbs_passes_conformance() {
 #[test]
 #[serial]
 fn capabilities_and_version_headless() {
-    ensure_built(&["quip-cuda-sa", "quip-cuda-gibbs"]);
+    ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
 
-    for (bin, algo) in [("quip-cuda-sa", "sa"), ("quip-cuda-gibbs", "gibbs")] {
+    for (bin, algo) in [
+        ("quip-cuda-sa", "sa"),
+        ("quip-cuda-msa", "msa"),
+        ("quip-cuda-gibbs", "gibbs"),
+    ] {
         let path = profile_bin(bin);
 
         let out = Command::new(&path).arg("--capabilities").output().unwrap();
@@ -85,9 +108,9 @@ fn capabilities_and_version_headless() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 fn check_succeeds_with_gpu() {
-    ensure_built(&["quip-cuda-sa", "quip-cuda-gibbs"]);
+    ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
 
-    for bin in ["quip-cuda-sa", "quip-cuda-gibbs"] {
+    for bin in ["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"] {
         let path = profile_bin(bin);
         let status = Command::new(&path)
             .arg("--check")

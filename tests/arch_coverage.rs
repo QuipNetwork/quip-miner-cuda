@@ -1,4 +1,4 @@
-//! The support contract: both kernels compile for every architecture in
+//! The support contract: every kernel compiles for every architecture in
 //! [`SUPPORTED_ARCHS`] *and* the resulting PTX assembles with `ptxas` for
 //! that architecture.
 //!
@@ -20,6 +20,7 @@ use std::process::{Command, Stdio};
 
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
+const MSC_SRC: &str = include_str!("../kernels/msc.cu");
 
 /// Reports whether the caller must return without testing anything, and says
 /// so on stderr when it does.
@@ -103,7 +104,11 @@ fn every_supported_arch_compiles_and_assembles_both_kernels() {
     for &arch in SUPPORTED_ARCHS {
         // Smallest realistic capacity for SA, the compiled-in default for
         // Gibbs — the same shapes `CudaDevice::open_with_nodes` produces.
-        for (name, src, nodes) in [("sa", SA_SRC, 512), ("gibbs", GIBBS_SRC, 4800)] {
+        for (name, src, nodes) in [
+            ("sa", SA_SRC, 512),
+            ("gibbs", GIBBS_SRC, 4800),
+            ("msc", MSC_SRC, 4800),
+        ] {
             if let Err(e) = compile_and_assemble(name, src, nodes, arch) {
                 failures.push(e);
             }

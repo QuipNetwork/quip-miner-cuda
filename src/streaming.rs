@@ -15,7 +15,7 @@
 //! (bounded wait), and launches with however many nonces that filled — still
 //! correct, just not guaranteed to hit full width on a very short run.
 
-use crate::cuda_device::CudaDevice;
+use crate::cuda_device::{CudaDevice, KernelKind};
 use crate::driver_budget::{Bucket, DriverBudget};
 use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
@@ -105,6 +105,15 @@ const SLOT_COMPLETE: i32 = 3;
 /// Every scalar the kernel uses to bound a device buffer goes through here, so
 /// a job too large for that ABI fails loudly at the host/device boundary
 /// instead of wrapping into an in-range index at launch.
+/// Threads per block for the multi-spin kernel; `QUIP_MSC_THREADS` (256/512/1024) for benchmarking.
+fn msc_block_threads() -> u32 {
+    std::env::var("QUIP_MSC_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&t| t == 256 || t == 512 || t == 1024)
+        .unwrap_or(256)
+}
+
 fn to_kernel_i32(name: &str, value: usize) -> Result<i32, SampleError> {
     i32::try_from(value).map_err(|_| {
         SampleError::Driver(format!(
@@ -214,6 +223,40 @@ pub(crate) fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
     }
 }
 
+/// Host scoring threads per job. The single sampler
+/// thread scored every read serially and capped the device at ~20 jobs/s at
+/// any sweep count (2026-09-15); `QUIP_SCORE_THREADS` overrides the default.
+fn score_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QUIP_SCORE_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(4)
+    })
+}
+
+/// Score one job's reads on up to `score_threads()` scoped host threads,
+/// preserving read order. Falls back to the serial path for one thread.
+fn score_reads_parallel(reads: &[Vec<i8>], graph: &IsingGraph) -> Vec<SamplerResult> {
+    let n = score_threads().min(reads.len().max(1));
+    if n <= 1 {
+        return reads.iter().map(|s| score_spins(s, graph)).collect();
+    }
+    let chunk = reads.len().div_ceil(n);
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = reads
+            .chunks(chunk)
+            .map(|c| sc.spawn(move || c.iter().map(|s| score_spins(s, graph)).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("score thread panicked"))
+            .collect()
+    })
+}
+
 /// Unpack one read's bit-packed spins (LSB-first per byte, bit=1 -> -1,
 /// bit=0 -> +1; matches the kernel's `set_spin_packed`).
 fn unpack_spins(packed: &[i8], n: usize) -> Vec<i8> {
@@ -282,6 +325,15 @@ struct KernelDims {
 /// so `launch()` destructures it directly instead of unwrapping an `Option`
 /// known-Some-by-invariant.
 enum AlgoState {
+    /// Multi-spin kernel: colour classes plus its shared-memory footprint.
+    Msc {
+        d_color_starts: CudaSlice<i32>,
+        d_color_counts: CudaSlice<i32>,
+        d_color_nodes: CudaSlice<i32>,
+        num_colors: i32,
+        words: i32,
+        shared_bytes: u32,
+    },
     Sa {
         d_delta_energy: CudaSlice<i8>,
     },
@@ -295,6 +347,79 @@ enum AlgoState {
     },
 }
 
+/// Device buffers for the multi-spin kernel: replica-word fit against the
+/// shared-memory opt-in, the neighbour-budget check, and the colour classes.
+fn build_msc_state(
+    device: &CudaDevice,
+    stream: &Arc<CudaStream>,
+    topology: &SelfFeedingTopology,
+    reads_per_nonce: usize,
+) -> Result<AlgoState, SampleError> {
+    let fixed = 8192usize + 64 * 8;
+    let mut words = reads_per_nonce.div_ceil(64).next_power_of_two().clamp(1, 4);
+    // Consumer parts opt in to ~99 KB of shared memory: fit as many replica
+    // words as the budget allows and refuse a read count that needs more.
+    while words > 1 && topology.n.max(1) * words * 8 + fixed > device.max_shared_optin {
+        words /= 2;
+    }
+    // The kernel unrolls a fixed neighbour budget; a denser graph would read past it.
+    let max_deg = topology
+        .row_ptr
+        .windows(2)
+        .map(|w| usize::try_from(w[1] - w[0]).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    if max_deg > 20 {
+        return Err(SampleError::Driver(format!(
+            "msc: topology max degree {max_deg} exceeds the kernel's 20-neighbour budget"
+        )));
+    }
+    tracing::info!(
+        num_colors = topology.colors.num_colors,
+        words,
+        max_deg,
+        shared_bytes = topology.n.max(1) * words * 8 + fixed,
+        "msc session: colour classes and shared-memory footprint"
+    );
+    if reads_per_nonce > 64 * words {
+        return Err(SampleError::Driver(format!(
+            "msc: {reads_per_nonce} reads need {} replica words but shared memory ({} B) fits {words}",
+            reads_per_nonce.div_ceil(64),
+            device.max_shared_optin
+        )));
+    }
+    let shared = topology.n.max(1) * words * 8 + fixed;
+    if shared > device.max_shared_optin {
+        return Err(SampleError::GraphTooLarge {
+            n: topology.n,
+            limit: device.max_shared_optin.saturating_sub(fixed) / (words * 8),
+        });
+    }
+    let starts = if topology.colors.starts.is_empty() {
+        vec![0i32]
+    } else {
+        topology.colors.starts.clone()
+    };
+    let counts = if topology.colors.counts.is_empty() {
+        vec![0i32]
+    } else {
+        topology.colors.counts.clone()
+    };
+    let nodes = if topology.colors.nodes.is_empty() {
+        vec![0i32]
+    } else {
+        topology.colors.nodes.clone()
+    };
+    Ok(AlgoState::Msc {
+        d_color_starts: stream.clone_htod(&starts)?,
+        d_color_counts: stream.clone_htod(&counts)?,
+        d_color_nodes: stream.clone_htod(&nodes)?,
+        num_colors: topology.colors.num_colors,
+        words: to_kernel_i32("words", words)?,
+        shared_bytes: u32::try_from(shared).unwrap_or(u32::MAX),
+    })
+}
+
 /// Allocate the algorithm-specific device buffers for `num_nonces` nonces.
 ///
 /// The Gibbs arm tiles the host-side coloring once per nonce. Every array
@@ -303,6 +428,7 @@ enum AlgoState {
 fn build_algo_state(
     // `&Arc<_>`, not `&CudaStream`: cudarc's allocation methods take the
     // stream by `&Arc<Self>` so the returned slices can keep it alive.
+    device: &CudaDevice,
     stream: &Arc<CudaStream>,
     algorithm: Algorithm,
     topology: &SelfFeedingTopology,
@@ -311,6 +437,9 @@ fn build_algo_state(
 ) -> Result<AlgoState, SampleError> {
     let limits = algo_limits(algorithm);
     match algorithm {
+        Algorithm::Sa if device.kernel == KernelKind::Msc => {
+            build_msc_state(device, stream, topology, reads_per_nonce)
+        }
         Algorithm::Sa => {
             let total_threads = num_nonces * 256;
             Ok(AlgoState::Sa {
@@ -410,6 +539,7 @@ impl<'a> SelfFeedingSession<'a> {
         let d_beta = stream_compute.alloc_zeros::<f32>(max_num_betas.max(1))?;
 
         let algo_state = build_algo_state(
+            device,
             &stream_compute,
             algorithm,
             &topology,
@@ -559,6 +689,61 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(self.stream_transfer.clone_dtoh(&self.d_ctrl)?)
     }
 
+    /// Launch arm for the multi-spin kernel.
+    fn launch_msc(
+        &self,
+        cfg: LaunchConfig,
+        num_betas: i32,
+        sweeps_per_beta: i32,
+        seed: u32,
+    ) -> Result<(), SampleError> {
+        let AlgoState::Msc {
+            d_color_starts,
+            d_color_counts,
+            d_color_nodes,
+            num_colors,
+            words,
+            ..
+        } = &self.algo_state
+        else {
+            return Err(SampleError::Driver("launch_msc without msc state".into()));
+        };
+        let f = self
+            .device
+            .msc
+            .as_ref()
+            .ok_or_else(|| SampleError::Driver("msc kernel not loaded".into()))?;
+        let dims = &self.dims;
+        let mut b = self.stream_compute.launch_builder(f);
+        b.arg(&self.d_row_ptr);
+        b.arg(&self.d_col_ind);
+        b.arg(d_color_starts);
+        b.arg(d_color_counts);
+        b.arg(d_color_nodes);
+        b.arg(num_colors);
+        b.arg(&self.d_j);
+        b.arg(&self.d_h);
+        b.arg(&self.d_samples);
+        b.arg(&self.d_energies);
+        b.arg(&self.d_beta);
+        b.arg(&num_betas);
+        b.arg(&sweeps_per_beta);
+        b.arg(&self.d_ctrl);
+        b.arg(&dims.num_nonces);
+        b.arg(&dims.reads_per_nonce);
+        b.arg(&dims.n);
+        b.arg(&dims.nnz);
+        b.arg(&dims.max_packed);
+        b.arg(&seed);
+        b.arg(words);
+        // SAFETY: the 21 `b.arg` calls above mirror `cuda_msc_self_feeding` in
+        // `kernels/msc.cu` in order, type and count; every buffer is sized by
+        // `build` from the same `dims` the kernel receives, and the colour
+        // buffers are bounded by `num_colors` / `dims.n`.
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
     fn launch(
         &mut self,
         active_nonces: usize,
@@ -577,8 +762,18 @@ impl<'a> SelfFeedingSession<'a> {
         })?;
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
+            block_dim: (
+                match &self.algo_state {
+                    AlgoState::Msc { .. } => msc_block_threads(),
+                    _ => 256,
+                },
+                1,
+                1,
+            ),
+            shared_mem_bytes: match &self.algo_state {
+                AlgoState::Msc { shared_bytes, .. } => *shared_bytes,
+                _ => 0,
+            },
         };
         let num_betas = to_kernel_i32("num_betas", num_betas)?;
         let sweeps_per_beta = to_kernel_i32("sweeps_per_beta", sweeps_per_beta)?;
@@ -609,6 +804,9 @@ impl<'a> SelfFeedingSession<'a> {
         // cudarc's read/write distinction is inert here — the kernel's own
         // volatile ctrl protocol is the actual synchronization.
         match &self.algo_state {
+            AlgoState::Msc { .. } => {
+                self.launch_msc(cfg, num_betas, sweeps_per_beta, seed)?;
+            }
             AlgoState::Sa { d_delta_energy } => {
                 let mut b = self.stream_compute.launch_builder(&self.device.sa);
                 b.arg(&self.d_row_ptr);
@@ -725,6 +923,15 @@ impl<'a> SelfFeedingSession<'a> {
                 .memcpy_htod(&exit, &mut self.d_ctrl.slice_mut(off..=off))?;
         }
         Ok(())
+    }
+
+    /// Stop the persistent kernel right now: raise `EXIT_NOW` on every nonce
+    /// (the patched kernel peeks it inside the sweep loop) and wait for the
+    /// blocks to leave. After this the session is unlaunched; `Drop` then
+    /// has nothing left to wait for.
+    fn abort_now(&mut self) -> Result<(), SampleError> {
+        self.signal_exit()?;
+        self.wait_exit()
     }
 
     fn wait_exit(&mut self) -> Result<(), SampleError> {
@@ -1233,11 +1440,11 @@ fn emit_completion(
         }
     };
     let scored = budget.mark();
-    let results: Vec<SamplerResult> = reads
+    let reads: Vec<Vec<i8>> = reads
         .into_iter()
         .take(done.job.params.num_reads.max(1))
-        .map(|spins| score_spins(&spins, &done.job.graph))
         .collect();
+    let results: Vec<SamplerResult> = score_reads_parallel(&reads, &done.job.graph);
     budget.charge(Bucket::Score, scored);
 
     // Charged separately from scoring: this send is where consumer-side
@@ -1340,6 +1547,43 @@ fn answer_empty_graph(out: &Sender<StreamResult>, job: StreamJob) -> bool {
 
 /// Reject every job these nonces still hold with `reason`, so none is dropped
 /// without a `StreamResult` — the coordinator is blocked on one per job.
+/// True when at least one model is ACTIVE on the device and every ACTIVE
+/// model belongs to a generation the coordinator has abandoned. NEXT slots
+/// are ignored: by the time the pump notices a cancel, `refill_slots` may
+/// already have admitted the new round's first jobs behind the stale ones,
+/// and those must not block the abort.
+fn abort_due(slots: &[SlotState], cancel: &CancelToken) -> bool {
+    let mut active = 0usize;
+    for slot in slots {
+        if let Some(a) = slot.active.as_ref() {
+            active += 1;
+            if !cancel.is_cancelled(a.job.watermark) {
+                return false;
+            }
+        }
+    }
+    active > 0
+}
+
+/// Empty every slot after an abort: stale jobs are refunded as `Cancelled`,
+/// live ones (a new-round NEXT job already uploaded) as `Reject(DeviceBusy)`
+/// so the coordinator re-stages fresh work. Either way the credit comes
+/// back. Returns how many jobs were released.
+fn cancel_held(slots: &mut [SlotState], out: &Sender<StreamResult>, cancel: &CancelToken) -> usize {
+    let mut n = 0;
+    for slot in slots {
+        for job in slot.drain_jobs() {
+            n += 1;
+            if cancel.is_cancelled(job.watermark) {
+                let _ = emit_cancelled(out, job);
+            } else {
+                send_reject(out, job, WireSampleError::DeviceBusy);
+            }
+        }
+    }
+    n
+}
+
 fn reject_held(slots: &mut [SlotState], out: &Sender<StreamResult>, reason: &WireSampleError) {
     for slot in slots {
         for job in slot.drain_jobs() {
@@ -1531,6 +1775,36 @@ fn pump_session(
         if !exhausted {
             halt = refill_slots(sess, slots, feed, ctx.budget);
             exhausted = halt.is_exhausted();
+        }
+        // Abort-on-cancel. Once the coordinator has
+        // abandoned the generation of every job this session holds, the
+        // kernel is annealing models nobody will score. Raise EXIT_NOW so the
+        // blocks leave mid-model (kernels/sa.cu peeks the flag inside the
+        // sweep loop), wait for them, refund every held job as Cancelled, and
+        // end the session; `run_session` then seeds a fresh one from the new
+        // round's first job. Stock behaviour was to let the models finish and
+        // drop their results afterwards, which cost roughly half a batch of
+        // GPU time per round change.
+        if abort_due(slots, feed.cancel) {
+            let aborted = ctx.budget.mark();
+            match sess.abort_now() {
+                Ok(()) => {
+                    let n = cancel_held(slots, feed.out, feed.cancel);
+                    eprintln!(
+                        "quip-miner-cuda: round cancelled; aborted {n} in-flight models and \
+                         rebuilding the self-feeding session"
+                    );
+                }
+                Err(e) => {
+                    // The kernel did not stop cleanly: fall back to the stock
+                    // drain path rather than tearing down under it.
+                    eprintln!("quip-miner-cuda: abort-on-cancel failed ({e}); draining instead");
+                }
+            }
+            ctx.budget.charge(Bucket::Poll, aborted);
+            if slots.iter().all(SlotState::is_vacant) {
+                break;
+            }
         }
         let empty = slots.iter().all(SlotState::is_vacant);
         if exhausted && empty {
