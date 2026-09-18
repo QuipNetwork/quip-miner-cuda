@@ -141,7 +141,13 @@ struct AlgoLimits {
     threads_per_block: u32,
 }
 
-fn algo_limits(kernel: KernelKind) -> AlgoLimits {
+/// `msa_replica_words` comes from
+/// [`crate::cuda_device::CudaDevice::msa_replica_words`] and is ignored for SA
+/// and Gibbs, whose read caps are block-shaped rather than shared-memory
+/// shaped. Passing it rather than reading a constant is what lets a device
+/// that only holds one replica word clamp jobs to 64 reads instead of sizing a
+/// two-word session it cannot fit (quip-miner-cuda-9p5).
+fn algo_limits(kernel: KernelKind, msa_replica_words: usize) -> AlgoLimits {
     match kernel {
         // 1 block (1 SM) per nonce; `if (tid < num_reads)` in a 256-thread
         // block hard-caps reads/nonce. N is capped by the kernel's
@@ -153,11 +159,12 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
             threads_per_block: 256,
         },
         // 1 block (1 SM) per nonce, like SA. Reads are lanes of 64-bit
-        // replica words; the session allocates two words, so 128 reads is
-        // the cap the kernel's shared-memory footprint was sized for.
+        // replica words, so the cap is the words this device holds times 64:
+        // 128 where the opt-in shared memory fits two words, 64 where it
+        // fits one.
         KernelKind::Msa => AlgoLimits {
             sms_per_nonce: 1,
-            max_reads: capacity::MSA_MAX_READS,
+            max_reads: capacity::msa_max_reads(msa_replica_words),
             threads_per_block: capacity::MSA_THREADS_PER_NONCE,
         },
         // reads/nonce isn't block-capped (work is chunked across
@@ -183,18 +190,21 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
 /// use quip_miner_cuda::streaming::max_reads;
 /// use quip_miner_cuda::KernelKind;
 ///
-/// // SA and Gibbs are held to one 256-thread block's worth of reads; msa is
-/// // capped at 128 by its shared-memory replica-word budget.
-/// assert_eq!(max_reads(KernelKind::Sa), 256);
-/// assert_eq!(max_reads(KernelKind::Gibbs), 256);
-/// assert_eq!(max_reads(KernelKind::Msa), 128);
+/// // SA and Gibbs are held to one 256-thread block's worth of reads and
+/// // ignore the word count; msa gets 64 reads per replica word its device
+/// // holds.
+/// assert_eq!(max_reads(KernelKind::Sa, 2), 256);
+/// assert_eq!(max_reads(KernelKind::Gibbs, 2), 256);
+/// assert_eq!(max_reads(KernelKind::Msa, 2), 128);
+/// assert_eq!(max_reads(KernelKind::Msa, 1), 64);
 /// ```
 #[must_use]
-// The cap is a compile-time constant per kernel (256 for SA/Gibbs, 128 for
-// msa; see `algo_limits`), so this is a width change and not a narrowing.
+// Bounded by 256 for SA/Gibbs and by 64 times the replica words for msa, whose
+// word count `capacity::msa_replica_words` caps at MSA_REPLICA_WORDS. Both are
+// far inside u32, so this is a width change and not a narrowing.
 #[allow(clippy::cast_possible_truncation)]
-pub fn max_reads(kernel: KernelKind) -> u32 {
-    algo_limits(kernel).max_reads as u32
+pub fn max_reads(kernel: KernelKind, msa_replica_words: usize) -> u32 {
+    algo_limits(kernel, msa_replica_words).max_reads as u32
 }
 
 fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
@@ -405,7 +415,7 @@ fn build_msa_state(
     if shared > device.msa_dynamic_shared_bytes {
         return Err(SampleError::GraphTooLarge {
             n: topology.n,
-            limit: capacity::msa_budget(device.msa_dynamic_shared_bytes),
+            limit: capacity::msa_budget(device.msa_dynamic_shared_bytes, words),
         });
     }
     tracing::info!(
@@ -462,7 +472,7 @@ fn build_algo_state(
     num_nonces: usize,
     reads_per_nonce: usize,
 ) -> Result<AlgoState, SampleError> {
-    let limits = algo_limits(kernel);
+    let limits = algo_limits(kernel, device.msa_replica_words);
     match kernel {
         KernelKind::Msa => build_msa_state(device, stream, topology, reads_per_nonce),
         KernelKind::Sa => {
@@ -773,7 +783,7 @@ impl<'a> SelfFeedingSession<'a> {
     ) -> Result<(), SampleError> {
         let _span = trace_span!("launch", active_nonces).entered();
         self.active_nonces = active_nonces;
-        let limits = algo_limits(self.kernel);
+        let limits = algo_limits(self.kernel, self.device.msa_replica_words);
         let blocks = active_nonces * limits.sms_per_nonce;
         let num_blocks = u32::try_from(blocks).map_err(|_| {
             SampleError::Driver(format!(
@@ -1091,7 +1101,7 @@ pub fn sample_one(
             .collect());
     }
 
-    let limits = algo_limits(kernel);
+    let limits = algo_limits(kernel, device.msa_replica_words);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_beta_schedule(
         graph,
@@ -1219,7 +1229,7 @@ pub fn bench_one(
             .collect();
         return Ok((empty, DeviceTimings::default()));
     }
-    let limits = algo_limits(kernel);
+    let limits = algo_limits(kernel, device.msa_replica_words);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_beta_schedule(
         graph,
@@ -1398,7 +1408,7 @@ impl SlotState {
 /// ```
 #[must_use]
 pub fn stream_width(device: &CudaDevice, kernel: KernelKind) -> usize {
-    (device.max_sms / algo_limits(kernel).sms_per_nonce).max(1)
+    (device.max_sms / algo_limits(kernel, device.msa_replica_words).sms_per_nonce).max(1)
 }
 
 enum Pull {
@@ -1942,7 +1952,7 @@ fn run_session(
     }
 
     let width = stream_width(device, kernel);
-    let limits = algo_limits(kernel);
+    let limits = algo_limits(kernel, device.msa_replica_words);
     let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
     let job_seed = seed.params.seed;
     let key = SessionKey::seed(&seed, reads_per_nonce);
@@ -2422,13 +2432,14 @@ mod tests {
     fn algo_limits_match_the_kernels_fixed_size_arrays() {
         // SA: one block per nonce. N is bounded by the resolved capacity on
         // the device, not by this table.
-        let sa = algo_limits(KernelKind::Sa);
+        let sa = algo_limits(KernelKind::Sa, crate::capacity::MSA_REPLICA_WORDS);
         assert_eq!(sa.sms_per_nonce, 1);
         assert_eq!(sa.max_reads, 256);
         assert_eq!(sa.threads_per_block, 256);
 
-        // msa: one block per nonce, two 64-lane replica words per spin.
-        let msa = algo_limits(KernelKind::Msa);
+        // msa: one block per nonce, 64 reads per 64-lane replica word. A
+        // device that holds two words serves 128 reads, one word serves 64.
+        let msa = algo_limits(KernelKind::Msa, crate::capacity::MSA_REPLICA_WORDS);
         assert_eq!(msa.sms_per_nonce, 1);
         assert_eq!(msa.max_reads, 128);
         assert_eq!(
@@ -2436,8 +2447,20 @@ mod tests {
             crate::capacity::MSA_THREADS_PER_NONCE
         );
 
+        let turing = algo_limits(KernelKind::Msa, 1);
+        assert_eq!(turing.max_reads, 64);
+        assert_eq!(turing.sms_per_nonce, 1);
+        assert_eq!(
+            turing.threads_per_block,
+            crate::capacity::MSA_THREADS_PER_NONCE
+        );
+
+        // SA and Gibbs ignore the replica-word count entirely.
+        assert_eq!(algo_limits(KernelKind::Sa, 1).max_reads, 256);
+        assert_eq!(algo_limits(KernelKind::Gibbs, 1).max_reads, 256);
+
         // Gibbs: four blocks per nonce.
-        let gibbs = algo_limits(KernelKind::Gibbs);
+        let gibbs = algo_limits(KernelKind::Gibbs, crate::capacity::MSA_REPLICA_WORDS);
         assert_eq!(gibbs.sms_per_nonce, 4);
         assert_eq!(gibbs.max_reads, 256);
         assert_eq!(gibbs.threads_per_block, 256);
@@ -2445,18 +2468,15 @@ mod tests {
 
     #[test]
     fn max_reads_mirrors_algo_limits_for_each_kernel() {
-        assert_eq!(
-            max_reads(KernelKind::Sa),
-            algo_limits(KernelKind::Sa).max_reads as u32
-        );
-        assert_eq!(
-            max_reads(KernelKind::Msa),
-            algo_limits(KernelKind::Msa).max_reads as u32
-        );
-        assert_eq!(
-            max_reads(KernelKind::Gibbs),
-            algo_limits(KernelKind::Gibbs).max_reads as u32
-        );
+        for words in [1, crate::capacity::MSA_REPLICA_WORDS] {
+            for kernel in [KernelKind::Sa, KernelKind::Msa, KernelKind::Gibbs] {
+                assert_eq!(
+                    max_reads(kernel, words),
+                    algo_limits(kernel, words).max_reads as u32,
+                    "{kernel:?} at {words} replica words"
+                );
+            }
+        }
     }
 
     #[test]

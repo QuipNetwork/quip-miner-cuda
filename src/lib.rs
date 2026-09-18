@@ -94,33 +94,45 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
     }
 }
 
-/// Adapt envelope for `quip-cuda-msa`.
+/// Adapt envelope for `quip-cuda-msa` at `max_reads` reads per nonce.
 ///
-/// Reads are pinned at `capacity::MSA_MAX_READS` (128): the kernel packs 64
-/// replicas per word and the session allocates two words per spin, which a
-/// 99 KB shared-memory opt-in holds at Zephyr scale.
-/// `tests/headless_api.rs` pins the two numbers together. Sweeps are far
-/// cheaper than in `sa.cu` (one bitwise update serves 64 replicas), so the
-/// envelope runs deeper: measured on an RTX 5090 Laptop against 24
-/// `advantage2-system1` problems (MR !26), the deep-solution rate keeps
-/// improving through 29568 sweeps.
-pub const CUDA_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
+/// Reads are pinned: `min_reads` equals `max_reads`, so the controller in
+/// `quip_solver_core::adapt` hands out exactly this count rather than scaling
+/// it with difficulty. The kernel packs 64 replicas into each 64-bit word, so
+/// the count is 64 per replica word the device's opt-in shared memory holds —
+/// 128 on a 99 KB card at Zephyr scale, 64 on a 64 KB Turing card.
+/// `tests/headless_api.rs` pins the numbers together.
+///
+/// Sweeps are far cheaper than in `sa.cu` (one bitwise update serves 64
+/// replicas), so the envelope runs deeper: measured on an RTX 5090 Laptop
+/// against 24 `advantage2-system1` problems (MR !26), the deep-solution rate
+/// keeps improving through 29568 sweeps.
+#[must_use]
+pub const fn cuda_msa_adapt(max_reads: u32) -> quip_solver_core::adapt::AdaptBounds {
     quip_solver_core::adapt::AdaptBounds {
         min_sweeps: 7392,
         max_sweeps: 29568,
-        min_reads: 128,
-        max_reads: 128,
+        min_reads: max_reads,
+        max_reads,
         reads_solution_min_factor: 0,
         reads_solution_max_factor: 0,
         reads_solution_floor_factor: 0,
-    };
+    }
+}
 
-/// Backend identity for `quip-cuda-msa` at a resolved capacity. `max_nodes`
-/// is the shared-memory ceiling `capacity::msa_budget` derived at open: the
-/// kernel keeps its spin state in dynamic shared memory, so a job over this
-/// cannot be launched and must reject `TooLarge` rather than clamp.
+/// Backend identity for `quip-cuda-msa` at a resolved capacity and read count.
+///
+/// `max_nodes` is the shared-memory ceiling `capacity::msa_budget` derived at
+/// open: the kernel keeps its spin state in dynamic shared memory, so a job
+/// over this cannot be launched and must reject `TooLarge` rather than clamp.
+///
+/// `max_reads` is `capacity::msa_max_reads` at the replica words the device
+/// holds, which the binary probes with
+/// `cuda_device::probe_msa_replica_words` before this identity is built. The
+/// envelope is declared before the device opens, so a card that can only serve
+/// 64 reads must say so here rather than accept 128-read jobs it would clamp.
 #[must_use]
-pub fn cuda_msa_identity(max_nodes: usize) -> BackendIdentity {
+pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
     BackendIdentity {
         backend: "cuda",
         algorithm: "msa",
@@ -128,7 +140,7 @@ pub fn cuda_msa_identity(max_nodes: usize) -> BackendIdentity {
         max_edges: DEFAULT_MAX_EDGES,
         // Same capability set as `cuda_sa_identity`: streaming + governor.
         features: &["streaming", "governor"],
-        adapt: CUDA_MSA_ADAPT,
+        adapt: cuda_msa_adapt(max_reads),
     }
 }
 
@@ -216,7 +228,7 @@ impl Sampler for CudaSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        streaming::max_reads(self.kernel)
+        streaming::max_reads(self.kernel, self.device.msa_replica_words)
     }
 
     fn apply_config(&self, backend_toml: &str) {

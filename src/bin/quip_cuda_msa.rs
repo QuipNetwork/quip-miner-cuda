@@ -7,9 +7,8 @@
 
 use clap::{Parser, Subcommand};
 use quip_miner_cuda::bench::{run_bench, BenchAction};
-use quip_miner_cuda::capacity::advertised_nodes;
-use quip_miner_cuda::capacity::MSA_DEFAULT_NODES;
-use quip_miner_cuda::cuda_device::{device_label_mismatch, CudaDevice};
+use quip_miner_cuda::capacity::{self, advertised_nodes, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
+use quip_miner_cuda::cuda_device::{device_label_mismatch, probe_msa_replica_words, CudaDevice};
 use quip_miner_cuda::nvml_gov::UtilGovernor;
 use quip_miner_cuda::{cuda_msa_identity, CudaSampler, KernelKind};
 use quip_solver_core::{run, CommonArgs, OpenError};
@@ -99,20 +98,24 @@ fn main() -> ExitCode {
             cli.device
         );
     }
-    run(
-        cuda_msa_identity(advertised_nodes(KernelKind::Msa, cli.max_nodes)),
-        &cli.common,
-        || {
-            let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, cli.max_nodes)
-                .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
-            // The governor binds by PCI bus id, not by ordinal: NVML's index
-            // space is PCI-ordered and does not track the CUDA ordinal this
-            // process opened. Taking it from the opened device means both
-            // APIs name the same physical GPU by construction.
-            let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
-            Ok(CudaSampler::new(device, gov, KernelKind::Msa))
-        },
-    )
+    // The identity is built before the device opens, so probe the one device
+    // attribute that decides the read count. A device that cannot be inspected
+    // — no driver, no such ordinal — declares the two-word ceiling and is
+    // refused at open if it really cannot hold it (quip-miner-cuda-9p5).
+    let nodes = advertised_nodes(KernelKind::Msa, cli.max_nodes);
+    let words = probe_msa_replica_words(cli.device, nodes).unwrap_or(MSA_REPLICA_WORDS);
+    let msa_max_reads = u32::try_from(capacity::msa_max_reads(words))
+        .expect("msa read cap is at most MSA_LANES * MSA_REPLICA_WORDS");
+    run(cuda_msa_identity(nodes, msa_max_reads), &cli.common, || {
+        let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, cli.max_nodes)
+            .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
+        // The governor binds by PCI bus id, not by ordinal: NVML's index
+        // space is PCI-ordered and does not track the CUDA ordinal this
+        // process opened. Taking it from the opened device means both
+        // APIs name the same physical GPU by construction.
+        let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
+        Ok(CudaSampler::new(device, gov, KernelKind::Msa))
+    })
 }
 
 #[cfg(test)]

@@ -450,10 +450,18 @@ pub fn run_bench(
 }
 
 /// Refuse a `--reads` the kernel would silently clamp. `bench_one` caps reads
-/// per nonce at `streaming::max_reads(kernel)`, and a clamped run would report
-/// the requested count against the clamped timing.
+/// per nonce at `streaming::max_reads(kernel, words)`, and a clamped run would
+/// report the requested count against the clamped timing.
+///
+/// This runs before the device opens, so it checks the msa ceiling at
+/// `capacity::MSA_REPLICA_WORDS`. A device that only holds one replica word
+/// caps at 64 and still clamps a `--reads 128` run; quip-miner-cuda-n6y moves
+/// this check after the open so that case is refused too.
 fn check_reads(kernel: KernelKind, reads: u64) -> Result<(), BenchError> {
-    let max_reads = u64::from(crate::streaming::max_reads(kernel));
+    let max_reads = u64::from(crate::streaming::max_reads(
+        kernel,
+        crate::capacity::MSA_REPLICA_WORDS,
+    ));
     if (1..=max_reads).contains(&reads) {
         return Ok(());
     }
