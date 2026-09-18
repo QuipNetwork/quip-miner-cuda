@@ -23,9 +23,10 @@ through the driver's forward-compatible PTX JIT. `SUPPORTED_ARCHS` in
 `src/cuda_device.rs` is the contract and `tests/arch_coverage.rs` enforces it
 (`make test-archs`). Energies are scored with the canonical
 `quip_protocol::scoring::energy_milli` so results match consensus.
-`quip-cuda-msa` also needs at least 96 KB of opt-in shared memory per block
-to open at its default capacity. Every supported architecture except Turing
-(sm_75, 64 KB) provides that.
+`quip-cuda-msa` sizes its spin state against the opt-in shared memory per
+block. A device with at least 96 KB holds two replica words per spin and serves
+128 reads. Turing (sm_75, 64 KB) holds one word and serves 64 reads. The miner
+declares the read count it can serve when it starts.
 
 ## Binaries
 
@@ -96,9 +97,16 @@ cannot run on this kernel. Such a job is rejected as `TooLarge`.
 
 Node capacity comes from the device. The spin state is dynamic shared memory,
 so the ceiling is the opt-in shared memory per block less 8720 bytes, divided
-by 16. That is 5791 spins on a 99 KB part and 5599 on Volta. `--max-nodes`
-above the ceiling is an error at open, never a silent clamp. Reads are fixed at
-128.
+by 8 times the replica words. At two words that is 5791 spins on a 99 KB part
+and 5599 on Volta. `--max-nodes` above the ceiling is an error at open, never a
+silent clamp.
+
+Replica words fall back from two to one when the device cannot hold the
+resolved capacity at two. The read count halves with them, because each 64-bit
+word carries 64 replicas. Turing is the case this serves. A 4577-spin topology
+needs 73232 bytes at two words and 36616 at one, under a 64 KB ceiling. The
+miner then pins reads at the resolved count, so no job asks for more than the
+device holds.
 
 Two host-side changes came with it and apply to `quip-cuda-sa` too:
 

@@ -8,9 +8,10 @@
 //! for the sweep those numbers come from.
 
 use quip_miner_cuda::capacity::GIBBS_DEFAULT_NODES;
-use quip_miner_cuda::capacity::MSA_DEFAULT_NODES;
-use quip_miner_cuda::cuda_device::CudaDevice;
+use quip_miner_cuda::capacity::{msa_max_reads, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
+use quip_miner_cuda::cuda_device::{probe_msa_replica_words, CudaDevice};
 use quip_miner_cuda::sampler::{sample_ising, SampleError};
+use quip_miner_cuda::streaming::max_reads;
 use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
 
 /// Pegasus P16 has 5640 nodes, above both shipped defaults (5000 / 4800).
@@ -196,4 +197,36 @@ fn two_capacities_in_one_process_do_not_cross_serve() {
 
     let large = CudaDevice::open_with_nodes(0, KernelKind::Gibbs, 16384).expect("Gibbs at 16384");
     assert_eq!(large.max_nodes, 16384);
+}
+
+/// The read count a miner declares comes from `probe_msa_replica_words`, which
+/// reads one device attribute before any kernel compiles. The count the
+/// session then launches with comes from the opened device. The two derive the
+/// same number from the same attribute, so a drift between them would make the
+/// miner advertise reads it clamps away (quip-miner-cuda-9p5).
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn the_probed_replica_words_match_the_opened_device() {
+    if CudaDevice::device_count().unwrap_or(0) == 0 {
+        eprintln!("no CUDA device visible; skipping");
+        return;
+    }
+
+    let probed = probe_msa_replica_words(0, MSA_DEFAULT_NODES)
+        .expect("a device that opens msa holds at least one replica word");
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES)
+        .expect("msa opens at its default");
+    assert_eq!(
+        probed, device.msa_replica_words,
+        "probed replica words must match the opened device"
+    );
+    assert!(
+        (1..=MSA_REPLICA_WORDS).contains(&probed),
+        "replica words {probed} outside 1..={MSA_REPLICA_WORDS}"
+    );
+    // Reads are 64 per word, and the declared cap must equal the launch cap.
+    assert_eq!(
+        max_reads(KernelKind::Msa, probed),
+        u32::try_from(msa_max_reads(device.msa_replica_words)).expect("small"),
+    );
 }
