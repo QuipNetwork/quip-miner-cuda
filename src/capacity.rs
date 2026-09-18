@@ -127,10 +127,15 @@ pub const MSA_DEFAULT_NODES: usize = 5000;
 /// Reads packed into one 64-bit word by the msa kernel (`kernels/msa.cu`).
 pub const MSA_LANES: usize = 64;
 
-/// Replica words per spin the msa session allocates for. Two words is 128
-/// reads, which is what the adapt envelope pins and what a 99 KB opt-in
-/// holds at Zephyr scale. Four words would need 146 KB for 4577 spins.
-pub const MSA_REPLICA_WORDS: usize = 2;
+/// Replica words per spin the msa session allocates for.
+///
+/// PRIVATE BUILD (msa1w, node06): one word, 64 reads. Upstream uses two words
+/// (128 reads), which needs a 99 KB opt-in at Zephyr scale and so refuses every
+/// Turing card (64 KB). One word needs 8 bytes per spin, so a 64 KB opt-in
+/// holds 7102 spins, above the 5000 floor and the 4577-spin topology. The
+/// kernel already takes `words` at runtime (1, 2 or 4); only this allocation
+/// shape and the adapt envelope in `lib.rs` changed.
+pub const MSA_REPLICA_WORDS: usize = 1;
 
 /// Read cap for the msa kernel: `MSA_LANES * MSA_REPLICA_WORDS`.
 pub const MSA_MAX_READS: usize = MSA_LANES * MSA_REPLICA_WORDS;
@@ -501,60 +506,65 @@ mod tests {
     }
 
     /// An A4000 opts in to 101376 bytes (99 KB) per block. Less the two
-    /// static ints and the 8704-byte threshold structures, two 8-byte
-    /// words per spin fit 5791 spins.
+    /// static ints and the 8704-byte threshold structures, one 8-byte
+    /// word per spin fits 11582 spins (msa1w; upstream two words fit 5791).
     #[test]
     fn msa_budget_on_a_99_kb_optin() {
         assert_eq!(msa_dynamic_shared_bytes(101_376), 101_360);
-        assert_eq!(msa_budget(101_360), 5791);
-        assert!(msa_shared_bytes(5791, MSA_REPLICA_WORDS) <= 101_360);
-        assert!(msa_shared_bytes(5792, MSA_REPLICA_WORDS) > 101_360);
+        assert_eq!(msa_budget(101_360), 11_582);
+        assert!(msa_shared_bytes(11_582, MSA_REPLICA_WORDS) <= 101_360);
+        assert!(msa_shared_bytes(11_583, MSA_REPLICA_WORDS) > 101_360);
     }
 
     /// The other opt-in sizes in the supported-arch table. Volta (96 KB),
-    /// Ampere datacenter (163 KB) and Hopper (227 KB) hold the default.
-    /// Turing (64 KB) does not.
+    /// Ampere datacenter (163 KB) and Hopper (227 KB) hold the default, and
+    /// at one word (msa1w) so does Turing (64 KB).
     #[test]
     fn msa_budget_across_the_supported_optin_sizes() {
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(98_304)), 5599);
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(166_912)), 9887);
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(232_448)), 13_983);
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(65_536)), 3551);
+        assert_eq!(msa_budget(msa_dynamic_shared_bytes(98_304)), 11_198);
+        assert_eq!(msa_budget(msa_dynamic_shared_bytes(166_912)), 19_774);
+        assert_eq!(msa_budget(msa_dynamic_shared_bytes(232_448)), 27_966);
+        assert_eq!(msa_budget(msa_dynamic_shared_bytes(65_536)), 7102);
     }
 
     #[test]
     fn resolve_msa_accepts_at_the_budget_and_rejects_above_it() {
         let limits = a4000(A4000_FREE);
-        assert_eq!(resolve(KernelKind::Msa, 5791, &limits), Ok(5791));
+        assert_eq!(resolve(KernelKind::Msa, 11_582, &limits), Ok(11_582));
         assert_eq!(
-            resolve(KernelKind::Msa, 5792, &limits),
+            resolve(KernelKind::Msa, 11_583, &limits),
             Err(CapacityError::AboveDeviceBudget {
-                requested: 5792,
-                budget: 5791,
+                requested: 11_583,
+                budget: 11_582,
                 resource: BudgetResource::SharedMemory,
             })
         );
     }
 
-    /// Turing cannot hold the default at 128 reads, so the open refuses
-    /// with the shared-memory budget instead of rejecting every job later.
+    /// msa1w: at one word (64 reads) Turing holds the default and the
+    /// 4577-spin topology, and still refuses above its 7102-spin budget.
     #[test]
-    fn resolve_refuses_msa_on_a_turing_sized_optin() {
+    fn resolve_opens_msa_on_a_turing_sized_optin() {
         let mut limits = a4000(A4000_FREE);
         limits.shared_bytes_per_block_optin = 65_536;
         assert_eq!(
             resolve(KernelKind::Msa, MSA_DEFAULT_NODES, &limits),
+            Ok(MSA_DEFAULT_NODES)
+        );
+        assert_eq!(resolve(KernelKind::Msa, 7102, &limits), Ok(7102));
+        assert_eq!(
+            resolve(KernelKind::Msa, 7103, &limits),
             Err(CapacityError::AboveDeviceBudget {
-                requested: MSA_DEFAULT_NODES,
-                budget: 3551,
+                requested: 7103,
+                budget: 7102,
                 resource: BudgetResource::SharedMemory,
             })
         );
     }
 
     #[test]
-    fn msa_read_cap_is_two_words_of_lanes() {
-        assert_eq!(MSA_MAX_READS, 128);
+    fn msa_read_cap_is_one_word_of_lanes() {
+        assert_eq!(MSA_MAX_READS, 64);
     }
 
     /// msa has no static ceiling either; the device budget is what refuses.

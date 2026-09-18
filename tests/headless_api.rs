@@ -20,7 +20,7 @@ use quip_miner_cuda::{
 fn max_reads_is_the_kernel_read_cap() {
     assert_eq!(max_reads(KernelKind::Sa), 256);
     assert_eq!(max_reads(KernelKind::Gibbs), 256);
-    assert_eq!(max_reads(KernelKind::Msa), 128);
+    assert_eq!(max_reads(KernelKind::Msa), 64);
 }
 
 /// Identity `max_nodes` must mirror whatever capacity the process resolved,

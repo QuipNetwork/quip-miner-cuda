@@ -153,8 +153,8 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
             threads_per_block: 256,
         },
         // 1 block (1 SM) per nonce, like SA. Reads are lanes of 64-bit
-        // replica words; the session allocates two words, so 128 reads is
-        // the cap the kernel's shared-memory footprint was sized for.
+        // replica words; the session allocates one word (msa1w; upstream two),
+        // so 64 reads is the cap the kernel's shared-memory footprint was sized for.
         KernelKind::Msa => AlgoLimits {
             sms_per_nonce: 1,
             max_reads: capacity::MSA_MAX_READS,
@@ -184,10 +184,10 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
 /// use quip_miner_cuda::KernelKind;
 ///
 /// // SA and Gibbs are held to one 256-thread block's worth of reads; msa is
-/// // capped at 128 by its shared-memory replica-word budget.
+/// // capped at 64 (msa1w; upstream 128) by its shared-memory replica-word budget.
 /// assert_eq!(max_reads(KernelKind::Sa), 256);
 /// assert_eq!(max_reads(KernelKind::Gibbs), 256);
-/// assert_eq!(max_reads(KernelKind::Msa), 128);
+/// assert_eq!(max_reads(KernelKind::Msa), 64);
 /// ```
 #[must_use]
 // The cap is a compile-time constant per kernel (256 for SA/Gibbs, 128 for
@@ -2427,10 +2427,10 @@ mod tests {
         assert_eq!(sa.max_reads, 256);
         assert_eq!(sa.threads_per_block, 256);
 
-        // msa: one block per nonce, two 64-lane replica words per spin.
+        // msa: one block per nonce, one 64-lane replica word per spin (msa1w).
         let msa = algo_limits(KernelKind::Msa);
         assert_eq!(msa.sms_per_nonce, 1);
-        assert_eq!(msa.max_reads, 128);
+        assert_eq!(msa.max_reads, 64);
         assert_eq!(
             msa.threads_per_block,
             crate::capacity::MSA_THREADS_PER_NONCE

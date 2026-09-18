@@ -785,7 +785,7 @@ mod tests {
     fn check_reads_refuses_counts_the_kernel_would_clamp() {
         for (kernel, cap) in [
             (KernelKind::Sa, 256),
-            (KernelKind::Msa, 128),
+            (KernelKind::Msa, 64),
             (KernelKind::Gibbs, 256),
         ] {
             assert!(check_reads(kernel, 1).is_ok(), "{kernel:?} 1");
@@ -796,7 +796,7 @@ mod tests {
         let err = check_reads(KernelKind::Msa, 256).unwrap_err().to_string();
         assert_eq!(
             err,
-            "bench args: --reads 256 is outside 1..=128 for the msa kernel"
+            "bench args: --reads 256 is outside 1..=64 for the msa kernel"
         );
     }
 }

@@ -96,8 +96,9 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
 
 /// Adapt envelope for `quip-cuda-msa`.
 ///
-/// Reads are pinned at `capacity::MSA_MAX_READS` (128): the kernel packs 64
-/// replicas per word and the session allocates two words per spin, which a
+/// Reads are pinned at `capacity::MSA_MAX_READS` (64 in the private msa1w
+/// build; upstream 128): the kernel packs 64 replicas per word and the session
+/// allocates one word per spin, which a
 /// 99 KB shared-memory opt-in holds at Zephyr scale.
 /// `tests/headless_api.rs` pins the two numbers together. Sweeps are far
 /// cheaper than in `sa.cu` (one bitwise update serves 64 replicas), so the
@@ -108,8 +109,8 @@ pub const CUDA_MSA_ADAPT: quip_solver_core::adapt::AdaptBounds =
     quip_solver_core::adapt::AdaptBounds {
         min_sweeps: 7392,
         max_sweeps: 29568,
-        min_reads: 128,
-        max_reads: 128,
+        min_reads: 64,
+        max_reads: 64,
         reads_solution_min_factor: 0,
         reads_solution_max_factor: 0,
         reads_solution_floor_factor: 0,
