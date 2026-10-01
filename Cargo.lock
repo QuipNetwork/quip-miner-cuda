@@ -296,6 +296,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
 name = "cudarc"
 version = "0.19.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -469,6 +475,17 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
 ]
 
 [[package]]
@@ -926,9 +943,9 @@ dependencies = [
 
 [[package]]
 name = "quip-proto"
-version = "0.0.1-rc2"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3136967f1102fe9b7ddfe383d943992fc09dc816d3a0a03e5f4a05f5f4d230b"
+checksum = "b23623cac848ac57fb00ae389f4ada328f09ff89631f30c955b7285a4d88879c"
 dependencies = [
  "prost",
  "tonic",
@@ -936,9 +953,9 @@ dependencies = [
 
 [[package]]
 name = "quip-protocol"
-version = "0.0.1-rc2"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "237b71aa4bf5334bcae12be1cdf8756de9143f16dc50a47785d5bd7ca4cf1388"
+checksum = "2685030cd72ce49aeb91a3ece54b91733cd30d64922277f907459b231441b46f"
 dependencies = [
  "blake3",
  "quip-proto",
@@ -946,9 +963,9 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-conformance"
-version = "0.0.1-rc2"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "845e0abf893426afeea8514d9396bc62504b47641ee5a2668047da9960076632"
+checksum = "8d47a4535d28590887754ac6beeeeca10924a68895d0ae0ccf64feb15d6ba862"
 dependencies = [
  "hyper-util",
  "prost",
@@ -964,13 +981,14 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-core"
-version = "0.0.1-rc2"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5eedc3b7391908f0cc64430869566257ba5fec9560050613c148fd67a07c735"
+checksum = "97610f7de2d194bb3a1c43802bffd223ecfc8ec93d3f49e08fdbeeaae5fd2850"
 dependencies = [
  "base64",
  "clap",
  "getrandom 0.2.17",
+ "half",
  "hyper-util",
  "prost",
  "quip-proto",

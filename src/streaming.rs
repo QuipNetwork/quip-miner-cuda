@@ -1011,7 +1011,7 @@ impl Drop for SelfFeedingSession<'_> {
 #[derive(Clone)]
 struct SessionKey {
     n: usize,
-    edges: Vec<(usize, usize)>,
+    edges: Arc<[(usize, usize)]>,
     reads_per_nonce: usize,
     num_sweeps: usize,
     sweeps_per_beta: usize,
@@ -2336,7 +2336,7 @@ mod tests {
     fn session_key_rejects_different_edges() {
         let key = SessionKey::seed(&job(1), 8);
         let mut other = job(2);
-        other.graph.edges = vec![(0, 1), (1, 2), (2, 3), (0, 2)];
+        other.graph.edges = vec![(0, 1), (1, 2), (2, 3), (0, 2)].into();
         assert!(!key.matches(&other));
     }
 

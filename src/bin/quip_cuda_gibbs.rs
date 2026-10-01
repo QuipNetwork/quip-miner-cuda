@@ -14,7 +14,7 @@ use quip_solver_core::{run, CommonArgs, OpenError};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 1"))]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " protocol 2"))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

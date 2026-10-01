@@ -6,6 +6,7 @@
 //! Run them on a GPU host: `cargo test -p quip-miner-cuda -- --ignored`.
 
 use quip_solver_conformance::driver::{drive_miner, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER};
+use quip_solver_core::quip_protocol::session::PROTOCOL_VERSION;
 use serial_test::serial;
 use std::process::Command;
 
@@ -99,7 +100,13 @@ fn capabilities_and_version_headless() {
 
         let out = Command::new(&path).arg("--version").output().unwrap();
         assert!(out.status.success());
-        assert!(String::from_utf8(out.stdout).unwrap().contains("protocol"));
+        // The literal in each binary's `#[command(version)]` must track the
+        // protocol the linked quip-solver-core speaks.
+        let version = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            version.contains(&format!("protocol {PROTOCOL_VERSION}")),
+            "{bin}: {version}"
+        );
     }
 }
 
