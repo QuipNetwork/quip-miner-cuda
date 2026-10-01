@@ -80,8 +80,8 @@ const STALL_FACTOR: u32 = 4;
 /// graphs complete in well under a second while a hard round takes minutes per
 /// job, and a cutoff short enough to be useful for the former would tear a
 /// healthy session apart mid-flight for the latter. So the cutoff tracks what
-/// this session has actually demonstrated — [`STALL_FACTOR`] times the longest
-/// wait between completions so far — and never drops below [`STALL_FLOOR`],
+/// this session has actually demonstrated — `STALL_FACTOR` times the longest
+/// wait between completions so far — and never drops below `STALL_FLOOR`,
 /// which is what covers the stretch before anything has completed at all.
 ///
 /// # Examples
