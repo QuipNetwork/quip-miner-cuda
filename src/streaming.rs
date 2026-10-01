@@ -80,8 +80,8 @@ const STALL_FACTOR: u32 = 4;
 /// graphs complete in well under a second while a hard round takes minutes per
 /// job, and a cutoff short enough to be useful for the former would tear a
 /// healthy session apart mid-flight for the latter. So the cutoff tracks what
-/// this session has actually demonstrated — [`STALL_FACTOR`] times the longest
-/// wait between completions so far — and never drops below [`STALL_FLOOR`],
+/// this session has actually demonstrated — `STALL_FACTOR` times the longest
+/// wait between completions so far — and never drops below `STALL_FLOOR`,
 /// which is what covers the stretch before anything has completed at all.
 ///
 /// # Examples
@@ -1011,7 +1011,7 @@ impl Drop for SelfFeedingSession<'_> {
 #[derive(Clone)]
 struct SessionKey {
     n: usize,
-    edges: Vec<(usize, usize)>,
+    edges: Arc<[(usize, usize)]>,
     reads_per_nonce: usize,
     num_sweeps: usize,
     sweeps_per_beta: usize,
@@ -2336,7 +2336,7 @@ mod tests {
     fn session_key_rejects_different_edges() {
         let key = SessionKey::seed(&job(1), 8);
         let mut other = job(2);
-        other.graph.edges = vec![(0, 1), (1, 2), (2, 3), (0, 2)];
+        other.graph.edges = vec![(0, 1), (1, 2), (2, 3), (0, 2)].into();
         assert!(!key.matches(&other));
     }
 

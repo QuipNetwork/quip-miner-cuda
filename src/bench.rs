@@ -453,15 +453,10 @@ pub fn run_bench(
 /// per nonce at `streaming::max_reads(kernel, words)`, and a clamped run would
 /// report the requested count against the clamped timing.
 ///
-/// This runs before the device opens, so it checks the msa ceiling at
-/// `capacity::MSA_REPLICA_WORDS`. A device that only holds one replica word
-/// caps at 64 and still clamps a `--reads 128` run; quip-miner-cuda-n6y moves
-/// this check after the open so that case is refused too.
-fn check_reads(kernel: KernelKind, reads: u64) -> Result<(), BenchError> {
-    let max_reads = u64::from(crate::streaming::max_reads(
-        kernel,
-        crate::capacity::MSA_REPLICA_WORDS,
-    ));
+/// `msa_replica_words` is the opened device's `msa_replica_words`, so a device
+/// that only holds one replica word refuses a `--reads 128` msa run.
+fn check_reads(kernel: KernelKind, reads: u64, msa_replica_words: usize) -> Result<(), BenchError> {
+    let max_reads = u64::from(crate::streaming::max_reads(kernel, msa_replica_words));
     if (1..=max_reads).contains(&reads) {
         return Ok(());
     }
@@ -477,7 +472,6 @@ fn run_run(
     max_nodes: usize,
     args: &RunArgs,
 ) -> Result<(), BenchError> {
-    check_reads(kernel, args.reads)?;
     std::fs::create_dir_all(&args.out).map_err(|e| BenchError::Io(e.to_string()))?;
     let sweeps: Vec<u64> = if args.sweeps.is_empty() {
         vec![1024]
@@ -506,6 +500,7 @@ fn run_run(
         // any larger graph regardless of which binary is running.
         let device = CudaDevice::open_with_nodes(device_index, kernel, max_nodes)
             .map_err(|e| BenchError::Device(e.to_string()))?;
+        check_reads(kernel, args.reads, device.msa_replica_words)?;
         let device_name = device
             .name()
             .unwrap_or_else(|_| format!("cuda-{device_index}"));
@@ -791,20 +786,43 @@ mod tests {
 
     #[test]
     fn check_reads_refuses_counts_the_kernel_would_clamp() {
+        let two = crate::capacity::MSA_REPLICA_WORDS;
         for (kernel, cap) in [
             (KernelKind::Sa, 256),
             (KernelKind::Msa, 128),
             (KernelKind::Gibbs, 256),
         ] {
-            assert!(check_reads(kernel, 1).is_ok(), "{kernel:?} 1");
-            assert!(check_reads(kernel, cap).is_ok(), "{kernel:?} cap");
-            assert!(check_reads(kernel, 0).is_err(), "{kernel:?} 0");
-            assert!(check_reads(kernel, cap + 1).is_err(), "{kernel:?} cap+1");
+            assert!(check_reads(kernel, 1, two).is_ok(), "{kernel:?} 1");
+            assert!(check_reads(kernel, cap, two).is_ok(), "{kernel:?} cap");
+            assert!(check_reads(kernel, 0, two).is_err(), "{kernel:?} 0");
+            assert!(
+                check_reads(kernel, cap + 1, two).is_err(),
+                "{kernel:?} cap+1"
+            );
         }
-        let err = check_reads(KernelKind::Msa, 256).unwrap_err().to_string();
+        let err = check_reads(KernelKind::Msa, 256, two)
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             err,
             "bench args: --reads 256 is outside 1..=128 for the msa kernel"
         );
+    }
+
+    /// A device that holds one replica word caps msa at 64 reads, so a
+    /// `--reads 128` run must be refused rather than clamped.
+    #[test]
+    fn check_reads_uses_the_resolved_replica_words() {
+        assert!(check_reads(KernelKind::Msa, 64, 1).is_ok());
+        let err = check_reads(KernelKind::Msa, 128, 1)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "bench args: --reads 128 is outside 1..=64 for the msa kernel"
+        );
+        // SA and Gibbs ignore the word count.
+        assert!(check_reads(KernelKind::Sa, 256, 1).is_ok());
+        assert!(check_reads(KernelKind::Gibbs, 256, 1).is_ok());
     }
 }

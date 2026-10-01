@@ -243,6 +243,15 @@ fn resolve_msa_replica_words(
 /// names the budget.
 #[must_use]
 pub fn probe_msa_replica_words(device_index: usize, requested_nodes: usize) -> Option<usize> {
+    // cudarc panics on the first driver call when libcuda cannot be loaded,
+    // so a machine with no driver must be caught before `CudaContext::new`.
+    // SAFETY: `is_culib_present` only attempts to `dlopen` the CUDA driver
+    // library by its standard names and drops the handle. Loading it runs the
+    // driver's own initializers, which every later driver call in this process
+    // runs anyway through cudarc's loader; no pointer or state crosses the call.
+    if !unsafe { cudarc::driver::sys::is_culib_present() } {
+        return None;
+    }
     let ctx = CudaContext::new(device_index).ok()?;
     let optin = usize::try_from(
         ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)

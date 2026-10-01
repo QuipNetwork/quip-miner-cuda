@@ -23,7 +23,7 @@
 //! workloads. Foreign utilization is what "is someone else using this GPU?"
 //! actually needs.
 //!
-//! See [`Attribution`] for how foreign load is established, and why the
+//! See `Attribution` for how foreign load is established, and why the
 //! process-count check is the part that holds in every environment.
 
 use nvml_wrapper::Device;

@@ -3,7 +3,7 @@
 //! This answers QUI-870's question — *which bucket's share grows as `att/s`
 //! falls?* — for the Rust driver loop. The original instrument
 //! (`GPU/driver_budget.py`) measured a Python stream driver that v0.3 replaced,
-//! so the buckets are re-derived here against [`crate::streaming::pump_session`]
+//! so the buckets are re-derived here against `streaming::pump_session`
 //! while keeping the operator-facing names and environment variables from that
 //! ticket, so a reader of the old JSONL can read this one.
 //!
@@ -108,7 +108,7 @@ pub struct Snapshot {
     pub elapsed: Duration,
     /// Jobs completed during this window.
     pub completions: u64,
-    /// Time charged to each bucket, indexed by [`Bucket::index`].
+    /// Time charged to each bucket, indexed by `Bucket::index`.
     pub charged: [Duration; 7],
 }
 

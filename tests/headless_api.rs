@@ -14,6 +14,7 @@ use quip_miner_cuda::topology::{fill_h_j, SelfFeedingTopology};
 use quip_miner_cuda::{
     cuda_gibbs_identity, cuda_msa_identity, cuda_sa_identity, IsingGraph, KernelKind,
 };
+use quip_solver_core::quip_protocol::session::{algorithm_name, backend_name};
 
 /// Read cap advertised by the streaming driver (kernel block size for SA).
 /// msa scales with the replica words its device holds; SA and Gibbs do not.
@@ -33,13 +34,13 @@ fn max_reads_is_the_kernel_read_cap() {
 #[test]
 fn identities_report_the_resolved_capacity() {
     let sa = cuda_sa_identity(SA_DEFAULT_NODES);
-    assert_eq!(sa.backend, "cuda");
-    assert_eq!(sa.algorithm, "sa");
+    assert_eq!(backend_name(sa.backend), "cuda");
+    assert_eq!(algorithm_name(sa.algorithm), "sa");
     assert_eq!(sa.max_nodes, 5000);
 
     let gibbs = cuda_gibbs_identity(GIBBS_DEFAULT_NODES);
-    assert_eq!(gibbs.backend, "cuda");
-    assert_eq!(gibbs.algorithm, "gibbs");
+    assert_eq!(backend_name(gibbs.backend), "cuda");
+    assert_eq!(algorithm_name(gibbs.algorithm), "gibbs");
     assert_eq!(gibbs.max_nodes, 4800);
 
     // A raised capacity must show through, or a coordinator would keep
@@ -54,7 +55,7 @@ fn identities_report_the_resolved_capacity() {
 #[test]
 fn msa_identity_reads_match_the_kernel_read_cap() {
     let msa = cuda_msa_identity(MSA_DEFAULT_NODES, 128);
-    assert_eq!(msa.algorithm, "msa");
+    assert_eq!(algorithm_name(msa.algorithm), "msa");
     assert_eq!(msa.max_nodes, 5000);
     assert_eq!(msa.adapt.min_reads, msa.adapt.max_reads);
     assert_eq!(

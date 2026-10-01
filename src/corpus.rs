@@ -236,7 +236,7 @@ mod tests {
         assert_eq!(record.topology_hash, "", "absent field defaults to empty");
         assert_eq!(graph.h, vec![1.0, 0.0, 0.0, 0.0]);
         assert_eq!(graph.j, vec![1.0, -1.0, -1.0, 1.0]);
-        assert_eq!(graph.edges, vec![(0, 1), (1, 2), (2, 3), (0, 3)]);
+        assert_eq!(graph.edges, vec![(0, 1), (1, 2), (2, 3), (0, 3)].into());
     }
 
     #[test]
@@ -268,7 +268,7 @@ mod tests {
         let (_, graph) = &recs[0];
         assert_eq!(graph.h, vec![0.0, 0.0, 0.0]);
         assert_eq!(graph.j, vec![1.0, 1.0]);
-        assert_eq!(graph.edges, vec![(0, 1), (1, 2)]);
+        assert_eq!(graph.edges, vec![(0, 1), (1, 2)].into());
     }
 
     #[test]

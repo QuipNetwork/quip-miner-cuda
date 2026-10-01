@@ -35,6 +35,7 @@ pub use sampler::sample_ising;
 use cuda_device::CudaDevice;
 use nvml_gov::UtilGovernor;
 use quip_solver_core::config::{config_override, warn_unknown_fields};
+use quip_solver_core::quip_proto::v1::Backend;
 use quip_solver_core::{
     BackendIdentity, CancelToken, SampleError, Sampler, StreamJob, StreamResult,
 };
@@ -83,8 +84,8 @@ fn identity_max_nodes(max_nodes: usize) -> u32 {
 #[must_use]
 pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
     BackendIdentity {
-        backend: "cuda",
-        algorithm: "sa",
+        backend: Backend::Cuda,
+        algorithm: KernelKind::Sa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
         // A real `sample_stream` override and the NVML governor — the two
@@ -134,8 +135,8 @@ pub const fn cuda_msa_adapt(max_reads: u32) -> quip_solver_core::adapt::AdaptBou
 #[must_use]
 pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
     BackendIdentity {
-        backend: "cuda",
-        algorithm: "msa",
+        backend: Backend::Cuda,
+        algorithm: KernelKind::Msa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
         // Same capability set as `cuda_sa_identity`: streaming + governor.
@@ -150,8 +151,8 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
 #[must_use]
 pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
     BackendIdentity {
-        backend: "cuda",
-        algorithm: "gibbs",
+        backend: Backend::Cuda,
+        algorithm: KernelKind::Gibbs.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
         // Same capability set as `cuda_sa_identity`: streaming + governor.
