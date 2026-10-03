@@ -47,7 +47,7 @@ pub const SUPPORTED_ARCHS: &[i32] = &[
 /// *newer* than the actual device (r610 driver → `compute_121` on an `sm_86`
 /// card) — and PTX only loads forward, so that open failed with
 /// `CUDA_ERROR_INVALID_PTX`.
-fn select_arch(cc: i32) -> i32 {
+pub(crate) fn select_arch(cc: i32) -> i32 {
     SUPPORTED_ARCHS
         .iter()
         .copied()

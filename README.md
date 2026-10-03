@@ -35,6 +35,7 @@ declares the read count it can serve when it starts.
 | `quip-cuda-sa` | simulated annealing (Metropolis) |
 | `quip-cuda-msa` | multi-spin coded simulated annealing, 64 reads per word |
 | `quip-cuda-gibbs` | heat-bath Gibbs |
+| `quip-screen` | probe screen: ranks PoW nonces for the coordinator (not a miner) |
 
 Prebuilt `amd64` binaries are attached to each
 [Release](https://gitlab.com/quip.network/quip-miner-cuda/-/releases).
@@ -116,6 +117,48 @@ Two host-side changes came with it and apply to `quip-cuda-sa` too:
 * **Parallel scoring.** Downloaded samples are rescored on `QUIP_SCORE_THREADS`
   host threads (default 4). With one thread the sampler capped a fast kernel at
   about 20 jobs per second and left the GPU idle between batches.
+
+## Probe screen (`quip-screen`)
+
+The instance drawn from a nonce sets almost all of the energy a solve can reach,
+so a short anneal ranks nonces (quip-miner-metal
+`docs/perf/2026-09-18-probe-screen-at-scale.md`). `quip-screen` runs that short
+anneal on many fresh nonces at once and hands the deepest to the coordinator,
+which sends only those to `quip-cuda-msa`.
+
+* **Nonce-parallel.** One 32-lane word holds 8 nonces with 4 reads each (or
+  4 x 8, 2 x 16, 1 x 32). Each nonce's coupling signs are one byte per edge;
+  the lane mask is that byte times a replication constant.
+* **Couplings drawn on the device** with the protocol's ChaCha8 draw, and
+  energies scored on the device, so the host only derives nonces and reads
+  back one energy per lane.
+* **Metropolis step** as in `msa.cu`; neighbours are read from one padded
+  20-entry row per node.
+* Needs about 69 KB of opt-in shared memory per block at 4,577 nodes and
+  41,514 edges: Volta, Ampere and newer; not Turing.
+
+```sh
+quip-screen --spec topology.json verify   # device draw and energies == protocol
+quip-screen --spec topology.json bench    # probe rate
+quip-screen --spec topology.json serve    # coordinator sidecar (stdin/stdout)
+```
+
+`verify` checks the device coupling masks against `draw_ising_milli` and every
+lane's energy against `energy_milli`. The coordinator starts `serve` itself when
+`QUIP_SCREEN_BIN` is set and writes the spec from the chain's topology.
+
+Measured on an RTX 5090 Laptop (82 SMs, 175 W), 4,096 instances of the Aglais
+topology `cbec1eb4`, full job an MSA anneal at 128 reads x 29,568 sweeps (two
+full runs agree at Spearman 0.985):
+
+| Probe (reads x sweeps) | Spearman vs full job |
+| --- | ---: |
+| 4 x 512 | 0.844 |
+| 4 x 1024 | 0.878 |
+| 8 x 512 | 0.877 |
+
+At 4 x 512 the screen probed about 7,900 nonces per second with a mining
+workload sharing the GPU; alone it runs faster.
 
 ## Yielding to other GPU users
 
