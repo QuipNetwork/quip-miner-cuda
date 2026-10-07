@@ -3,7 +3,7 @@
 //! Ignored by default: it needs a real CUDA device. Run with
 //! `cargo test --release --test jit_cache_gpu -- --ignored`.
 
-use quip_miner_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::cuda_device::CudaDevice;
 use std::time::Instant;
 
 #[test]

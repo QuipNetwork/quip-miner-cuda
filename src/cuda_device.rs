@@ -343,11 +343,11 @@ impl CudaDevice {
     ///   `compute_N` architecture.
     ///
     /// ```no_run
-    /// use quip_miner_cuda::cuda_device::CudaDevice;
+    /// use quip_solver_cuda::cuda_device::CudaDevice;
     ///
     /// let device = CudaDevice::open(0)?;
     /// println!("device {} has {} SMs", device.device_index, device.max_sms);
-    /// # Ok::<(), quip_miner_cuda::cuda_device::CudaError>(())
+    /// # Ok::<(), quip_solver_cuda::cuda_device::CudaError>(())
     /// ```
     pub fn open(device_index: usize) -> Result<Self, CudaError> {
         Self::open_with_nodes(device_index, KernelKind::Sa, capacity::SA_DEFAULT_NODES)
@@ -509,10 +509,10 @@ impl CudaDevice {
     /// driver installed, or CUDA failed to initialize).
     ///
     /// ```no_run
-    /// use quip_miner_cuda::cuda_device::CudaDevice;
+    /// use quip_solver_cuda::cuda_device::CudaDevice;
     ///
     /// println!("{} CUDA device(s) visible", CudaDevice::device_count()?);
-    /// # Ok::<(), quip_miner_cuda::cuda_device::CudaError>(())
+    /// # Ok::<(), quip_solver_cuda::cuda_device::CudaError>(())
     /// ```
     pub fn device_count() -> Result<usize, CudaError> {
         // CUDA reports the count as i32; reject negative rather than truncate.
@@ -531,10 +531,10 @@ impl CudaDevice {
     /// architecture.
     ///
     /// ```no_run
-    /// use quip_miner_cuda::cuda_device::CudaDevice;
+    /// use quip_solver_cuda::cuda_device::CudaDevice;
     ///
     /// CudaDevice::check(0)?;
-    /// # Ok::<(), quip_miner_cuda::cuda_device::CudaError>(())
+    /// # Ok::<(), quip_solver_cuda::cuda_device::CudaError>(())
     /// ```
     pub fn check(device_index: usize) -> Result<(), CudaError> {
         // The probe is the open itself; the device is dropped straight away.

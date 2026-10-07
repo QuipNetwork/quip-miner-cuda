@@ -1,7 +1,7 @@
 # Local + CI entry points. Everything runs inside the CUDA 12.9 CI image so a
 # local run and a pipeline run exercise the same toolkit (see the spec:
 # quip-miner docs/superpowers/specs/2026-08-14-cuda-version-target-design.md).
-CI_IMAGE := quip-miner-cuda-ci
+CI_IMAGE := quip-solver-cuda-ci
 # `-e CI=1` marks the container as the pinned-toolkit environment. tests/arch_coverage.rs
 # skips without it, because off CUDA 12.9 those tests report the toolkit, not the kernels.
 # GitLab sets CI itself; docker run inherits nothing, so the flag is what keeps

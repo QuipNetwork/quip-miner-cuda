@@ -1,14 +1,14 @@
 [package]
-name = "quip-miner-cuda"
+name = "quip-solver-cuda"
 version = "0.3.4-rc3"
 edition = "2021"
 rust-version = "1.97"
 description = "CUDA Ising miners: simulated annealing, multi-spin coded annealing and heat-bath Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
-repository = "https://gitlab.com/quip.network/quip-miner-cuda"
+repository = "https://gitlab.com/quip.network/quip-solver-cuda"
 
 [lib]
-name = "quip_miner_cuda"
+name = "quip_solver_cuda"
 path = "src/lib.rs"
 
 [[bin]]

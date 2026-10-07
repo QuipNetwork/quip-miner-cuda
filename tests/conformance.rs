@@ -3,7 +3,7 @@
 //!
 //! GPU-backed drive tests are `#[ignore]` so default `cargo test` on headless CI
 //! never confuses "self-skipped" with "passed" ([quip-miner-cuda-gp2] part b).
-//! Run them on a GPU host: `cargo test -p quip-miner-cuda -- --ignored`.
+//! Run them on a GPU host: `cargo test -p quip-solver-cuda -- --ignored`.
 
 use quip_solver_conformance::driver::{drive_miner, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER};
 use quip_solver_core::quip_protocol::session::PROTOCOL_VERSION;

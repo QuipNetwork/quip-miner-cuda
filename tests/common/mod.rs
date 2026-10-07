@@ -1,4 +1,4 @@
-//! Shared helpers for quip-miner-cuda integration tests.
+//! Shared helpers for quip-solver-cuda integration tests.
 
 use std::process::Command;
 
@@ -18,10 +18,10 @@ pub fn profile_bin(name: &str) -> String {
 
 pub fn ensure_built(package_bins: &[&str]) {
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "quip-miner-cuda"])
+        .args(["build", "-p", "quip-solver-cuda"])
         .status()
-        .expect("cargo build quip-miner-cuda");
-    assert!(status.success(), "failed to build quip-miner-cuda");
+        .expect("cargo build quip-solver-cuda");
+    assert!(status.success(), "failed to build quip-solver-cuda");
     for b in package_bins {
         assert!(
             std::path::Path::new(&profile_bin(b)).exists(),

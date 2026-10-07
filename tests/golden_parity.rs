@@ -4,17 +4,17 @@
 //! Host/golden tests always run. Live sampling tests are `#[ignore]` so default
 //! `cargo test` on headless CI reports them as ignored, not silently passed
 //! ([quip-miner-cuda-gp2] part b). Run on a GPU host:
-//! `cargo test -p quip-miner-cuda -- --ignored`.
+//! `cargo test -p quip-solver-cuda -- --ignored`.
 
 // Test fixtures parse golden-vector literals; casts are intentional and values are call-site visible.
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use quip_miner_cuda::cuda_device::CudaDevice;
-use quip_miner_cuda::sampler::sample_ising;
-use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
 use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
 use quip_solver_conformance::GOLDEN_VECTORS;
+use quip_solver_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::sampler::sample_ising;
+use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serde_json::Value;
 use serial_test::serial;
 use std::sync::OnceLock;

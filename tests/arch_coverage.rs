@@ -14,7 +14,7 @@
 //! [`skip_outside_ci`].
 
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
-use quip_miner_cuda::cuda_device::SUPPORTED_ARCHS;
+use quip_solver_cuda::cuda_device::SUPPORTED_ARCHS;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -107,7 +107,11 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
         for (name, src, nodes) in [
             ("sa", SA_SRC, 512),
             ("gibbs", GIBBS_SRC, 4800),
-            ("msa", MSA_SRC, quip_miner_cuda::capacity::MSA_DEFAULT_NODES),
+            (
+                "msa",
+                MSA_SRC,
+                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+            ),
         ] {
             if let Err(e) = compile_and_assemble(name, src, nodes, arch) {
                 failures.push(e);

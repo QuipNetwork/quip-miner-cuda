@@ -50,6 +50,8 @@ fn resolve_cache_dir(
     if let Some(dir) = non_empty(quip) {
         return Some(dir);
     }
+    // The directory intentionally keeps the pre-rename crate name: renaming it
+    // would orphan every node's cache and force a cold NVRTC recompile.
     if let Some(dir) = non_empty(xdg) {
         return Some(dir.join("quip-miner-cuda"));
     }

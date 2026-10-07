@@ -10,7 +10,7 @@
 //! `device_by_index` yields a working governor that measures the wrong card.
 //! Only a per-device identity comparison catches it.
 
-use quip_miner_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::cuda_device::CudaDevice;
 
 /// The address CUDA reports must be the address NVML knows the same card by.
 /// Without this, `Nvml::device_by_pci_bus_id` silently finds nothing and the
