@@ -49,6 +49,7 @@ fn job(id: u8, reads: usize, sweeps: usize, watermark: u64) -> StreamJob {
             sweeps_per_beta: 1,
             beta_range: None,
             seed: u64::from(id),
+            ..SampleParams::default()
         },
         watermark: Some(watermark),
     }

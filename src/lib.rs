@@ -92,6 +92,7 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         // capability names `BackendIdentity::features` documents.
         features: &["streaming", "governor"],
         adapt: CUDA_ADAPT,
+        limits: quip_solver_core::ModelLimits::UNSTATED,
     }
 }
 
@@ -142,6 +143,7 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
         // Same capability set as `cuda_sa_identity`: streaming + governor.
         features: &["streaming", "governor"],
         adapt: cuda_msa_adapt(max_reads),
+        limits: quip_solver_core::ModelLimits::UNSTATED,
     }
 }
 
@@ -158,6 +160,7 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
         // Same capability set as `cuda_sa_identity`: streaming + governor.
         features: &["streaming", "governor"],
         adapt: CUDA_ADAPT,
+        limits: quip_solver_core::ModelLimits::UNSTATED,
     }
 }
 

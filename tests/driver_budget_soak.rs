@@ -283,6 +283,7 @@ fn stream_driver_soak() {
                         sweeps_per_beta: 1,
                         beta_range: None,
                         seed: n.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                        ..SampleParams::default()
                     },
                     watermark: None,
                 };
