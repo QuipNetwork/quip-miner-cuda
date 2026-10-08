@@ -37,11 +37,52 @@ use nvml_gov::UtilGovernor;
 use quip_solver_core::config::{config_override, warn_unknown_fields};
 use quip_solver_core::quip_proto::v1::Backend;
 use quip_solver_core::{
-    BackendIdentity, CancelToken, SampleError, Sampler, StreamJob, StreamResult,
+    BackendIdentity, CancelToken, ModelLimits, SampleError, Sampler, StreamJob, StreamResult,
+    LINEAR_SCHEDULE_FEATURE,
 };
 use std::collections::BTreeMap;
 
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
+
+/// Features every kernel advertises: a real `sample_stream` override, the NVML
+/// governor, and a host-built ladder that honours `SampleParams::schedule`.
+const FEATURES: &[&str] = &["streaming", "governor", LINEAR_SCHEDULE_FEATURE];
+
+/// One unit, in milli. Every kernel truncates each coefficient to an `int8` of
+/// whole units (`topology::quantize_i8`), so only whole units are exact.
+const UNIT_MILLI: u32 = 1000;
+
+/// SA's model limits. `kernels/sa.cu` keeps each flip's energy change in a
+/// `signed char`, `-2 * s * (h + Σ J s)`, so the local field must stay within
+/// 63 units or the change wraps.
+pub const SA_LIMITS: ModelLimits = ModelLimits {
+    max_degree: Some(0),
+    max_local_field_milli: Some(63 * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
+
+/// Gibbs's model limits. `kernels/gibbs.cu` sums the field in `float`, so only
+/// the `int8` coefficients bound it: a field of at most 127 units keeps every
+/// coefficient inside one.
+pub const GIBBS_LIMITS: ModelLimits = ModelLimits {
+    max_degree: Some(0),
+    max_local_field_milli: Some(127 * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
+
+/// [`capacity::MSA_MAX_DEGREE`] as the wire type.
+// The degree budget is 20, far inside u32, so this is a width change.
+#[allow(clippy::cast_possible_truncation)]
+const MSA_MAX_DEGREE_U32: u32 = capacity::MSA_MAX_DEGREE as u32;
+
+/// MSA's model limits. `kernels/msa.cu` unrolls [`capacity::MSA_MAX_DEGREE`]
+/// neighbours and anneals on the signs of the couplings and biases alone, so
+/// its field is at most one unit per neighbour plus one for the bias.
+pub const MSA_LIMITS: ModelLimits = ModelLimits {
+    max_degree: Some(MSA_MAX_DEGREE_U32),
+    max_local_field_milli: Some((MSA_MAX_DEGREE_U32 + 1) * UNIT_MILLI),
+    exact_resolution_milli: Some(UNIT_MILLI),
+};
 
 /// CUDA backend config, parsed from the verbatim `config.toml` subsection in
 /// `Configure.backend_toml`. Unrecognized keys land in `unknown`;
@@ -88,11 +129,9 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: KernelKind::Sa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // A real `sample_stream` override and the NVML governor — the two
-        // capability names `BackendIdentity::features` documents.
-        features: &["streaming", "governor"],
+        features: FEATURES,
         adapt: CUDA_ADAPT,
-        limits: quip_solver_core::ModelLimits::UNSTATED,
+        limits: SA_LIMITS,
     }
 }
 
@@ -140,10 +179,9 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
         algorithm: KernelKind::Msa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Same capability set as `cuda_sa_identity`: streaming + governor.
-        features: &["streaming", "governor"],
+        features: FEATURES,
         adapt: cuda_msa_adapt(max_reads),
-        limits: quip_solver_core::ModelLimits::UNSTATED,
+        limits: MSA_LIMITS,
     }
 }
 
@@ -157,10 +195,9 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: KernelKind::Gibbs.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Same capability set as `cuda_sa_identity`: streaming + governor.
-        features: &["streaming", "governor"],
+        features: FEATURES,
         adapt: CUDA_ADAPT,
-        limits: quip_solver_core::ModelLimits::UNSTATED,
+        limits: GIBBS_LIMITS,
     }
 }
 

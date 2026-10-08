@@ -575,6 +575,7 @@ fn run_model(
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        params.schedule,
     );
     let cfg = CellConfig {
         reads: args.reads,

@@ -6,6 +6,7 @@
 //! Run them on a GPU host: `cargo test -p quip-solver-cuda -- --ignored`.
 
 use quip_solver_conformance::driver::{drive_miner, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER};
+use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use quip_solver_core::quip_protocol::session::PROTOCOL_VERSION;
 use serial_test::serial;
 use std::process::Command;
@@ -74,6 +75,74 @@ async fn quip_cuda_gibbs_passes_conformance() {
         "driver did not derive the gibbs sweep expectation from the Hello"
     );
     assert!(report.is_conformant(), "{}", report.summary());
+}
+
+/// Every kernel passes the `--solve` gate, runs a linear schedule, and honours
+/// the limits it advertises: a model at each limit solves, one past it is
+/// refused as capacity.
+#[tokio::test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+async fn every_kernel_passes_the_solve_gate() {
+    ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
+    for (bin, limit_cases) in [
+        (
+            "quip-cuda-sa",
+            &["field-limit-inside", "field-limit-outside"][..],
+        ),
+        (
+            "quip-cuda-msa",
+            &[
+                "degree-limit-inside",
+                "degree-limit-outside",
+                "field-limit-inside",
+                "field-limit-outside",
+            ][..],
+        ),
+        (
+            "quip-cuda-gibbs",
+            &["field-limit-inside", "field-limit-outside"][..],
+        ),
+    ] {
+        let report = drive_solve(&profile_bin(bin)).await;
+        assert!(report.is_conformant(), "{bin}:\n{}", report.summary());
+        for case in ["linear-schedule"].iter().chain(limit_cases) {
+            assert_eq!(
+                report.outcome(case),
+                Some(&CaseOutcome::Passed),
+                "{bin} {case}:\n{}",
+                report.summary()
+            );
+        }
+    }
+}
+
+/// Each kernel lists `linear-schedule` and states its model limits, without a
+/// device.
+#[test]
+#[serial]
+fn capabilities_advertise_the_schedule_feature_and_limits() {
+    ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
+    for (bin, degree, field) in [
+        ("quip-cuda-sa", 0, 63_000),
+        ("quip-cuda-msa", 20, 21_000),
+        ("quip-cuda-gibbs", 0, 127_000),
+    ] {
+        let out = Command::new(profile_bin(bin))
+            .arg("--capabilities")
+            .output()
+            .unwrap();
+        let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            caps["features"]
+                .as_array()
+                .is_some_and(|f| f.iter().any(|f| f == "linear-schedule")),
+            "{bin}: {caps}"
+        );
+        assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
+        assert_eq!(caps["maxLocalFieldMilli"], field, "{bin}: {caps}");
+        assert_eq!(caps["exactResolutionMilli"], 1000, "{bin}: {caps}");
+    }
 }
 
 /// `--capabilities` / `--version` are headless (no CUDA).
