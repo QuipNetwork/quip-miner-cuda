@@ -25,7 +25,8 @@ use crate::topology::{fill_h_j, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use quip_protocol::scoring::energy_milli;
-use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::beta::default_ising_beta_range;
+use quip_solver_core::BetaSchedule;
 use quip_solver_core::SampleError as WireSampleError;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
@@ -121,13 +122,20 @@ fn to_kernel_i32(name: &str, value: usize) -> Result<i32, SampleError> {
     })
 }
 
-/// Low 32 bits of a host seed, for the kernel's `unsigned int` seed argument.
+/// The kernel's `unsigned int` seed argument, mixed from all 64 bits of a
+/// host seed.
 ///
-/// Deliberate narrowing: the device RNG is 32-bit, so the high half has
-/// nowhere to go. This is a width change, not a lost bound.
-#[allow(clippy::cast_possible_truncation)]
-fn seed_low_u32(seed: u64) -> u32 {
-    seed as u32
+/// The device RNG state is 32-bit, so the seed must be narrowed. Taking the
+/// low half made seeds that differ only in their high 32 bits run identical
+/// trajectories. The `SplitMix64` finalizer spreads every input bit over the
+/// high word it returns, so any change to the seed changes the kernel seed,
+/// short of a 2^-32 collision.
+fn kernel_seed(seed: u64) -> u32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    u32::try_from(z >> 32).unwrap_or(u32::MAX)
 }
 
 /// Per-algorithm constants dictated by the verbatim kernel's fixed-size
@@ -215,7 +223,8 @@ fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
     out
 }
 
-/// Geometric beta schedule cast to f32 for kernel upload, plus sweeps-per-beta.
+/// Beta schedule of the kind `schedule` names, cast to f32 for kernel upload,
+/// plus sweeps-per-beta.
 // The kernel's beta buffer is `float`, so the schedule is deliberately narrowed
 // on upload. Betas here run O(0.01)-O(10), far inside f32's range, and every
 // kernel-side use of them is f32 arithmetic regardless.
@@ -225,12 +234,14 @@ pub(crate) fn build_beta_schedule(
     num_sweeps: usize,
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
+    schedule: BetaSchedule,
 ) -> (Vec<f32>, usize) {
     let _span = trace_span!("beta_build", num_sweeps).entered();
     let sweeps_per = sweeps_per_beta.max(1);
     let num_betas = (num_sweeps / sweeps_per).max(1);
     let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
-    let sched: Vec<f32> = geometric_beta_schedule(hot, cold, num_betas)
+    let sched: Vec<f32> = schedule
+        .build(hot, cold, num_betas)
         .iter()
         .map(|&b| b as f32)
         .collect();
@@ -1016,7 +1027,7 @@ impl Drop for SelfFeedingSession<'_> {
 /// Structural + sampling-config identity a self-feeding session is built
 /// for. A job can reuse the running session iff it matches: same graph
 /// (topology, so the CSR/coloring/edge positions stay valid) and same
-/// beta-schedule shape (so the shared beta buffer stays valid). `num_reads`
+/// beta-schedule shape and kind (so the shared beta buffer stays valid). `num_reads`
 /// only needs to fit under the session's established per-slot capacity.
 #[derive(Clone)]
 struct SessionKey {
@@ -1026,6 +1037,7 @@ struct SessionKey {
     num_sweeps: usize,
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
+    schedule: BetaSchedule,
 }
 
 impl SessionKey {
@@ -1037,6 +1049,7 @@ impl SessionKey {
             num_sweeps: job.params.num_sweeps,
             sweeps_per_beta: job.params.sweeps_per_beta.max(1),
             beta_range: job.params.beta_range,
+            schedule: job.params.schedule,
         }
     }
 
@@ -1046,6 +1059,7 @@ impl SessionKey {
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.beta_range == job.params.beta_range
+            && self.schedule == job.params.schedule
             && job.params.num_reads.max(1) <= self.reads_per_nonce
     }
 }
@@ -1118,6 +1132,7 @@ pub fn sample_one(
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        params.schedule,
     );
     let topology = SelfFeedingTopology::build(graph);
 
@@ -1125,7 +1140,7 @@ pub fn sample_one(
         SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
-    let seed = seed_low_u32(params.seed).wrapping_add(1);
+    let seed = kernel_seed(params.seed).wrapping_add(1);
     sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
 
     let deadline = Instant::now() + Duration::from_mins(2);
@@ -1246,6 +1261,7 @@ pub fn bench_one(
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        params.schedule,
     );
     let topology = SelfFeedingTopology::build(graph);
     let mut sess =
@@ -1265,7 +1281,7 @@ pub fn bench_one(
     // --- Timed launch on the compute stream (one model, then kernel returns). ---
     let k0 = timing_event(device)?;
     let k1 = timing_event(device)?;
-    let seed = seed_low_u32(params.seed).wrapping_add(1);
+    let seed = kernel_seed(params.seed).wrapping_add(1);
     k0.record(&sess.stream_compute)?;
     sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
     k1.record(&sess.stream_compute)?;
@@ -1640,8 +1656,8 @@ fn reject_held(slots: &mut [SlotState], out: &Sender<StreamResult>, reason: &Wir
 /// (`Instant::now().elapsed()` is not — it measures the few nanoseconds
 /// between its own two calls), mixed with the seed job's own `params.seed` so
 /// two sessions starting in the same clock tick still diverge.
-/// Multiply-and-take-the-high-word spreads both inputs across the whole `u32`
-/// rather than exposing raw low bits.
+/// [`kernel_seed`] spreads both inputs across the whole `u32` rather than
+/// exposing raw low bits.
 fn session_seed(job_seed: u64) -> u32 {
     let wall_nanos = u64::try_from(
         SystemTime::now()
@@ -1650,7 +1666,7 @@ fn session_seed(job_seed: u64) -> u32 {
             .as_nanos(),
     )
     .unwrap_or(u64::MAX);
-    seed_low_u32((wall_nanos ^ job_seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32)
+    kernel_seed(wall_nanos ^ job_seed)
 }
 
 /// Collect the batch a session launches with: the already-received `seed`
@@ -1971,6 +1987,7 @@ fn run_session(
         seed.params.num_sweeps,
         seed.params.sweeps_per_beta,
         seed.params.beta_range,
+        seed.params.schedule,
     );
     let topology = SelfFeedingTopology::build(&seed.graph);
     let mut feed = Feed {
@@ -2374,6 +2391,37 @@ mod tests {
         assert!(!key.matches(&other));
     }
 
+    /// A linear job must not reuse a geometric session's beta buffer.
+    #[test]
+    fn session_key_rejects_a_different_schedule_kind() {
+        let key = SessionKey::seed(&job(1), 8);
+        let mut other = job(2);
+        other.params.schedule = BetaSchedule::Linear;
+        assert!(!key.matches(&other));
+    }
+
+    #[test]
+    fn a_linear_schedule_is_evenly_spaced() {
+        let (sched, _) =
+            build_beta_schedule(&graph(), 5, 1, Some((1.0, 5.0)), BetaSchedule::Linear);
+        assert_eq!(sched, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// `--solve` seeds that differ only in their high 32 bits used to give the
+    /// same kernel seed, and so the same samples.
+    #[test]
+    fn the_kernel_seed_depends_on_every_bit_of_the_host_seed() {
+        let base = 0x0000_0000_dead_beef_u64;
+        assert_eq!(kernel_seed(base), kernel_seed(base), "deterministic");
+        for bit in 0..64 {
+            assert_ne!(
+                kernel_seed(base),
+                kernel_seed(base ^ (1 << bit)),
+                "flipping bit {bit} must change the kernel seed"
+            );
+        }
+    }
+
     #[test]
     fn session_key_rejects_more_reads_than_the_session_allocated() {
         let key = SessionKey::seed(&job(1), 8);
@@ -2397,7 +2445,13 @@ mod tests {
 
     #[test]
     fn beta_schedule_length_is_sweeps_over_sweeps_per_beta() {
-        let (sched, sweeps_per) = build_beta_schedule(&graph(), 100, 10, Some((0.1, 10.0)));
+        let (sched, sweeps_per) = build_beta_schedule(
+            &graph(),
+            100,
+            10,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+        );
         assert_eq!(sweeps_per, 10);
         assert_eq!(sched.len(), 10);
     }
@@ -2405,7 +2459,8 @@ mod tests {
     #[test]
     fn beta_schedule_floors_sweeps_per_beta_at_one() {
         // A zero would divide by zero; the floor turns it into one beta per sweep.
-        let (sched, sweeps_per) = build_beta_schedule(&graph(), 64, 0, Some((0.1, 10.0)));
+        let (sched, sweeps_per) =
+            build_beta_schedule(&graph(), 64, 0, Some((0.1, 10.0)), BetaSchedule::Geometric);
         assert_eq!(sweeps_per, 1);
         assert_eq!(sched.len(), 64);
     }
@@ -2414,15 +2469,18 @@ mod tests {
     fn beta_schedule_always_has_at_least_one_beta() {
         // Zero sweeps, or fewer sweeps than sweeps_per_beta, must not yield an
         // empty schedule — the kernel would have nothing to anneal against.
-        let (sched, _) = build_beta_schedule(&graph(), 0, 1, Some((0.1, 10.0)));
+        let (sched, _) =
+            build_beta_schedule(&graph(), 0, 1, Some((0.1, 10.0)), BetaSchedule::Geometric);
         assert_eq!(sched.len(), 1);
-        let (sched, _) = build_beta_schedule(&graph(), 4, 64, Some((0.1, 10.0)));
+        let (sched, _) =
+            build_beta_schedule(&graph(), 4, 64, Some((0.1, 10.0)), BetaSchedule::Geometric);
         assert_eq!(sched.len(), 1);
     }
 
     #[test]
     fn beta_schedule_runs_hot_to_cold() {
-        let (sched, _) = build_beta_schedule(&graph(), 40, 10, Some((0.1, 10.0)));
+        let (sched, _) =
+            build_beta_schedule(&graph(), 40, 10, Some((0.1, 10.0)), BetaSchedule::Geometric);
         assert_eq!(sched.len(), 4);
         // Beta rises as temperature falls, so the schedule is increasing.
         for pair in sched.windows(2) {

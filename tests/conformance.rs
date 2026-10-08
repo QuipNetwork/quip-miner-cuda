@@ -6,13 +6,30 @@
 //! Run them on a GPU host: `cargo test -p quip-solver-cuda -- --ignored`.
 
 use quip_solver_conformance::driver::{drive_miner, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER};
-use quip_solver_conformance::solve::drive_solve;
+use quip_solver_conformance::solve::{drive_solve, CaseOutcome};
 use quip_solver_core::quip_protocol::session::PROTOCOL_VERSION;
 use serial_test::serial;
 use std::process::Command;
 
 mod common;
 use common::{ensure_built, profile_bin};
+
+/// Run the `--solve` gate on `bin` and require, beyond overall conformance,
+/// that the linear-schedule case and each named limit case passed rather than
+/// being skipped: the gate skips a case the binary does not advertise.
+async fn assert_passes_solve_gate(bin: &str, limit_cases: &[&str]) {
+    ensure_built(&[bin]);
+    let report = drive_solve(&profile_bin(bin)).await;
+    assert!(report.is_conformant(), "{bin}:\n{}", report.summary());
+    for case in ["linear-schedule"].iter().chain(limit_cases) {
+        assert_eq!(
+            report.outcome(case),
+            Some(&CaseOutcome::Passed),
+            "{bin} {case}:\n{}",
+            report.summary()
+        );
+    }
+}
 
 #[tokio::test]
 #[serial]
@@ -36,10 +53,11 @@ async fn quip_cuda_sa_passes_conformance() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 async fn quip_cuda_sa_passes_solve_conformance() {
-    ensure_built(&["quip-cuda-sa"]);
-    let miner = profile_bin("quip-cuda-sa");
-    let report = drive_solve(&miner).await;
-    assert!(report.is_conformant(), "{}", report.summary());
+    assert_passes_solve_gate(
+        "quip-cuda-sa",
+        &["field-limit-inside", "field-limit-outside"],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -64,10 +82,16 @@ async fn quip_cuda_msa_passes_conformance() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 async fn quip_cuda_msa_passes_solve_conformance() {
-    ensure_built(&["quip-cuda-msa"]);
-    let miner = profile_bin("quip-cuda-msa");
-    let report = drive_solve(&miner).await;
-    assert!(report.is_conformant(), "{}", report.summary());
+    assert_passes_solve_gate(
+        "quip-cuda-msa",
+        &[
+            "degree-limit-inside",
+            "degree-limit-outside",
+            "field-limit-inside",
+            "field-limit-outside",
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -101,10 +125,39 @@ async fn quip_cuda_gibbs_passes_conformance() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 async fn quip_cuda_gibbs_passes_solve_conformance() {
-    ensure_built(&["quip-cuda-gibbs"]);
-    let miner = profile_bin("quip-cuda-gibbs");
-    let report = drive_solve(&miner).await;
-    assert!(report.is_conformant(), "{}", report.summary());
+    assert_passes_solve_gate(
+        "quip-cuda-gibbs",
+        &["field-limit-inside", "field-limit-outside"],
+    )
+    .await;
+}
+
+/// Each kernel lists `linear-schedule` and states its model limits, without a
+/// device.
+#[test]
+#[serial]
+fn capabilities_advertise_the_schedule_feature_and_limits() {
+    ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
+    for (bin, degree, field) in [
+        ("quip-cuda-sa", 0, 63_000),
+        ("quip-cuda-msa", 20, 21_000),
+        ("quip-cuda-gibbs", 0, 127_000),
+    ] {
+        let out = Command::new(profile_bin(bin))
+            .arg("--capabilities")
+            .output()
+            .unwrap();
+        let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            caps["features"]
+                .as_array()
+                .is_some_and(|f| f.iter().any(|f| f == "linear-schedule")),
+            "{bin}: {caps}"
+        );
+        assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
+        assert_eq!(caps["maxLocalFieldMilli"], field, "{bin}: {caps}");
+        assert_eq!(caps["exactResolutionMilli"], 1000, "{bin}: {caps}");
+    }
 }
 
 /// `--capabilities` / `--version` are headless (no CUDA).
