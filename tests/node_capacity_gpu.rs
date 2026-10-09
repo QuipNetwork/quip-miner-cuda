@@ -7,12 +7,12 @@
 //! `docs/superpowers/specs/2026-08-06-configurable-node-capacity-design.md`
 //! for the sweep those numbers come from.
 
-use quip_miner_cuda::capacity::GIBBS_DEFAULT_NODES;
-use quip_miner_cuda::capacity::{msa_max_reads, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
-use quip_miner_cuda::cuda_device::{probe_msa_replica_words, CudaDevice};
-use quip_miner_cuda::sampler::{sample_ising, SampleError};
-use quip_miner_cuda::streaming::max_reads;
-use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
+use quip_solver_cuda::capacity::GIBBS_DEFAULT_NODES;
+use quip_solver_cuda::capacity::{msa_max_reads, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
+use quip_solver_cuda::cuda_device::{probe_msa_replica_words, CudaDevice};
+use quip_solver_cuda::sampler::{sample_ising, SampleError};
+use quip_solver_cuda::streaming::max_reads;
+use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 
 /// Pegasus P16 has 5640 nodes, above both shipped defaults (5000 / 4800).
 /// Both kernels must compile and open there, which is the whole point of the

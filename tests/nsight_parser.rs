@@ -3,10 +3,10 @@
 //! derivation, and folding a parsed report into a [`BenchRecord`] the
 //! `bench run` host path already emitted.
 
-use quip_miner_cuda::bench::{assemble_record, CellConfig, HostSpans};
-use quip_miner_cuda::nsight::{derive_per_sweep, fold_into, parse_ncu_csv, parse_nsys_kern_sum};
-use quip_miner_cuda::schema::{Scope, Source};
-use quip_miner_cuda::streaming::DeviceTimings;
+use quip_solver_cuda::bench::{assemble_record, CellConfig, HostSpans};
+use quip_solver_cuda::nsight::{derive_per_sweep, fold_into, parse_ncu_csv, parse_nsys_kern_sum};
+use quip_solver_cuda::schema::{Scope, Source};
+use quip_solver_cuda::streaming::DeviceTimings;
 
 const KERN_LO: &str = include_str!("fixtures/nsight/kern_sum_lo.csv");
 const KERN_HI: &str = include_str!("fixtures/nsight/kern_sum_hi.csv");
@@ -43,7 +43,7 @@ fn parses_ncu_metrics() {
 
 /// Build a `BenchRecord` the way `bench run`'s host path would, using purely
 /// synthetic (no-GPU) device/host timings.
-fn synthetic_record() -> quip_miner_cuda::schema::BenchRecord {
+fn synthetic_record() -> quip_solver_cuda::schema::BenchRecord {
     let dev = DeviceTimings {
         kernel_ns: 750_000, // pre-fold placeholder; fold_into overwrites this
         upload_ns: 100_000,

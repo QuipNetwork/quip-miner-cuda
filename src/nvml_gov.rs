@@ -106,7 +106,7 @@ impl UtilGovernor {
     /// The ceiling is clamped into `1..=100` on the way in:
     ///
     /// ```
-    /// use quip_miner_cuda::nvml_gov::UtilGovernor;
+    /// use quip_solver_cuda::nvml_gov::UtilGovernor;
     ///
     /// // No GPU answers to this address, so the poll thread exits immediately
     /// // and only the knobs are exercised. A real caller passes
@@ -142,7 +142,7 @@ impl UtilGovernor {
     /// [`start`](Self::start):
     ///
     /// ```
-    /// use quip_miner_cuda::nvml_gov::UtilGovernor;
+    /// use quip_solver_cuda::nvml_gov::UtilGovernor;
     ///
     /// let gov = UtilGovernor::start("00000000:00:00.0", 90, true);
     ///
@@ -164,7 +164,7 @@ impl UtilGovernor {
     /// Current ceiling (CLI value, or the config override once applied).
     ///
     /// ```
-    /// use quip_miner_cuda::nvml_gov::UtilGovernor;
+    /// use quip_solver_cuda::nvml_gov::UtilGovernor;
     ///
     /// let gov = UtilGovernor::start("00000000:00:00.0", 75, false);
     /// assert_eq!(gov.utilization_ceiling(), 75);
@@ -180,7 +180,7 @@ impl UtilGovernor {
     /// Current yielding flag (CLI value, or the config override once applied).
     ///
     /// ```
-    /// use quip_miner_cuda::nvml_gov::UtilGovernor;
+    /// use quip_solver_cuda::nvml_gov::UtilGovernor;
     ///
     /// let gov = UtilGovernor::start("00000000:00:00.0", 75, false);
     /// assert!(!gov.yielding());
@@ -232,7 +232,7 @@ impl UtilGovernor {
     /// With yielding off it is always false, whatever the last sample was:
     ///
     /// ```
-    /// use quip_miner_cuda::nvml_gov::UtilGovernor;
+    /// use quip_solver_cuda::nvml_gov::UtilGovernor;
     ///
     /// let gov = UtilGovernor::start("00000000:00:00.0", 50, false);
     /// assert!(!gov.should_throttle());

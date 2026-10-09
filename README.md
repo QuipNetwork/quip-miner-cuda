@@ -1,4 +1,4 @@
-# quip-miner-cuda
+# quip-solver-cuda
 
 CUDA Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-cuda-sa`), multi-spin coded
@@ -37,7 +37,7 @@ declares the read count it can serve when it starts.
 | `quip-cuda-gibbs` | heat-bath Gibbs |
 
 Prebuilt `amd64` binaries are attached to each
-[Release](https://gitlab.com/quip.network/quip-miner-cuda/-/releases).
+[Release](https://gitlab.com/quip.network/quip-solver-cuda/-/releases).
 
 ## Build
 
@@ -81,7 +81,7 @@ quip-cuda-sa --check          # probe the backend is runnable
 ## Multi-spin kernel (`quip-cuda-msa`)
 
 `kernels/msa.cu` is a CUDA port of the multi-spin coded simulated annealing
-in `quip-miner-cpu`'s `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer,
+in `quip-solver-cpu`'s `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer,
 *Optimised simulated annealing for Ising spin glasses*, Comput. Phys. Commun.
 192, 2015). 64 replicas share one 64-bit word per spin. A job of 128 reads is
 two words. The Metropolis test is an integer comparison against a per-rung
@@ -153,7 +153,7 @@ which refunds their credits at the coordinator, and starts a new session. It
 logs one line:
 
 ```text
-quip-miner-cuda: no slot completed in 612.4s; rebuilding the self-feeding session
+quip-solver-cuda: no slot completed in 612.4s; rebuilding the self-feeding session
 ```
 
 ## Driver time budget

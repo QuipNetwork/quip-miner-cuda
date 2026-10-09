@@ -12,7 +12,7 @@
 //
 // Algorithm: Isakov, Zintchenko, Ronnow, Troyer, "Optimised simulated
 // annealing for Ising spin glasses", Comput. Phys. Commun. 192 (2015), as
-// implemented by quip-miner-cpu's sa_msc.rs. With b_i the bit of spin i and
+// implemented by quip-solver-cpu's sa_msc.rs. With b_i the bit of spin i and
 // c_ij the bit of J_ij, l_ij = c_ij ^ b_i ^ b_j is set on the replicas where
 // the bond is satisfied. Summing the d incident bonds into bit planes gives L
 // per replica, and the Metropolis test is the integer comparison

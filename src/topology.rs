@@ -33,7 +33,7 @@ use quip_solver_core::IsingGraph;
 /// `fill_h_j` surface; the partition fields are `pub(crate)`.
 ///
 /// ```
-/// use quip_miner_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
+/// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
 ///
 /// let graph = IsingGraph::new(
 ///     vec![0.0, 0.0, 0.0, 0.0],
@@ -175,7 +175,7 @@ impl SelfFeedingTopology {
     /// # Examples
     ///
     /// ```
-    /// use quip_miner_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
+    /// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
     ///
     /// let graph = IsingGraph::new(
     ///     vec![1.0, -1.0, 0.0],
@@ -293,7 +293,7 @@ fn quantize_i8(v: f64) -> i8 {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
+/// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
 ///
 /// let graph = IsingGraph::new(
 ///     vec![1.0, -1.0],

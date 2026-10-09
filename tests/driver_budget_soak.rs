@@ -32,11 +32,11 @@
 //! `ADAPT_MIN_READS=256`) against an Advantage2-scale topology. Everything is
 //! overridable so the light-workload regime from QUI-882 can be soaked too.
 
-use quip_miner_cuda::cuda_device::CudaDevice;
-use quip_miner_cuda::nvml_gov::UtilGovernor;
-use quip_miner_cuda::streaming::run_stream;
-use quip_miner_cuda::KernelKind;
 use quip_solver_core::{CancelToken, IsingGraph, SampleParams, StreamJob};
+use quip_solver_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::nvml_gov::UtilGovernor;
+use quip_solver_cuda::streaming::run_stream;
+use quip_solver_cuda::KernelKind;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;

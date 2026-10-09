@@ -37,7 +37,7 @@ const FLAGS_TAG: &str = "ffm";
 /// touching the real process environment (so it is unit-testable).
 ///
 /// Precedence: `QUIP_CUDA_CACHE` (used verbatim) → `XDG_CACHE_HOME` +
-/// `/quip-miner-cuda` → `HOME` + `/.cache/quip-miner-cuda`. Returns `None` when
+/// `/quip-solver-cuda` → `HOME` + `/.cache/quip-solver-cuda`. Returns `None` when
 /// none resolve to a non-empty path.
 fn resolve_cache_dir(
     quip: Option<OsString>,
@@ -51,9 +51,9 @@ fn resolve_cache_dir(
         return Some(dir);
     }
     if let Some(dir) = non_empty(xdg) {
-        return Some(dir.join("quip-miner-cuda"));
+        return Some(dir.join("quip-solver-cuda"));
     }
-    non_empty(home).map(|h| h.join(".cache").join("quip-miner-cuda"))
+    non_empty(home).map(|h| h.join(".cache").join("quip-solver-cuda"))
 }
 
 /// Resolve and create the cache directory, reading the real environment.
@@ -232,11 +232,11 @@ mod tests {
     fn falls_back_to_xdg_then_home() {
         assert_eq!(
             resolve_cache_dir(None, Some("/xdg".into()), Some("/home/user".into())),
-            Some(PathBuf::from("/xdg/quip-miner-cuda")),
+            Some(PathBuf::from("/xdg/quip-solver-cuda")),
         );
         assert_eq!(
             resolve_cache_dir(None, None, Some("/home/user".into())),
-            Some(PathBuf::from("/home/user/.cache/quip-miner-cuda")),
+            Some(PathBuf::from("/home/user/.cache/quip-solver-cuda")),
         );
     }
 
@@ -245,7 +245,7 @@ mod tests {
         // An empty QUIP_CUDA_CACHE is ignored in favour of XDG.
         assert_eq!(
             resolve_cache_dir(Some("".into()), Some("/xdg".into()), None),
-            Some(PathBuf::from("/xdg/quip-miner-cuda")),
+            Some(PathBuf::from("/xdg/quip-solver-cuda")),
         );
         assert_eq!(resolve_cache_dir(None, None, None), None);
     }

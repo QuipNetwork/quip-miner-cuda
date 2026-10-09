@@ -1,14 +1,14 @@
 [package]
-name = "quip-miner-cuda"
+name = "quip-solver-cuda"
 version = "0.3.4-rc3"
 edition = "2021"
 rust-version = "1.97"
 description = "CUDA Ising miners: simulated annealing, multi-spin coded annealing and heat-bath Gibbs (v0.3)"
 license = "AGPL-3.0-or-later"
-repository = "https://gitlab.com/quip.network/quip-miner-cuda"
+repository = "https://gitlab.com/quip.network/quip-solver-cuda"
 
 [lib]
-name = "quip_miner_cuda"
+name = "quip_solver_cuda"
 path = "src/lib.rs"
 
 [[bin]]
@@ -37,7 +37,7 @@ clap = { version = "4", features = ["derive"] }
 # NVRTC 12.9 keeps sm_70/72, which CUDA 13 drops, and reaches the same
 # sm_121 ceiling; CUDA 13 would add only sm_88/sm_110, which we do not
 # need. The runtime image must ship libnvrtc.so.12
-# (docker/Dockerfile.quip-miner-cuda in quip-miner installs cuda-nvrtc-12-9).
+# (docker/Dockerfile.quip-solver-cuda in quip-solver installs cuda-nvrtc-12-9).
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
     "driver",

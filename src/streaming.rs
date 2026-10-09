@@ -87,7 +87,7 @@ const STALL_FACTOR: u32 = 4;
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cuda::streaming::stall_cutoff;
+/// use quip_solver_cuda::streaming::stall_cutoff;
 /// use std::time::Duration;
 ///
 /// // Nothing observed yet, or a fast session: the floor governs.
@@ -187,8 +187,8 @@ fn algo_limits(kernel: KernelKind, msa_replica_words: usize) -> AlgoLimits {
 /// # Examples
 ///
 /// ```
-/// use quip_miner_cuda::streaming::max_reads;
-/// use quip_miner_cuda::KernelKind;
+/// use quip_solver_cuda::streaming::max_reads;
+/// use quip_solver_cuda::KernelKind;
 ///
 /// // SA and Gibbs are held to one 256-thread block's worth of reads and
 /// // ignore the word count; msa gets 64 reads per replica word its device
@@ -1067,9 +1067,9 @@ impl SessionKey {
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_cuda::cuda_device::CudaDevice;
-/// use quip_miner_cuda::streaming::sample_one;
-/// use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
+/// use quip_solver_cuda::cuda_device::CudaDevice;
+/// use quip_solver_cuda::streaming::sample_one;
+/// use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = CudaDevice::open(0)?;
@@ -1395,9 +1395,9 @@ impl SlotState {
 /// # Examples
 ///
 /// ```no_run
-/// use quip_miner_cuda::cuda_device::CudaDevice;
-/// use quip_miner_cuda::streaming::stream_width;
-/// use quip_miner_cuda::KernelKind;
+/// use quip_solver_cuda::cuda_device::CudaDevice;
+/// use quip_solver_cuda::streaming::stream_width;
+/// use quip_solver_cuda::KernelKind;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let device = CudaDevice::open(0)?;
@@ -1821,7 +1821,7 @@ fn pump_session(
                 Ok(()) => {
                     let n = cancel_held(slots, feed.out, feed.cancel);
                     eprintln!(
-                        "quip-miner-cuda: round cancelled; aborted {n} in-flight models and \
+                        "quip-solver-cuda: round cancelled; aborted {n} in-flight models and \
                          rebuilding the self-feeding session"
                     );
                 }
@@ -1831,7 +1831,7 @@ fn pump_session(
                     // Same recovery as an unreadable ctrl mailbox: refund the
                     // held jobs as DeviceBusy and rebuild.
                     eprintln!(
-                        "quip-miner-cuda: abort-on-cancel failed ({e}); rebuilding the \
+                        "quip-solver-cuda: abort-on-cancel failed ({e}); rebuilding the \
                          self-feeding session"
                     );
                     reject_held(slots, feed.out, &WireSampleError::DeviceBusy);
@@ -1880,7 +1880,7 @@ fn pump_session(
             let stalled = last_completion.elapsed();
             if stalled >= stall_cutoff(longest_gap) {
                 eprintln!(
-                    "quip-miner-cuda: no slot completed in {stalled:?}; rebuilding the \
+                    "quip-solver-cuda: no slot completed in {stalled:?}; rebuilding the \
                      self-feeding session"
                 );
                 reject_held(slots, feed.out, &WireSampleError::DeviceBusy);
@@ -1993,7 +1993,7 @@ fn run_session(
     let (cold, halt) = drain_cold_start(&mut feed, seed, width);
     let active_nonces = cold.len();
     eprintln!(
-        "quip-miner-cuda: self-feeding session launching with {active_nonces}/{width} nonces active"
+        "quip-solver-cuda: self-feeding session launching with {active_nonces}/{width} nonces active"
     );
     let mut slots: Vec<SlotState> = (0..width).map(|_| SlotState::default()).collect();
     for (nonce_id, job) in cold.into_iter().enumerate() {
@@ -2057,10 +2057,10 @@ fn run_session(
 ///
 /// ```no_run
 /// use quip_solver_core::{CancelToken, StreamJob, StreamResult};
-/// use quip_miner_cuda::cuda_device::CudaDevice;
-/// use quip_miner_cuda::nvml_gov::UtilGovernor;
-/// use quip_miner_cuda::streaming::run_stream;
-/// use quip_miner_cuda::KernelKind;
+/// use quip_solver_cuda::cuda_device::CudaDevice;
+/// use quip_solver_cuda::nvml_gov::UtilGovernor;
+/// use quip_solver_cuda::streaming::run_stream;
+/// use quip_solver_cuda::KernelKind;
 /// use tokio::sync::mpsc::channel;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
