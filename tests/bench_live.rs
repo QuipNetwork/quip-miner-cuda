@@ -1,13 +1,13 @@
 //! GPU-gated bench-path tests. `#[ignore]` so headless CI reports them
 //! ignored rather than passed ([quip-miner-cuda-gp2] part b). Run on a CUDA
-//! host: `cargo test -p quip-miner-cuda -- --ignored`.
+//! host: `cargo test -p quip-solver-cuda -- --ignored`.
 
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
-use quip_miner_cuda::cuda_device::CudaDevice;
-use quip_miner_cuda::streaming::bench_one;
-use quip_miner_cuda::{IsingGraph, KernelKind, SampleParams};
 use quip_protocol::scoring::energy_milli;
+use quip_solver_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::streaming::bench_one;
+use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serial_test::serial;
 use std::sync::OnceLock;
 

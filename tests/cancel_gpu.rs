@@ -6,14 +6,14 @@
 //! Both tests open device 0 and leave a persistent kernel resident. They are
 //! `serial` so those kernels are not launched together.
 
-use quip_miner_cuda::capacity::MSA_DEFAULT_NODES;
-use quip_miner_cuda::cuda_device::CudaDevice;
-use quip_miner_cuda::nvml_gov::UtilGovernor;
-use quip_miner_cuda::streaming::run_stream;
-use quip_miner_cuda::KernelKind;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, StreamJob, StreamOutcome, StreamResult,
 };
+use quip_solver_cuda::capacity::MSA_DEFAULT_NODES;
+use quip_solver_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::nvml_gov::UtilGovernor;
+use quip_solver_cuda::streaming::run_stream;
+use quip_solver_cuda::KernelKind;
 use serial_test::serial;
 use std::thread;
 use std::time::{Duration, Instant};

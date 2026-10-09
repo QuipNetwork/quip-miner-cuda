@@ -3,9 +3,9 @@
 //! `scope`/`source` serializes to the contract string the isingmark C plan
 //! and Python viz key on. Catches a future rename before it breaks C.
 
-use quip_miner_cuda::bench::{assemble_record, CellConfig, HostSpans};
-use quip_miner_cuda::schema::{BenchRecord, Scope, Source};
-use quip_miner_cuda::streaming::DeviceTimings;
+use quip_solver_cuda::bench::{assemble_record, CellConfig, HostSpans};
+use quip_solver_cuda::schema::{BenchRecord, Scope, Source};
+use quip_solver_cuda::streaming::DeviceTimings;
 
 fn sample_record() -> BenchRecord {
     let dev = DeviceTimings {

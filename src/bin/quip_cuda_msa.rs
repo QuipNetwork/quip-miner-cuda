@@ -6,12 +6,12 @@
 //! `config.toml` with `[cuda.N] binary = "<path>/quip-cuda-msa"`.
 
 use clap::{Parser, Subcommand};
-use quip_miner_cuda::bench::{run_bench, BenchAction};
-use quip_miner_cuda::capacity::{self, advertised_nodes, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
-use quip_miner_cuda::cuda_device::{device_label_mismatch, probe_msa_replica_words, CudaDevice};
-use quip_miner_cuda::nvml_gov::UtilGovernor;
-use quip_miner_cuda::{cuda_msa_identity, CudaSampler, KernelKind};
 use quip_solver_core::{run, CommonArgs, OpenError};
+use quip_solver_cuda::bench::{run_bench, BenchAction};
+use quip_solver_cuda::capacity::{self, advertised_nodes, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
+use quip_solver_cuda::cuda_device::{device_label_mismatch, probe_msa_replica_words, CudaDevice};
+use quip_solver_cuda::nvml_gov::UtilGovernor;
+use quip_solver_cuda::{cuda_msa_identity, CudaSampler, KernelKind};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -134,7 +134,7 @@ mod cli_tests {
     #[test]
     fn max_nodes_defaults_to_the_kernel_floor() {
         let cli = Cli::parse_from(["quip-cuda-msa"]);
-        assert_eq!(cli.max_nodes, quip_miner_cuda::capacity::MSA_DEFAULT_NODES);
+        assert_eq!(cli.max_nodes, quip_solver_cuda::capacity::MSA_DEFAULT_NODES);
     }
 
     #[test]

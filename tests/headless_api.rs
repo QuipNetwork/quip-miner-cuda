@@ -6,15 +6,15 @@
 //! `stream_width` requires a `&CudaDevice` and cannot run headless — deliberately
 //! not covered here. Run GPU tests with `cargo test -- --ignored` on a GPU host.
 
-use quip_miner_cuda::capacity::{
+use quip_solver_core::quip_protocol::session::{algorithm_name, backend_name};
+use quip_solver_cuda::capacity::{
     GIBBS_DEFAULT_NODES, MSA_DEFAULT_NODES, MSA_MAX_READS, MSA_REPLICA_WORDS, SA_DEFAULT_NODES,
 };
-use quip_miner_cuda::streaming::max_reads;
-use quip_miner_cuda::topology::{fill_h_j, SelfFeedingTopology};
-use quip_miner_cuda::{
+use quip_solver_cuda::streaming::max_reads;
+use quip_solver_cuda::topology::{fill_h_j, SelfFeedingTopology};
+use quip_solver_cuda::{
     cuda_gibbs_identity, cuda_msa_identity, cuda_sa_identity, IsingGraph, KernelKind,
 };
-use quip_solver_core::quip_protocol::session::{algorithm_name, backend_name};
 
 /// Read cap advertised by the streaming driver (kernel block size for SA).
 /// msa scales with the replica words its device holds; SA and Gibbs do not.
