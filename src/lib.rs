@@ -37,7 +37,7 @@ use nvml_gov::UtilGovernor;
 use quip_solver_core::config::{config_override, warn_unknown_fields};
 use quip_solver_core::quip_proto::v1::Backend;
 use quip_solver_core::{
-    BackendIdentity, CancelToken, SampleError, Sampler, StreamJob, StreamResult,
+    BackendIdentity, CancelToken, ModelLimits, SampleError, Sampler, StreamJob, StreamResult,
 };
 use std::collections::BTreeMap;
 
@@ -92,6 +92,7 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         // capability names `BackendIdentity::features` documents.
         features: &["streaming", "governor"],
         adapt: CUDA_ADAPT,
+        limits: ModelLimits::UNSTATED,
     }
 }
 
@@ -142,6 +143,7 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
         // Same capability set as `cuda_sa_identity`: streaming + governor.
         features: &["streaming", "governor"],
         adapt: cuda_msa_adapt(max_reads),
+        limits: ModelLimits::UNSTATED,
     }
 }
 
@@ -158,6 +160,7 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
         // Same capability set as `cuda_sa_identity`: streaming + governor.
         features: &["streaming", "governor"],
         adapt: CUDA_ADAPT,
+        limits: ModelLimits::UNSTATED,
     }
 }
 
