@@ -1,11 +1,12 @@
-//! Protocol conformance: spawn SA, multi-spin SA and Gibbs miners against
-//! quip-solver-conformance's driver.
+//! Session and `--solve` conformance: spawn SA, multi-spin SA and Gibbs solvers
+//! against quip-solver-conformance's drivers.
 //!
 //! GPU-backed drive tests are `#[ignore]` so default `cargo test` on headless CI
 //! never confuses "self-skipped" with "passed" ([quip-miner-cuda-gp2] part b).
 //! Run them on a GPU host: `cargo test -p quip-solver-cuda -- --ignored`.
 
 use quip_solver_conformance::driver::{drive_miner, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER};
+use quip_solver_conformance::solve::drive_solve;
 use quip_solver_core::quip_protocol::session::PROTOCOL_VERSION;
 use serial_test::serial;
 use std::process::Command;
@@ -34,6 +35,16 @@ async fn quip_cuda_sa_passes_conformance() {
 #[tokio::test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+async fn quip_cuda_sa_passes_solve_conformance() {
+    ensure_built(&["quip-cuda-sa"]);
+    let miner = profile_bin("quip-cuda-sa");
+    let report = drive_solve(&miner).await;
+    assert!(report.is_conformant(), "{}", report.summary());
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 async fn quip_cuda_msa_passes_conformance() {
     ensure_built(&["quip-cuda-msa"]);
     let miner = profile_bin("quip-cuda-msa");
@@ -46,6 +57,16 @@ async fn quip_cuda_msa_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
+    assert!(report.is_conformant(), "{}", report.summary());
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+async fn quip_cuda_msa_passes_solve_conformance() {
+    ensure_built(&["quip-cuda-msa"]);
+    let miner = profile_bin("quip-cuda-msa");
+    let report = drive_solve(&miner).await;
     assert!(report.is_conformant(), "{}", report.summary());
 }
 
@@ -73,6 +94,16 @@ async fn quip_cuda_gibbs_passes_conformance() {
         CONFIGURED_SWEEPS * GIBBS_SWEEP_MULTIPLIER,
         "driver did not derive the gibbs sweep expectation from the Hello"
     );
+    assert!(report.is_conformant(), "{}", report.summary());
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+async fn quip_cuda_gibbs_passes_solve_conformance() {
+    ensure_built(&["quip-cuda-gibbs"]);
+    let miner = profile_bin("quip-cuda-gibbs");
+    let report = drive_solve(&miner).await;
     assert!(report.is_conformant(), "{}", report.summary());
 }
 
