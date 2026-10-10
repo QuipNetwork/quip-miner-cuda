@@ -961,7 +961,17 @@ impl<'a> SelfFeedingSession<'a> {
         self.wait_exit()
     }
 
+    /// Wait until no queued work can still touch this session's buffers.
+    ///
+    /// Drains `stream_transfer` as well as `stream_compute`. Slot uploads and
+    /// the `EXIT_NOW` writes from [`Self::signal_exit`] are queued there, and
+    /// the two streams are unordered (event tracking is off), so a finished
+    /// kernel says nothing about them. A kernel that has already returned
+    /// makes the compute sync immediate, and `Drop` would then free `d_ctrl`
+    /// while the `EXIT_NOW` copy is still in flight: a device write to freed
+    /// memory, which surfaces as `CUDA_ERROR_LAUNCH_FAILED` on the next call.
     fn wait_exit(&mut self) -> Result<(), SampleError> {
+        self.stream_transfer.synchronize()?;
         if self.launched {
             self.stream_compute.synchronize()?;
             self.launched = false;
