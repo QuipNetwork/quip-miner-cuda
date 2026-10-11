@@ -14,7 +14,7 @@
 //! [`skip_outside_ci`].
 
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
-use quip_solver_cuda::cuda_device::SUPPORTED_ARCHS;
+use quip_solver_cuda::cuda_device::{SA_WIDE_DEFINE, SUPPORTED_ARCHS};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -120,7 +120,7 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
                 quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
                 &[][..],
             ),
-            ("sa-wide", SA_SRC, 512, &["-DQUIP_SA_WIDE"][..]),
+            ("sa-wide", SA_SRC, 512, &[SA_WIDE_DEFINE][..]),
         ] {
             if let Err(e) = compile_and_assemble(name, src, nodes, arch, defines) {
                 failures.push(e);

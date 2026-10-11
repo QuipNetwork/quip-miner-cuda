@@ -22,6 +22,9 @@ pub const LOCAL_MEM_BYTES_PER_THREAD: usize = 512 * 1024;
 /// `streaming::build_algo_state`.
 pub const SA_THREADS_PER_NONCE: usize = 256;
 
+/// Bytes per node per thread of the wide SA `delta_energy` workspace (`int`).
+pub const SA_WIDE_DELTA_BYTES: usize = 4;
+
 /// Fraction of free device memory the capacity derivation will spend, as
 /// numerator over denominator.
 ///
@@ -109,6 +112,38 @@ pub fn sa_budget(limits: &DeviceLimits) -> usize {
     // 9 frame bytes per 8 nodes, inverted against the per-thread cap.
     let by_local_cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
     by_memory.min(by_local_cap)
+}
+
+/// Device memory the wide SA path consumes at `nodes`: the same local frame as
+/// the int8 build (both compile at `QUIP_MAX_NODES`), an i32 delta workspace,
+/// and the `-ln(u)` table.
+#[must_use]
+pub fn sa_wide_working_set_bytes(nodes: usize, limits: &DeviceLimits) -> usize {
+    let local = sa_frame_bytes(nodes)
+        .saturating_mul(limits.sm_count)
+        .saturating_mul(limits.threads_per_sm);
+    let workspace = nodes
+        .saturating_mul(SA_WIDE_DELTA_BYTES)
+        .saturating_mul(limits.sm_count)
+        .saturating_mul(SA_THREADS_PER_NONCE);
+    let table = crate::accept_table::NEGLOG_LEN * std::mem::size_of::<i64>();
+    local.saturating_add(workspace).saturating_add(table)
+}
+
+/// Largest node count whose wide SA working set fits this device, at most
+/// [`sa_budget`].
+#[must_use]
+pub fn sa_wide_budget(limits: &DeviceLimits) -> usize {
+    let per_node = limits
+        .sm_count
+        .saturating_mul(
+            limits.threads_per_sm.saturating_mul(9) / 8
+                + SA_THREADS_PER_NONCE * SA_WIDE_DELTA_BYTES,
+        )
+        .max(1);
+    let table = crate::accept_table::NEGLOG_LEN * std::mem::size_of::<i64>();
+    let by_memory = limits.usable_bytes().saturating_sub(table) / per_node;
+    by_memory.min(sa_budget(limits))
 }
 
 /// Shipped `shared_state` size in `kernels/gibbs.cu`, and the floor.
@@ -334,6 +369,24 @@ pub fn resolve(
 mod tests {
     use super::*;
     use crate::kernel::KernelKind;
+
+    #[test]
+    fn wide_budget_is_below_the_int8_budget() {
+        let limits = DeviceLimits {
+            shared_bytes_per_block: 48 * 1024,
+            shared_bytes_per_block_optin: 99 * 1024,
+            free_bytes: 16 << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        };
+        let wide = sa_wide_budget(&limits);
+        assert!(wide > 0 && wide <= sa_budget(&limits));
+        assert!(sa_wide_working_set_bytes(wide, &limits) <= limits.usable_bytes());
+        assert!(
+            sa_wide_working_set_bytes(wide + 1, &limits) > limits.usable_bytes()
+                || wide == sa_budget(&limits)
+        );
+    }
 
     /// A4000 reports 49152 bytes of shared memory per block. `s_chunk` and
     /// `s_arrival` take 8 of them, so 49144 nodes is the Gibbs ceiling.
