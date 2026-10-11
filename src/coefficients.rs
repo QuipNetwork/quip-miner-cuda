@@ -26,9 +26,9 @@ const INT8_MAX_COEF: i64 = 127;
 /// `4 * field <= i32::MAX` keeps every intermediate in `int`.
 pub const WIDE_MAX_FIELD: i64 = 536_870_911;
 
-/// Tolerance on `v * 1000` being an integer. An `i32` milli value divided by
-/// 1000 and multiplied back is off by at most one ulp of 2^31, about 4.8e-7.
-const MILLI_TOLERANCE: f64 = 1e-6;
+/// Relative bound on the rounding error of `milli / 1000 * 1000`, scaled by
+/// the rounded milli magnitude with a floor of one.
+const MILLI_TOLERANCE: f64 = 4.0 * f64::EPSILON;
 
 /// Which compiled kernel runs the job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -66,7 +66,10 @@ impl CoefficientPlan {
 pub fn to_milli(v: f64) -> Option<i64> {
     let x = v * 1000.0;
     let m = x.round();
-    if !m.is_finite() || (x - m).abs() > MILLI_TOLERANCE || m.abs() > f64::from(i32::MAX) {
+    if !m.is_finite()
+        || (x - m).abs() > MILLI_TOLERANCE * m.abs().max(1.0)
+        || m.abs() > f64::from(i32::MAX)
+    {
         return None;
     }
     #[allow(clippy::cast_possible_truncation)] // checked against i32::MAX above
@@ -355,6 +358,8 @@ mod tests {
             f64::NEG_INFINITY,
             0.0005,
             1e-7,
+            1e-10,
+            1.000_000_000_5,
             -2_147_483.648,
         ] {
             let g = graph(vec![bad, 0.0], vec![1.0], vec![(0, 1)]);
@@ -362,6 +367,16 @@ mod tests {
                 assert!(plan(kind, &g, BIG_WIDE).is_err(), "{kind:?} accepted {bad}");
             }
         }
+    }
+
+    #[test]
+    fn to_milli_refuses_tiny_off_grid_values() {
+        assert_eq!(to_milli(1e-10), None);
+    }
+
+    #[test]
+    fn to_milli_refuses_off_grid_values_near_one() {
+        assert_eq!(to_milli(1.000_000_000_5), None);
     }
 
     #[test]
