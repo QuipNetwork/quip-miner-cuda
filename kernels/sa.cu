@@ -302,7 +302,7 @@ __global__ void cuda_sa_self_feeding(
                     const int j =
                         __ldg(&csr_col_ind[p]);
                     if (j > i) {
-                        const signed char Jij =
+                        const coef_t Jij =
                             __ldg(&my_J[p]);
                         const signed char spin_j =
                             unpacked_state[j];
