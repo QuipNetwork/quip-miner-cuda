@@ -181,3 +181,112 @@ fn stream_separates_one_x_and_thousand_x_schedules() {
     driver.join().expect("stream driver exits");
     assert_eq!(seen, [true, true], "both scales must produce a result");
 }
+
+/// `K_n` with J in {-1, +1} from a fixed pattern and h = 0.
+fn complete_pm1(n: usize) -> IsingGraph {
+    let mut edges = Vec::new();
+    for u in 0..n {
+        for v in (u + 1)..n {
+            edges.push((u, v));
+        }
+    }
+    let j = (0..edges.len())
+        .map(|k| {
+            if (k * 2_654_435_761) >> 7 & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            }
+        })
+        .collect();
+    IsingGraph::new(vec![0.0; n], j, edges)
+}
+
+/// Best energy from single-spin descent out of 32 deterministic starts, in milli.
+fn descent_reference(g: &IsingGraph) -> i64 {
+    let n = g.h.len();
+    (0..32)
+        .map(|s| {
+            let mut spins: Vec<i8> = (0..n)
+                .map(|i| if (i * 31 + s * 17) % 3 == 0 { 1 } else { -1 })
+                .collect();
+            let mut energy = energy_milli(&spins, &g.h, &g.j, &g.edges);
+            loop {
+                let mut improved = false;
+                for i in 0..n {
+                    spins[i] = -spins[i];
+                    let flipped = energy_milli(&spins, &g.h, &g.j, &g.edges);
+                    if flipped < energy {
+                        energy = flipped;
+                        improved = true;
+                    } else {
+                        spins[i] = -spins[i];
+                    }
+                }
+                if !improved {
+                    return energy;
+                }
+            }
+        })
+        .min()
+        .unwrap()
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn complete_graphs_solve_on_both_paths() {
+    // 16 and 64 run int8, 65 and 200 run wide (see coefficients::tests).
+    for n in [16, 64, 65, 200] {
+        let g = complete_pm1(n);
+        let reads =
+            sample_ising(device(KernelKind::Sa), &g, &params(), KernelKind::Sa).expect("solves");
+        for r in &reads {
+            assert_eq!(r.energy_milli, energy_milli(&r.spins, &g.h, &g.j, &g.edges));
+        }
+        let best = reads.iter().map(|r| r.energy_milli).min().unwrap();
+        assert!(
+            best <= descent_reference(&g),
+            "K_{n}: {best} worse than descent"
+        );
+        if n <= 16 {
+            assert_eq!(best, brute_force_min(&g));
+        }
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn large_and_wide_range_coefficients_solve_or_refuse() {
+    // Wide range on the milli step: 0.001 next to 100000 units.
+    let g = IsingGraph::new(
+        vec![0.001, -100_000.0, 0.0, 3.5],
+        vec![1.25, -0.5, 7.0, 0.001],
+        vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+    );
+    assert_finds_ground_state(KernelKind::Sa, &g);
+    // Above the wide bound at scale 1: refused.
+    let over = IsingGraph::new(vec![536_870.912, 0.0], vec![0.001], vec![(0, 1)]);
+    let err = sample_ising(device(KernelKind::Sa), &over, &params(), KernelKind::Sa).unwrap_err();
+    assert!(matches!(err, SampleError::Unsupported(_)));
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn dense_quarter_unit_qubo_on_the_wide_path() {
+    // K_12, quarter units up to ±2: field above 63 scale units, so wide.
+    let n = 12;
+    let vals = [-2.0, -1.25, -0.5, 0.25, 1.0, 1.75];
+    let mut edges = Vec::new();
+    for u in 0..n {
+        for v in (u + 1)..n {
+            edges.push((u, v));
+        }
+    }
+    let j = (0..edges.len()).map(|k| vals[(k * 7 + 2) % 6]).collect();
+    let h = (0..n).map(|i| vals[(i * 5 + 1) % 6]).collect();
+    let g = IsingGraph::new(h, j, edges);
+    assert_finds_ground_state(KernelKind::Sa, &g);
+}

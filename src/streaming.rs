@@ -15,8 +15,9 @@
 //! (bounded wait), and launches with however many nonces that filled — still
 //! correct, just not guaranteed to hit full width on a very short run.
 
+use crate::accept_table::{neglog_table, wide_rungs};
 use crate::capacity;
-use crate::coefficients::{self, CoefficientPlan};
+use crate::coefficients::{self, CoefficientPath, CoefficientPlan};
 use crate::cuda_device::CudaDevice;
 use crate::driver_budget::{Bucket, DriverBudget};
 use crate::kernel::KernelKind;
@@ -333,8 +334,7 @@ struct SelfFeedingSession<'a> {
 
     d_row_ptr: CudaSlice<i32>,
     d_col_ind: CudaSlice<i32>,
-    d_j: CudaSlice<i8>,
-    d_h: CudaSlice<i8>,
+    coefs: SlotCoefficients,
     d_samples: CudaSlice<i8>,
     d_energies: CudaSlice<i32>,
     d_ctrl: CudaSlice<i32>,
@@ -342,11 +342,23 @@ struct SelfFeedingSession<'a> {
 
     algo_state: AlgoState,
 
-    // Host staging, reused across uploads to avoid a realloc per model.
-    stage_j: Vec<i8>,
-    stage_h: Vec<i8>,
-
     launched: bool,
+}
+
+/// Slot buffers and reusable host staging, selected by coefficient width.
+enum SlotCoefficients {
+    Int8 {
+        d_j: CudaSlice<i8>,
+        d_h: CudaSlice<i8>,
+        stage_j: Vec<i8>,
+        stage_h: Vec<i8>,
+    },
+    Wide {
+        d_j: CudaSlice<i32>,
+        d_h: CudaSlice<i32>,
+        stage_j: Vec<i32>,
+        stage_h: Vec<i32>,
+    },
 }
 
 /// The session's sizes in the kernel's `int` ABI, converted once in `build`
@@ -377,6 +389,12 @@ enum AlgoState {
     },
     Sa {
         d_delta_energy: CudaSlice<i8>,
+    },
+    SaWide {
+        d_delta_energy: CudaSlice<i32>,
+        d_beta_fixed: CudaSlice<i64>,
+        d_delta_cut: CudaSlice<i32>,
+        d_neglog: CudaSlice<i64>,
     },
     Gibbs {
         d_block_starts: CudaSlice<i32>,
@@ -464,6 +482,22 @@ fn build_msa_state(
     })
 }
 
+/// Allocate the wide SA workspace and its fixed-point acceptance buffers.
+fn build_sa_wide_state(
+    stream: &Arc<CudaStream>,
+    n: usize,
+    num_nonces: usize,
+    max_num_betas: usize,
+) -> Result<AlgoState, SampleError> {
+    let total_threads = num_nonces * 256;
+    Ok(AlgoState::SaWide {
+        d_delta_energy: stream.alloc_zeros::<i32>(total_threads * n.max(1))?,
+        d_beta_fixed: stream.alloc_zeros::<i64>(max_num_betas.max(1))?,
+        d_delta_cut: stream.alloc_zeros::<i32>(max_num_betas.max(1))?,
+        d_neglog: stream.clone_htod(&neglog_table())?,
+    })
+}
+
 /// Allocate the algorithm-specific device buffers for `num_nonces` nonces.
 ///
 /// The Gibbs arm tiles the host-side coloring once per nonce. Every array
@@ -544,6 +578,15 @@ impl<'a> SelfFeedingSession<'a> {
                 limit: device.max_nodes,
             });
         }
+        if kernel == KernelKind::Sa
+            && plan.path == CoefficientPath::Wide
+            && n > device.sa_wide_max_nodes
+        {
+            return Err(SampleError::GraphTooLarge {
+                n,
+                limit: device.sa_wide_max_nodes,
+            });
+        }
         let nnz_alloc = topology.nnz.max(1);
         let max_packed_size = n.div_ceil(8).max(1);
         let total_slots = num_nonces * usize::from(SLOTS_PER_NONCE);
@@ -572,8 +615,20 @@ impl<'a> SelfFeedingSession<'a> {
         let d_row_ptr = stream_compute.clone_htod(&row_ptr)?;
         let d_col_ind = stream_compute.clone_htod(&col_ind)?;
 
-        let d_j = stream_compute.alloc_zeros::<i8>(total_slots * nnz_alloc)?;
-        let d_h = stream_compute.alloc_zeros::<i8>(total_slots * n.max(1))?;
+        let coefs = match plan.path {
+            CoefficientPath::Int8 => SlotCoefficients::Int8 {
+                d_j: stream_compute.alloc_zeros::<i8>(total_slots * nnz_alloc)?,
+                d_h: stream_compute.alloc_zeros::<i8>(total_slots * n.max(1))?,
+                stage_j: vec![0i8; nnz_alloc],
+                stage_h: vec![0i8; n.max(1)],
+            },
+            CoefficientPath::Wide => SlotCoefficients::Wide {
+                d_j: stream_compute.alloc_zeros::<i32>(total_slots * nnz_alloc)?,
+                d_h: stream_compute.alloc_zeros::<i32>(total_slots * n.max(1))?,
+                stage_j: vec![0i32; nnz_alloc],
+                stage_h: vec![0i32; n.max(1)],
+            },
+        };
         let d_samples =
             stream_compute.alloc_zeros::<i8>(total_slots * reads_per_nonce * max_packed_size)?;
         let d_energies =
@@ -581,14 +636,18 @@ impl<'a> SelfFeedingSession<'a> {
         let d_ctrl = stream_compute.alloc_zeros::<i32>(num_nonces * CTRL_STRIDE)?;
         let d_beta = stream_compute.alloc_zeros::<f32>(max_num_betas.max(1))?;
 
-        let algo_state = build_algo_state(
-            device,
-            &stream_compute,
-            kernel,
-            &topology,
-            num_nonces,
-            reads_per_nonce,
-        )?;
+        let algo_state = if kernel == KernelKind::Sa && plan.path == CoefficientPath::Wide {
+            build_sa_wide_state(&stream_compute, n, num_nonces, max_num_betas)?
+        } else {
+            build_algo_state(
+                device,
+                &stream_compute,
+                kernel,
+                &topology,
+                num_nonces,
+                reads_per_nonce,
+            )?
+        };
 
         // Every device buffer above is zero-initialized by an `alloc_zeros`
         // memset enqueued on `stream_compute`. Per-slot `h`/`J`/ctrl uploads
@@ -620,15 +679,12 @@ impl<'a> SelfFeedingSession<'a> {
             stream_transfer,
             d_row_ptr,
             d_col_ind,
-            d_j,
-            d_h,
+            coefs,
             d_samples,
             d_energies,
             d_ctrl,
             d_beta,
             algo_state,
-            stage_j: vec![0i8; nnz_alloc],
-            stage_h: vec![0i8; n.max(1)],
             launched: false,
         })
     }
@@ -640,6 +696,18 @@ impl<'a> SelfFeedingSession<'a> {
         }
         self.stream_transfer
             .memcpy_htod(sched, &mut self.d_beta.slice_mut(0..sched.len()))?;
+        if let AlgoState::SaWide {
+            d_beta_fixed,
+            d_delta_cut,
+            ..
+        } = &mut self.algo_state
+        {
+            let (beta_fixed, delta_cut) = wide_rungs(sched);
+            self.stream_transfer
+                .memcpy_htod(&beta_fixed, &mut d_beta_fixed.slice_mut(0..sched.len()))?;
+            self.stream_transfer
+                .memcpy_htod(&delta_cut, &mut d_delta_cut.slice_mut(0..sched.len()))?;
+        }
         Ok(())
     }
 
@@ -654,7 +722,6 @@ impl<'a> SelfFeedingSession<'a> {
     ) -> Result<(), SampleError> {
         let _span = trace_span!("upload", kind = "slot", nonce_id, slot_id).entered();
         let slot_idx = nonce_id * usize::from(SLOTS_PER_NONCE) + slot_id;
-        let nnz = self.topology.nnz;
         let n = self.topology.n;
 
         // `stage_h` is sized from `self.topology.n`, but the `h` produced
@@ -670,25 +737,54 @@ impl<'a> SelfFeedingSession<'a> {
             )));
         }
 
-        self.stage_j[..nnz.max(1)].fill(0);
-        self.stage_h[..n.max(1)].fill(0);
-        let (j, h) = fill_coefficients::<i8>(&self.topology, graph, self.plan.scale_milli)
-            .map_err(SampleError::Unsupported)?;
-        self.stage_j[..j.len()].copy_from_slice(&j);
-        self.stage_h[..h.len()].copy_from_slice(&h);
-
         let nnz_alloc = self.topology.nnz.max(1);
         let n_alloc = self.topology.n.max(1);
         let j_start = slot_idx * nnz_alloc;
         let h_start = slot_idx * n_alloc;
-        self.stream_transfer.memcpy_htod(
-            &self.stage_j[..nnz_alloc],
-            &mut self.d_j.slice_mut(j_start..j_start + nnz_alloc),
-        )?;
-        self.stream_transfer.memcpy_htod(
-            &self.stage_h[..n_alloc],
-            &mut self.d_h.slice_mut(h_start..h_start + n_alloc),
-        )?;
+        match &mut self.coefs {
+            SlotCoefficients::Int8 {
+                d_j,
+                d_h,
+                stage_j,
+                stage_h,
+            } => {
+                stage_j.fill(0);
+                stage_h.fill(0);
+                let (j, h) = fill_coefficients::<i8>(&self.topology, graph, self.plan.scale_milli)
+                    .map_err(SampleError::Unsupported)?;
+                stage_j[..j.len()].copy_from_slice(&j);
+                stage_h[..h.len()].copy_from_slice(&h);
+                self.stream_transfer.memcpy_htod(
+                    &stage_j[..nnz_alloc],
+                    &mut d_j.slice_mut(j_start..j_start + nnz_alloc),
+                )?;
+                self.stream_transfer.memcpy_htod(
+                    &stage_h[..n_alloc],
+                    &mut d_h.slice_mut(h_start..h_start + n_alloc),
+                )?;
+            }
+            SlotCoefficients::Wide {
+                d_j,
+                d_h,
+                stage_j,
+                stage_h,
+            } => {
+                stage_j.fill(0);
+                stage_h.fill(0);
+                let (j, h) = fill_coefficients::<i32>(&self.topology, graph, self.plan.scale_milli)
+                    .map_err(SampleError::Unsupported)?;
+                stage_j[..j.len()].copy_from_slice(&j);
+                stage_h[..h.len()].copy_from_slice(&h);
+                self.stream_transfer.memcpy_htod(
+                    &stage_j[..nnz_alloc],
+                    &mut d_j.slice_mut(j_start..j_start + nnz_alloc),
+                )?;
+                self.stream_transfer.memcpy_htod(
+                    &stage_h[..n_alloc],
+                    &mut d_h.slice_mut(h_start..h_start + n_alloc),
+                )?;
+            }
+        }
 
         // Zero this slot's output region so a stale prior model's samples
         // can't leak through if the kernel writes fewer bytes than expected.
@@ -753,6 +849,11 @@ impl<'a> SelfFeedingSession<'a> {
         else {
             return Err(SampleError::Driver("launch_msa without msa state".into()));
         };
+        let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
+            return Err(SampleError::Driver(
+                "launch_msa without int8 coefficients".into(),
+            ));
+        };
         let dims = &self.dims;
         let mut b = self.stream_compute.launch_builder(&self.device.msa);
         b.arg(&self.d_row_ptr);
@@ -761,8 +862,8 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(d_color_counts);
         b.arg(d_color_nodes);
         b.arg(num_colors);
-        b.arg(&self.d_j);
-        b.arg(&self.d_h);
+        b.arg(d_j);
+        b.arg(d_h);
         b.arg(&self.d_samples);
         b.arg(&self.d_energies);
         b.arg(&self.d_beta);
@@ -780,6 +881,66 @@ impl<'a> SelfFeedingSession<'a> {
         // `kernels/msa.cu` in order, type and count; every buffer is sized by
         // `build` from the same `dims` the kernel receives, and the colour
         // buffers are bounded by `num_colors` / `dims.n`.
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    fn launch_sa_wide(
+        &self,
+        cfg: LaunchConfig,
+        num_betas: i32,
+        sweeps_per_beta: i32,
+        seed: u32,
+    ) -> Result<(), SampleError> {
+        let AlgoState::SaWide {
+            d_delta_energy,
+            d_beta_fixed,
+            d_delta_cut,
+            d_neglog,
+        } = &self.algo_state
+        else {
+            return Err(SampleError::Driver(
+                "launch_sa_wide without wide SA state".into(),
+            ));
+        };
+        let dims = &self.dims;
+        let SlotCoefficients::Wide { d_j, d_h, .. } = &self.coefs else {
+            return Err(SampleError::Driver(
+                "launch_sa_wide without wide coefficients".into(),
+            ));
+        };
+        let mut b = self.stream_compute.launch_builder(&self.device.sa_wide);
+        b.arg(&self.d_row_ptr);
+        b.arg(&self.d_col_ind);
+        b.arg(d_j);
+        b.arg(d_h);
+        b.arg(&self.d_samples);
+        b.arg(&self.d_energies);
+        b.arg(&self.d_beta);
+        b.arg(&num_betas);
+        b.arg(&sweeps_per_beta);
+        b.arg(&self.d_ctrl);
+        b.arg(&dims.num_nonces);
+        b.arg(&dims.reads_per_nonce);
+        b.arg(&dims.n);
+        b.arg(&dims.nnz);
+        b.arg(&dims.max_packed);
+        b.arg(&seed);
+        b.arg(d_delta_energy);
+        b.arg(&dims.n);
+        b.arg(d_beta_fixed);
+        b.arg(d_delta_cut);
+        b.arg(d_neglog);
+        // SAFETY: the 21 `b.arg` calls mirror `cuda_sa_self_feeding`
+        // in `kernels/sa.cu` built with `QUIP_SA_WIDE`, in order,
+        // type and count. J, h and delta use i32. The slot buffers
+        // and workspace are sized from these same `dims`, as in the
+        // SA arm. The three trailing buffers hold `num_betas`,
+        // `num_betas` and `NEGLOG_LEN` entries. `build` rejects
+        // n above both device.max_nodes and device.sa_wide_max_nodes,
+        // bounding the compiled frame and wide workspace. `Drop`
+        // signals exit and synchronizes `stream_compute` before
+        // any buffer is freed.
         unsafe { b.launch(cfg) }?;
         Ok(())
     }
@@ -805,7 +966,7 @@ impl<'a> SelfFeedingSession<'a> {
             block_dim: (limits.threads_per_block, 1, 1),
             shared_mem_bytes: match &self.algo_state {
                 AlgoState::Msa { shared_bytes, .. } => *shared_bytes,
-                AlgoState::Sa { .. } | AlgoState::Gibbs { .. } => 0,
+                AlgoState::Sa { .. } | AlgoState::SaWide { .. } | AlgoState::Gibbs { .. } => 0,
             },
         };
         let num_betas = to_kernel_i32("num_betas", num_betas)?;
@@ -841,11 +1002,16 @@ impl<'a> SelfFeedingSession<'a> {
                 self.launch_msa(cfg, num_betas, sweeps_per_beta, seed)?;
             }
             AlgoState::Sa { d_delta_energy } => {
+                let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
+                    return Err(SampleError::Driver(
+                        "launch_sa without int8 coefficients".into(),
+                    ));
+                };
                 let mut b = self.stream_compute.launch_builder(&self.device.sa);
                 b.arg(&self.d_row_ptr);
                 b.arg(&self.d_col_ind);
-                b.arg(&self.d_j);
-                b.arg(&self.d_h);
+                b.arg(d_j);
+                b.arg(d_h);
                 b.arg(&self.d_samples);
                 b.arg(&self.d_energies);
                 b.arg(&self.d_beta);
@@ -877,6 +1043,9 @@ impl<'a> SelfFeedingSession<'a> {
                 // `stream_compute` before any `CudaSlice` field is freed.
                 unsafe { b.launch(cfg) }?;
             }
+            AlgoState::SaWide { .. } => {
+                self.launch_sa_wide(cfg, num_betas, sweeps_per_beta, seed)?;
+            }
             AlgoState::Gibbs {
                 d_block_starts,
                 d_block_counts,
@@ -885,6 +1054,11 @@ impl<'a> SelfFeedingSession<'a> {
                 chunks_per_model,
                 reads_per_chunk,
             } => {
+                let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
+                    return Err(SampleError::Driver(
+                        "launch_gibbs without int8 coefficients".into(),
+                    ));
+                };
                 let mut b = self.stream_compute.launch_builder(&self.device.gibbs);
                 b.arg(&self.d_row_ptr);
                 b.arg(&self.d_col_ind);
@@ -895,8 +1069,8 @@ impl<'a> SelfFeedingSession<'a> {
                 b.arg(&self.d_beta);
                 b.arg(&num_betas);
                 b.arg(&sweeps_per_beta);
-                b.arg(&self.d_j);
-                b.arg(&self.d_h);
+                b.arg(d_j);
+                b.arg(d_h);
                 b.arg(&self.d_samples);
                 b.arg(&self.d_energies);
                 b.arg(&self.d_ctrl);
@@ -1000,7 +1174,8 @@ impl Drop for SelfFeedingSession<'_> {
         // ignorable. If we return without establishing that the kernel has
         // stopped, the `CudaSlice` fields are freed immediately afterwards
         // and a still-running persistent kernel keeps writing into
-        // `d_samples`/`d_ctrl`/`d_energies` — a use-after-free on the device,
+        // `d_samples`/`d_ctrl`/`d_energies`/the int8 or wide delta workspace
+        // — a use-after-free on the device,
         // the exact scenario `CudaDevice::open`'s safety note rules out.
         // Leaking device memory is sound and aborting is sound; freeing
         // memory that is still in use is not. So escalate instead of giving
@@ -1090,9 +1265,12 @@ impl SessionKey {
     }
 }
 
-/// Node budget of the wide SA path on this device. Zero: no wide path yet.
-pub(crate) fn wide_max_nodes(_device: &CudaDevice, _kernel: KernelKind) -> usize {
-    0
+/// Node budget of the wide path on this device. Zero for kernels without it.
+pub(crate) fn wide_max_nodes(device: &CudaDevice, kernel: KernelKind) -> usize {
+    match kernel {
+        KernelKind::Sa => device.sa_wide_max_nodes,
+        KernelKind::Msa | KernelKind::Gibbs => 0,
+    }
 }
 
 /// Run one job through a dedicated single-nonce self-feeding session:

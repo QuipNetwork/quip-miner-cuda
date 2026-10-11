@@ -94,12 +94,15 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         // Streaming, the NVML governor, and exact coefficient uploads.
         features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
         adapt: CUDA_ADAPT,
-        // SA has no degree bound (`Some(0)` is unbounded) and represents every whole
-        // milli value exactly. The field bound arrives with the wide path (Task 7).
-        // Until then, a field over the int8 limit is refused per job.
+        // SA has no degree bound (`Some(0)` is unbounded).
         limits: ModelLimits {
             max_degree: Some(0),
-            max_local_field_milli: None,
+            // The wide path holds every whole milli value up to a local field of
+            // i32::MAX / 4 milli (at scale 1, the worst case). Above that, the SDK
+            // refuses before the job reaches the device.
+            max_local_field_milli: Some(
+                u32::try_from(coefficients::WIDE_MAX_FIELD).unwrap_or(u32::MAX),
+            ),
             exact_resolution_milli: Some(1),
         },
     }
