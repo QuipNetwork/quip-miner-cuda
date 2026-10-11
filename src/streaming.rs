@@ -25,7 +25,7 @@ use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
 use crate::topology::{fill_coefficients, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
-use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg};
 use quip_protocol::scoring::energy_milli;
 use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
 use quip_solver_core::SampleError as WireSampleError;
@@ -359,6 +359,40 @@ enum SlotCoefficients {
         stage_j: Vec<i32>,
         stage_h: Vec<i32>,
     },
+}
+
+/// Stage and upload one slot's coefficients at the selected element width.
+fn upload_slot_coefficients<T>(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+    scale_milli: u64,
+    stream: &Arc<CudaStream>,
+    slot_idx: usize,
+    (d_j, d_h): (&mut CudaSlice<T>, &mut CudaSlice<T>),
+    (stage_j, stage_h): (&mut [T], &mut [T]),
+) -> Result<(), SampleError>
+where
+    T: DeviceRepr + Copy + Default + TryFrom<i64>,
+{
+    let nnz_alloc = topology.nnz.max(1);
+    let n_alloc = topology.n.max(1);
+    let j_start = slot_idx * nnz_alloc;
+    let h_start = slot_idx * n_alloc;
+    stage_j.fill(T::default());
+    stage_h.fill(T::default());
+    let (j, h) =
+        fill_coefficients::<T>(topology, graph, scale_milli).map_err(SampleError::Unsupported)?;
+    stage_j[..j.len()].copy_from_slice(&j);
+    stage_h[..h.len()].copy_from_slice(&h);
+    stream.memcpy_htod(
+        &stage_j[..nnz_alloc],
+        &mut d_j.slice_mut(j_start..j_start + nnz_alloc),
+    )?;
+    stream.memcpy_htod(
+        &stage_h[..n_alloc],
+        &mut d_h.slice_mut(h_start..h_start + n_alloc),
+    )?;
+    Ok(())
 }
 
 /// The session's sizes in the kernel's `int` ABI, converted once in `build`
@@ -737,53 +771,35 @@ impl<'a> SelfFeedingSession<'a> {
             )));
         }
 
-        let nnz_alloc = self.topology.nnz.max(1);
-        let n_alloc = self.topology.n.max(1);
-        let j_start = slot_idx * nnz_alloc;
-        let h_start = slot_idx * n_alloc;
         match &mut self.coefs {
             SlotCoefficients::Int8 {
                 d_j,
                 d_h,
                 stage_j,
                 stage_h,
-            } => {
-                stage_j.fill(0);
-                stage_h.fill(0);
-                let (j, h) = fill_coefficients::<i8>(&self.topology, graph, self.plan.scale_milli)
-                    .map_err(SampleError::Unsupported)?;
-                stage_j[..j.len()].copy_from_slice(&j);
-                stage_h[..h.len()].copy_from_slice(&h);
-                self.stream_transfer.memcpy_htod(
-                    &stage_j[..nnz_alloc],
-                    &mut d_j.slice_mut(j_start..j_start + nnz_alloc),
-                )?;
-                self.stream_transfer.memcpy_htod(
-                    &stage_h[..n_alloc],
-                    &mut d_h.slice_mut(h_start..h_start + n_alloc),
-                )?;
-            }
+            } => upload_slot_coefficients(
+                &self.topology,
+                graph,
+                self.plan.scale_milli,
+                &self.stream_transfer,
+                slot_idx,
+                (d_j, d_h),
+                (stage_j, stage_h),
+            )?,
             SlotCoefficients::Wide {
                 d_j,
                 d_h,
                 stage_j,
                 stage_h,
-            } => {
-                stage_j.fill(0);
-                stage_h.fill(0);
-                let (j, h) = fill_coefficients::<i32>(&self.topology, graph, self.plan.scale_milli)
-                    .map_err(SampleError::Unsupported)?;
-                stage_j[..j.len()].copy_from_slice(&j);
-                stage_h[..h.len()].copy_from_slice(&h);
-                self.stream_transfer.memcpy_htod(
-                    &stage_j[..nnz_alloc],
-                    &mut d_j.slice_mut(j_start..j_start + nnz_alloc),
-                )?;
-                self.stream_transfer.memcpy_htod(
-                    &stage_h[..n_alloc],
-                    &mut d_h.slice_mut(h_start..h_start + n_alloc),
-                )?;
-            }
+            } => upload_slot_coefficients(
+                &self.topology,
+                graph,
+                self.plan.scale_milli,
+                &self.stream_transfer,
+                slot_idx,
+                (d_j, d_h),
+                (stage_j, stage_h),
+            )?,
         }
 
         // Zero this slot's output region so a stale prior model's samples

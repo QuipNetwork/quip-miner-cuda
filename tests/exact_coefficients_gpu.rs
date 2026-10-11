@@ -205,10 +205,20 @@ fn complete_pm1(n: usize) -> IsingGraph {
 /// Best energy from single-spin descent out of 32 deterministic starts, in milli.
 fn descent_reference(g: &IsingGraph) -> i64 {
     let n = g.h.len();
-    (0..32)
+    (0..32_u64)
         .map(|s| {
             let mut spins: Vec<i8> = (0..n)
-                .map(|i| if (i * 31 + s * 17) % 3 == 0 { 1 } else { -1 })
+                .map(|i| {
+                    let mut hash = (s << 32) | u64::try_from(i).expect("node index fits u64");
+                    hash = hash.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    if (hash ^ (hash >> 31)) & 1 == 0 {
+                        1
+                    } else {
+                        -1
+                    }
+                })
                 .collect();
             let mut energy = energy_milli(&spins, &g.h, &g.j, &g.edges);
             loop {
