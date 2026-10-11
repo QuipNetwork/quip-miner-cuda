@@ -282,6 +282,9 @@ fn scaled<T: TryFrom<i64>>(v: f64, scale_milli: i64) -> Result<T, String> {
 /// the plan already admitted this job, so an error here is a bug between the
 /// two, and the caller refuses the job.
 ///
+/// Correct placement of `J` requires that the caller's graph matches the
+/// establishing graph's node count and edge order (checked by the session layer).
+///
 /// `j_csr` has length `topology.nnz`, and `h` has length `graph.h.len()`.
 /// Positions that no edge touches stay `0`. Out-of-range edge indices are
 /// skipped, and a missing `j[k]` counts as `0`. A self-loop writes only the
@@ -289,6 +292,7 @@ fn scaled<T: TryFrom<i64>>(v: f64, scale_milli: i64) -> Result<T, String> {
 ///
 /// # Errors
 ///
+/// A message if `scale_milli` is zero or out of range.
 /// A message naming the first coefficient that is not exact in `T` at
 /// `scale_milli`.
 ///
@@ -311,6 +315,9 @@ pub fn fill_coefficients<T>(
 where
     T: Copy + Default + TryFrom<i64>,
 {
+    if scale_milli == 0 {
+        return Err("scale must be positive".to_string());
+    }
     let scale = i64::try_from(scale_milli)
         .map_err(|_| format!("scale {scale_milli} milli is out of range"))?;
     let mut j_csr = vec![T::default(); topology.nnz];
@@ -473,6 +480,13 @@ mod tests {
         assert_eq!(h, vec![300, -400, 0]);
         assert!(j.contains(&200));
         assert!(j.contains(&-300));
+    }
+
+    #[test]
+    fn fill_coefficients_refuses_a_zero_scale() {
+        let graph = IsingGraph::new(vec![1.0], vec![], vec![]);
+        let topology = SelfFeedingTopology::build(&graph);
+        assert!(fill_coefficients::<i8>(&topology, &graph, 0).is_err());
     }
 
     #[test]
