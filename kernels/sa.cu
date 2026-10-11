@@ -59,6 +59,25 @@
 // Fast math constants
 #define RNG_SCALE 2.32830643653869628906e-10f  // 1.0f / 2^32
 
+// Coefficient width. The default build is the int8 kernel every mining job
+// runs, and its preprocessed source is byte-for-byte today's: each typedef
+// below names the type the line used before. -DQUIP_SA_WIDE builds the
+// exact fixed-point fallback (src/coefficients.rs, src/accept_table.rs):
+// i32 coefficients and delta, and an integer-only Metropolis test.
+#ifdef QUIP_SA_WIDE
+typedef int coef_t;
+typedef int delta_t;
+typedef long long energy_t;
+#define NEGLOG_MASK 65535
+#else
+typedef signed char coef_t;
+typedef signed char delta_t;
+typedef int energy_t;
+#endif
+#ifdef QUIP_SA_WIDE
+static_assert(sizeof(coef_t) == 4, "wide build uses i32 coefficients");
+#endif
+
 extern "C" {
 
 // Simple xorshift32 RNG
@@ -87,14 +106,14 @@ __device__ void set_spin_packed(
 }
 
 // Compute delta energy for flipping variable (unpacked state)
-__device__ signed char get_flip_energy_unpacked(
+__device__ delta_t get_flip_energy_unpacked(
     int var,
     const signed char* unpacked_state,
     const int* csr_row_ptr,
     const int* csr_col_ind,
-    const signed char* csr_J_vals,
+    const coef_t* csr_J_vals,
     int n,
-    const signed char* h
+    const coef_t* h
 ) {
     const int start = __ldg(&csr_row_ptr[var]);
     const int end = __ldg(&csr_row_ptr[var + 1]);
@@ -108,11 +127,11 @@ __device__ signed char get_flip_energy_unpacked(
     #pragma unroll 20
     for (int p = start; p < end; ++p) {
         const int neighbor = __ldg(&csr_col_ind[p]);
-        const signed char Jij = __ldg(&csr_J_vals[p]);
+        const coef_t Jij = __ldg(&csr_J_vals[p]);
         energy += unpacked_state[neighbor] * Jij;
     }
 
-    return (signed char)(-2 * unpacked_state[var] * energy);
+    return (delta_t)(-2 * unpacked_state[var] * energy);
 }
 
 
@@ -129,8 +148,8 @@ __global__ void cuda_sa_self_feeding(
     const int* __restrict__ csr_col_ind,
 
     // Per-slot flat buffers (slot_idx = nonce_id * 3 + slot_id)
-    const signed char* __restrict__ slot_J_vals,
-    const signed char* __restrict__ slot_h_vals,
+    const coef_t* __restrict__ slot_J_vals,
+    const coef_t* __restrict__ slot_h_vals,
     signed char* slot_samples,
     int* slot_energies,
 
@@ -151,8 +170,13 @@ __global__ void cuda_sa_self_feeding(
     unsigned int base_seed,
 
     // Workspace (per global thread)
-    signed char* delta_energy_workspace,
+    delta_t* delta_energy_workspace,
     int max_N
+#ifdef QUIP_SA_WIDE
+    , const long long* __restrict__ beta_fixed
+    , const int* __restrict__ delta_cut
+    , const long long* __restrict__ neglog_table
+#endif
 ) {
     int tid = threadIdx.x;
     int nonce_id = blockIdx.x;
@@ -213,9 +237,9 @@ __global__ void cuda_sa_self_feeding(
     // === Model loop: process slots until none READY ===
     while (true) {
         int slot_idx = nonce_id * 3 + active_slot;
-        const signed char* my_J = &slot_J_vals[
+        const coef_t* my_J = &slot_J_vals[
             (long long)slot_idx * nnz];
-        const signed char* my_h = &slot_h_vals[
+        const coef_t* my_h = &slot_h_vals[
             (long long)slot_idx * N];
         int sample_base = slot_idx * num_reads
                           * max_packed_size;
@@ -238,7 +262,7 @@ __global__ void cuda_sa_self_feeding(
 
             // Delta energy workspace (unique per global thread)
             int global_tid = blockIdx.x * blockDim.x + tid;
-            signed char* delta_energy =
+            delta_t* delta_energy =
                 &delta_energy_workspace[
                     (long long)global_tid * max_N];
 
@@ -265,7 +289,7 @@ __global__ void cuda_sa_self_feeding(
             }
 
             // Initial energy (h + J terms)
-            int current_energy = 0;
+            energy_t current_energy = 0;
             for (int i = 0; i < N; i++) {
                 signed char spin_i = unpacked_state[i];
                 current_energy +=
@@ -299,17 +323,36 @@ __global__ void cuda_sa_self_feeding(
                     aborted = true;
                     break;
                 }
+#ifdef QUIP_SA_WIDE
+                const long long rung_beta = __ldg(&beta_fixed[beta_idx]);
+                const int rung_cut = __ldg(&delta_cut[beta_idx]);
+#else
                 float beta = __ldg(
                     &beta_schedule[beta_idx]);
                 float threshold = 22.18f / beta;
+#endif
 
                 for (int sweep = 0;
                      sweep < sweeps_per_beta;
                      sweep++) {
                     for (int var = 0; var < N; var++) {
-                        signed char de =
+                        delta_t de =
                             delta_energy[var];
 
+#ifdef QUIP_SA_WIDE
+                        if (de > rung_cut) {
+                            continue;
+                        }
+                        bool flip_spin = false;
+                        if (de <= 0) {
+                            flip_spin = true;
+                        } else {
+                            const unsigned int r = xorshift32(rng_state);
+                            flip_spin =
+                                (long long)de * rung_beta
+                                < __ldg(&neglog_table[r & NEGLOG_MASK]);
+                        }
+#else
                         if (de >= threshold) {
                             continue;
                         }
@@ -331,6 +374,7 @@ __global__ void cuda_sa_self_feeding(
                                 (accept_prob
                                  > rand_uniform);
                         }
+#endif
 
                         if (flip_spin) {
                             current_energy += de;
@@ -356,7 +400,7 @@ __global__ void cuda_sa_self_feeding(
                                     __ldg(
                                         &csr_col_ind[
                                             p]);
-                                const signed char
+                                const coef_t
                                     Jij = __ldg(
                                         &my_J[p]);
                                 const signed char
@@ -403,7 +447,7 @@ __global__ void cuda_sa_self_feeding(
 
                 // Write energy to output
                 slot_energies[energy_base + tid] =
-                    current_energy;
+                    (int)current_energy;
             }
         }
 

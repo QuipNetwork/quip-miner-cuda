@@ -52,8 +52,14 @@ fn skip_outside_ci(test: &str) -> bool {
 }
 
 /// Compile one kernel for one arch and assemble the PTX for that same arch.
-fn compile_and_assemble(name: &str, src: &str, nodes: usize, arch: i32) -> Result<(), String> {
-    let opts = CompileOptions {
+fn compile_and_assemble(
+    name: &str,
+    src: &str,
+    nodes: usize,
+    arch: i32,
+    defines: &[&str],
+) -> Result<(), String> {
+    let mut opts = CompileOptions {
         use_fast_math: Some(true),
         options: vec![
             format!("-DQUIP_MAX_NODES={nodes}"),
@@ -61,6 +67,7 @@ fn compile_and_assemble(name: &str, src: &str, nodes: usize, arch: i32) -> Resul
         ],
         ..Default::default()
     };
+    opts.options.extend(defines.iter().map(|s| (*s).to_owned()));
     let ptx = compile_ptx_with_opts(src, opts)
         .map_err(|e| format!("{name} @ compute_{arch}: NVRTC: {e}"))?;
 
@@ -104,16 +111,18 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
     for &arch in SUPPORTED_ARCHS {
         // Smallest realistic capacity for SA, the compiled-in default for
         // Gibbs — the same shapes `CudaDevice::open_with_nodes` produces.
-        for (name, src, nodes) in [
-            ("sa", SA_SRC, 512),
-            ("gibbs", GIBBS_SRC, 4800),
+        for (name, src, nodes, defines) in [
+            ("sa", SA_SRC, 512, &[][..]),
+            ("gibbs", GIBBS_SRC, 4800, &[][..]),
             (
                 "msa",
                 MSA_SRC,
                 quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+                &[][..],
             ),
+            ("sa-wide", SA_SRC, 512, &["-DQUIP_SA_WIDE"][..]),
         ] {
-            if let Err(e) = compile_and_assemble(name, src, nodes, arch) {
+            if let Err(e) = compile_and_assemble(name, src, nodes, arch, defines) {
                 failures.push(e);
             }
         }
@@ -137,7 +146,7 @@ fn floor_is_real_one_arch_below_fails() {
     // should be widened deliberately.
     let below = SUPPORTED_ARCHS[0] - 8; // 70 -> 62 (Pascal)
     assert!(
-        compile_and_assemble("sa", SA_SRC, 512, below).is_err(),
+        compile_and_assemble("sa", SA_SRC, 512, below, &[]).is_err(),
         "sa unexpectedly built at compute_{below}; revisit SUPPORTED_ARCHS"
     );
 }
