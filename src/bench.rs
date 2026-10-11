@@ -570,11 +570,18 @@ fn run_model(
         sweeps_per_beta: usize::try_from(args.sweeps_per_beta).unwrap_or(1),
         ..SampleParams::default()
     };
+    let plan = crate::coefficients::plan(
+        ctx.kernel,
+        graph,
+        crate::streaming::wide_max_nodes(ctx.device, ctx.kernel),
+    )
+    .map_err(|why| BenchError::Device(crate::sampler::SampleError::Unsupported(why).to_string()))?;
     let (beta, sweeps_per_beta) = crate::streaming::build_beta_schedule(
         graph,
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        plan.beta_factor(),
     );
     let cfg = CellConfig {
         reads: args.reads,

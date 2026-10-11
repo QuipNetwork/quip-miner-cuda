@@ -39,6 +39,7 @@ use quip_solver_core::config::{config_override, warn_unknown_fields};
 use quip_solver_core::quip_proto::v1::Backend;
 use quip_solver_core::{
     BackendIdentity, CancelToken, ModelLimits, SampleError, Sampler, StreamJob, StreamResult,
+    EXACT_COEFFICIENTS_FEATURE,
 };
 use std::collections::BTreeMap;
 
@@ -89,11 +90,17 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: KernelKind::Sa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // A real `sample_stream` override and the NVML governor — the two
-        // capability names `BackendIdentity::features` documents.
-        features: &["streaming", "governor"],
+        // Streaming, the NVML governor, and exact coefficient uploads.
+        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
         adapt: CUDA_ADAPT,
-        limits: ModelLimits::UNSTATED,
+        // SA has no degree bound (`Some(0)` is unbounded) and represents every whole
+        // milli value exactly. The field bound arrives with the wide path (Task 7).
+        // Until then, a field over the int8 limit is refused per job.
+        limits: ModelLimits {
+            max_degree: Some(0),
+            max_local_field_milli: None,
+            exact_resolution_milli: Some(1),
+        },
     }
 }
 
@@ -141,10 +148,17 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
         algorithm: KernelKind::Msa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Same capability set as `cuda_sa_identity`: streaming + governor.
-        features: &["streaming", "governor"],
+        // Same capability set as `cuda_sa_identity`.
+        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
         adapt: cuda_msa_adapt(max_reads),
-        limits: ModelLimits::UNSTATED,
+        // The kernel unrolls 20 neighbours and reads J and h by sign. The step is
+        // one unit. Magnitudes other than one are refused per job: a field bound
+        // would let a 21-unit h through.
+        limits: ModelLimits {
+            max_degree: Some(u32::try_from(capacity::MSA_MAX_DEGREE).unwrap_or(u32::MAX)),
+            max_local_field_milli: None,
+            exact_resolution_milli: Some(1000),
+        },
     }
 }
 
@@ -158,10 +172,16 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: KernelKind::Gibbs.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Same capability set as `cuda_sa_identity`: streaming + governor.
-        features: &["streaming", "governor"],
+        // Same capability set as `cuda_sa_identity`.
+        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
         adapt: CUDA_ADAPT,
-        limits: ModelLimits::UNSTATED,
+        // The int8 bound is per coefficient at the model's own scale, which no
+        // binary-wide field limit expresses: the binary refuses per job.
+        limits: ModelLimits {
+            max_degree: Some(0),
+            max_local_field_milli: None,
+            exact_resolution_milli: Some(1),
+        },
     }
 }
 

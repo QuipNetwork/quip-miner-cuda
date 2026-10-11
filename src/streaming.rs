@@ -16,6 +16,7 @@
 //! correct, just not guaranteed to hit full width on a very short run.
 
 use crate::capacity;
+use crate::coefficients::{self, CoefficientPlan};
 use crate::cuda_device::CudaDevice;
 use crate::driver_budget::{Bucket, DriverBudget};
 use crate::kernel::KernelKind;
@@ -225,14 +226,18 @@ pub(crate) fn build_beta_schedule(
     num_sweeps: usize,
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
+    beta_factor: f64,
 ) -> (Vec<f32>, usize) {
     let _span = trace_span!("beta_build", num_sweeps).entered();
     let sweeps_per = sweeps_per_beta.max(1);
     let num_betas = (num_sweeps / sweeps_per).max(1);
     let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
+    // `beta_factor` turns a beta for the model in units into one for the
+    // kernel's integer delta (see `coefficients::CoefficientPlan`). It is
+    // exactly 1.0 for a mining job, so the uploaded schedule is unchanged.
     let sched: Vec<f32> = geometric_beta_schedule(hot, cold, num_betas)
         .iter()
-        .map(|&b| b as f32)
+        .map(|&b| (b * beta_factor) as f32)
         .collect();
     (sched, sweeps_per)
 }
@@ -317,6 +322,7 @@ struct SelfFeedingSession<'a> {
     device: &'a CudaDevice,
     kernel: KernelKind,
     topology: SelfFeedingTopology,
+    plan: CoefficientPlan,
     active_nonces: usize,
     reads_per_nonce: usize,
     max_packed_size: usize,
@@ -387,8 +393,9 @@ enum AlgoState {
 ///
 /// The kernel unrolls a fixed neighbour budget (`MSA_MAX_DEG` in
 /// `kernels/msa.cu`). A denser topology cannot run on it and is refused per
-/// job as `Unsupported`, which the wire maps to `Capacity`: permanent for
-/// this graph, harmless to the session.
+/// job as `Unsupported`. The coefficient plan also refuses non-unit models
+/// per job. Both checks map to `Capacity` on the wire: permanent for this
+/// graph, harmless to the session.
 fn build_msa_state(
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
@@ -522,6 +529,7 @@ impl<'a> SelfFeedingSession<'a> {
         num_nonces: usize,
         reads_per_nonce: usize,
         max_num_betas: usize,
+        plan: CoefficientPlan,
     ) -> Result<Self, SampleError> {
         let _span = trace_span!("problem_setup", n = topology.n, nnz = topology.nnz).entered();
         let n = topology.n;
@@ -603,6 +611,7 @@ impl<'a> SelfFeedingSession<'a> {
             device,
             kernel,
             topology,
+            plan,
             active_nonces: 0,
             reads_per_nonce,
             max_packed_size,
@@ -663,7 +672,7 @@ impl<'a> SelfFeedingSession<'a> {
 
         self.stage_j[..nnz.max(1)].fill(0);
         self.stage_h[..n.max(1)].fill(0);
-        let (j, h) = fill_coefficients::<i8>(&self.topology, graph, 1000)
+        let (j, h) = fill_coefficients::<i8>(&self.topology, graph, self.plan.scale_milli)
             .map_err(SampleError::Unsupported)?;
         self.stage_j[..j.len()].copy_from_slice(&j);
         self.stage_h[..h.len()].copy_from_slice(&h);
@@ -1026,29 +1035,64 @@ struct SessionKey {
     reads_per_nonce: usize,
     num_sweeps: usize,
     sweeps_per_beta: usize,
-    beta_range: Option<(f64, f64)>,
+    /// The range the schedule was built from: the job's own, or the default
+    /// the seed's coefficients produced. Keyed resolved, because two jobs
+    /// that both send `None` get different defaults when their fields differ.
+    beta_range: (f64, f64),
+    /// Path and scale every job in the session runs at. A job at another
+    /// scale needs another schedule, and a job on another path another
+    /// kernel.
+    plan: CoefficientPlan,
+    kernel: KernelKind,
+    wide_max_nodes: usize,
 }
 
 impl SessionKey {
-    fn seed(job: &StreamJob, reads_per_nonce: usize) -> Self {
-        Self {
+    fn seed(
+        job: &StreamJob,
+        reads_per_nonce: usize,
+        kernel: KernelKind,
+        wide_max_nodes: usize,
+    ) -> Result<Self, String> {
+        let plan = coefficients::plan(kernel, &job.graph, wide_max_nodes)?;
+        Ok(Self {
             n: job.graph.h.len(),
             edges: job.graph.edges.clone(),
             reads_per_nonce,
             num_sweeps: job.params.num_sweeps,
             sweeps_per_beta: job.params.sweeps_per_beta.max(1),
-            beta_range: job.params.beta_range,
-        }
+            beta_range: job
+                .params
+                .beta_range
+                .unwrap_or_else(|| default_ising_beta_range(&job.graph)),
+            plan,
+            kernel,
+            wide_max_nodes,
+        })
     }
 
-    fn matches(&self, job: &StreamJob) -> bool {
+    fn plan_for(&self, job: &StreamJob) -> Result<CoefficientPlan, String> {
+        coefficients::plan(self.kernel, &job.graph, self.wide_max_nodes)
+    }
+
+    fn matches(&self, job: &StreamJob, plan: CoefficientPlan) -> bool {
         self.n == job.graph.h.len()
             && self.edges == job.graph.edges
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
-            && self.beta_range == job.params.beta_range
+            && self.plan == plan
+            && self.beta_range
+                == job
+                    .params
+                    .beta_range
+                    .unwrap_or_else(|| default_ising_beta_range(&job.graph))
             && job.params.num_reads.max(1) <= self.reads_per_nonce
     }
+}
+
+/// Node budget of the wide SA path on this device. Zero: no wide path yet.
+pub(crate) fn wide_max_nodes(_device: &CudaDevice, _kernel: KernelKind) -> usize {
+    0
 }
 
 /// Run one job through a dedicated single-nonce self-feeding session:
@@ -1101,6 +1145,8 @@ pub fn sample_one(
     params: &SampleParams,
     kernel: KernelKind,
 ) -> Result<Vec<SamplerResult>, SampleError> {
+    let plan = coefficients::plan(kernel, graph, wide_max_nodes(device, kernel))
+        .map_err(SampleError::Unsupported)?;
     let n = graph.num_nodes();
     if n == 0 {
         let reads = params.num_reads.max(1);
@@ -1119,11 +1165,19 @@ pub fn sample_one(
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        plan.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(graph);
 
-    let mut sess =
-        SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
+    let mut sess = SelfFeedingSession::build(
+        device,
+        kernel,
+        topology,
+        1,
+        reads_per_nonce,
+        beta.len(),
+        plan,
+    )?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
     let seed = seed_low_u32(params.seed).wrapping_add(1);
@@ -1229,6 +1283,8 @@ pub fn bench_one(
     params: &SampleParams,
     kernel: KernelKind,
 ) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
+    let plan = coefficients::plan(kernel, graph, wide_max_nodes(device, kernel))
+        .map_err(SampleError::Unsupported)?;
     let n = graph.num_nodes();
     if n == 0 {
         let reads = params.num_reads.max(1);
@@ -1247,10 +1303,18 @@ pub fn bench_one(
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        plan.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(graph);
-    let mut sess =
-        SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
+    let mut sess = SelfFeedingSession::build(
+        device,
+        kernel,
+        topology,
+        1,
+        reads_per_nonce,
+        beta.len(),
+        plan,
+    )?;
 
     // --- Timed upload (beta + slot 0 + exit flag) on the transfer stream. ---
     let up0 = timing_event(device)?;
@@ -1425,14 +1489,20 @@ pub fn stream_width(device: &CudaDevice, kernel: KernelKind) -> usize {
 enum Pull {
     Job(StreamJob),
     Mismatch(StreamJob),
+    /// No path holds this job exactly. The caller rejects it as Capacity and
+    /// keeps the session: one refused job must not cost the jobs in flight.
+    Refused(StreamJob, String),
     Empty,
     Closed,
 }
 
 fn try_pull(jobs: &mut Receiver<StreamJob>, key: &SessionKey) -> Pull {
     match jobs.try_recv() {
-        Ok(j) if key.matches(&j) => Pull::Job(j),
-        Ok(j) => Pull::Mismatch(j),
+        Ok(j) => match key.plan_for(&j) {
+            Err(why) => Pull::Refused(j, why),
+            Ok(plan) if key.matches(&j, plan) => Pull::Job(j),
+            Ok(_) => Pull::Mismatch(j),
+        },
         Err(TryRecvError::Empty) => Pull::Empty,
         Err(TryRecvError::Disconnected) => Pull::Closed,
     }
@@ -1679,6 +1749,10 @@ fn drain_cold_start(feed: &mut Feed<'_>, seed: StreamJob, width: usize) -> (Vec<
                     last_arrival = Instant::now();
                 }
             }
+            Pull::Refused(job, why) => {
+                eprintln!("quip-solver-cuda: refusing job: {why}");
+                send_reject(feed.out, job, WireSampleError::Capacity);
+            }
             Pull::Mismatch(j) => return (cold, Halt::Mismatch(j)),
             Pull::Empty => {
                 if last_arrival.elapsed() > idle_timeout {
@@ -1718,6 +1792,10 @@ fn refill_slots(
                         continue;
                     }
                     slot.admit(free, j);
+                }
+                Pull::Refused(job, why) => {
+                    eprintln!("quip-solver-cuda: refusing job: {why}");
+                    send_reject(feed.out, job, WireSampleError::Capacity);
                 }
                 Pull::Mismatch(j) => return Halt::Mismatch(j),
                 Pull::Empty => break,
@@ -1944,6 +2022,21 @@ fn run_session(
     cancel: &CancelToken,
     ctx: &mut DriverContext<'_>,
 ) -> Option<StreamJob> {
+    let limits = algo_limits(kernel, device.msa_replica_words);
+    let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
+    let key = match SessionKey::seed(
+        &seed,
+        reads_per_nonce,
+        kernel,
+        wide_max_nodes(device, kernel),
+    ) {
+        Ok(key) => key,
+        Err(why) => {
+            eprintln!("quip-solver-cuda: refusing job: {why}");
+            send_reject(out, seed, WireSampleError::Capacity);
+            return jobs.blocking_recv();
+        }
+    };
     if seed.graph.num_nodes() == 0 {
         // Degenerate empty-graph job: no kernel needed, answer directly.
         if !answer_empty_graph(out, seed) {
@@ -1963,15 +2056,13 @@ fn run_session(
     }
 
     let width = stream_width(device, kernel);
-    let limits = algo_limits(kernel, device.msa_replica_words);
-    let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
     let job_seed = seed.params.seed;
-    let key = SessionKey::seed(&seed, reads_per_nonce);
     let (beta, sweeps_per_beta) = build_beta_schedule(
         &seed.graph,
         seed.params.num_sweeps,
         seed.params.sweeps_per_beta,
-        seed.params.beta_range,
+        Some(key.beta_range),
+        key.plan.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(&seed.graph);
     let mut feed = Feed {
@@ -1988,6 +2079,7 @@ fn run_session(
         width,
         reads_per_nonce,
         beta.len(),
+        key.plan,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -2331,58 +2423,61 @@ mod tests {
     #[test]
     fn session_key_matches_an_identical_job() {
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8);
-        assert!(key.matches(&seed));
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
+        assert!(key.matches(&seed, key.plan_for(&seed).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_node_count() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
         let mut other = job(2);
         other.graph.h.push(0.5);
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_different_edges() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
         let mut other = job(2);
         other.graph.edges = vec![(0, 1), (1, 2), (2, 3), (0, 2)].into();
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_sweep_count() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
         let mut other = job(2);
         other.params.num_sweeps += 1;
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_sweeps_per_beta() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
         let mut other = job(2);
         other.params.sweeps_per_beta = 4;
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_beta_range() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
         let mut other = job(2);
         other.params.beta_range = Some((0.1, 10.0));
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_more_reads_than_the_session_allocated() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
         let mut other = job(2);
         other.params.num_reads = 8;
-        assert!(key.matches(&other), "exactly the capacity still fits");
+        assert!(
+            key.matches(&other, key.plan_for(&other).unwrap()),
+            "exactly the capacity still fits"
+        );
         other.params.num_reads = 9;
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
@@ -2390,15 +2485,64 @@ mod tests {
         // Both sides apply `.max(1)`, so 0 and 1 are the same session.
         let mut seed = job(1);
         seed.params.sweeps_per_beta = 0;
-        let key = SessionKey::seed(&seed, 8);
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
         let mut other = job(2);
         other.params.sweeps_per_beta = 1;
-        assert!(key.matches(&other));
+        assert!(key.matches(&other, key.plan_for(&other).unwrap()));
+    }
+
+    #[test]
+    fn session_key_separates_scales_on_one_topology() {
+        let one_x = job(1);
+        let mut thousand_x = job(2);
+        thousand_x.graph.h.iter_mut().for_each(|v| *v *= 1000.0);
+        thousand_x.graph.j.iter_mut().for_each(|v| *v *= 1000.0);
+        let key = SessionKey::seed(&one_x, 8, KernelKind::Sa, 0).unwrap();
+        let plan = key.plan_for(&thousand_x).unwrap();
+        assert_eq!(plan.scale_milli, 1_000_000);
+        assert!(
+            !key.matches(&thousand_x, plan),
+            "a 1000x job must not reuse the 1x schedule"
+        );
+    }
+
+    #[test]
+    fn session_key_separates_default_beta_ranges() {
+        // Same scale (1000) and topology, different field: the default range differs.
+        let seed = job(1);
+        let mut other = job(2);
+        other.graph.h = vec![3.0, -3.0, 0.0, 3.0];
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
+        let plan = key.plan_for(&other).unwrap();
+        assert_eq!(plan.scale_milli, 1000);
+        assert!(!key.matches(&other, plan));
+    }
+
+    #[test]
+    fn try_pull_refuses_without_ending_the_session() {
+        let (tx, mut rx) = channel::<StreamJob>(4);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let mut bad = job(2);
+        bad.graph.h[0] = 0.0005; // sub-milli
+        tx.try_send(bad).unwrap();
+        tx.try_send(job(3)).unwrap();
+        assert!(matches!(try_pull(&mut rx, &key), Pull::Refused(j, _) if j.job_id == vec![2]));
+        assert!(matches!(try_pull(&mut rx, &key), Pull::Job(j) if j.job_id == vec![3]));
+    }
+
+    #[test]
+    fn mining_schedule_is_bit_identical_after_scaling() {
+        let g = graph();
+        let (base, _) = build_beta_schedule(&g, 1024, 4, None, 1.0);
+        let plan = coefficients::plan(KernelKind::Sa, &g, 0).unwrap();
+        let (scaled, _) = build_beta_schedule(&g, 1024, 4, None, plan.beta_factor());
+        let bits = |v: &[f32]| v.iter().map(|b| b.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&base), bits(&scaled));
     }
 
     #[test]
     fn beta_schedule_length_is_sweeps_over_sweeps_per_beta() {
-        let (sched, sweeps_per) = build_beta_schedule(&graph(), 100, 10, Some((0.1, 10.0)));
+        let (sched, sweeps_per) = build_beta_schedule(&graph(), 100, 10, Some((0.1, 10.0)), 1.0);
         assert_eq!(sweeps_per, 10);
         assert_eq!(sched.len(), 10);
     }
@@ -2406,7 +2550,7 @@ mod tests {
     #[test]
     fn beta_schedule_floors_sweeps_per_beta_at_one() {
         // A zero would divide by zero; the floor turns it into one beta per sweep.
-        let (sched, sweeps_per) = build_beta_schedule(&graph(), 64, 0, Some((0.1, 10.0)));
+        let (sched, sweeps_per) = build_beta_schedule(&graph(), 64, 0, Some((0.1, 10.0)), 1.0);
         assert_eq!(sweeps_per, 1);
         assert_eq!(sched.len(), 64);
     }
@@ -2415,15 +2559,15 @@ mod tests {
     fn beta_schedule_always_has_at_least_one_beta() {
         // Zero sweeps, or fewer sweeps than sweeps_per_beta, must not yield an
         // empty schedule — the kernel would have nothing to anneal against.
-        let (sched, _) = build_beta_schedule(&graph(), 0, 1, Some((0.1, 10.0)));
+        let (sched, _) = build_beta_schedule(&graph(), 0, 1, Some((0.1, 10.0)), 1.0);
         assert_eq!(sched.len(), 1);
-        let (sched, _) = build_beta_schedule(&graph(), 4, 64, Some((0.1, 10.0)));
+        let (sched, _) = build_beta_schedule(&graph(), 4, 64, Some((0.1, 10.0)), 1.0);
         assert_eq!(sched.len(), 1);
     }
 
     #[test]
     fn beta_schedule_runs_hot_to_cold() {
-        let (sched, _) = build_beta_schedule(&graph(), 40, 10, Some((0.1, 10.0)));
+        let (sched, _) = build_beta_schedule(&graph(), 40, 10, Some((0.1, 10.0)), 1.0);
         assert_eq!(sched.len(), 4);
         // Beta rises as temperature falls, so the schedule is increasing.
         for pair in sched.windows(2) {
@@ -2522,7 +2666,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8);
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
         job_tx.try_send(job(2)).expect("queue a second job");
         drop(job_tx);
 
@@ -2545,7 +2689,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8);
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
         let mut other = job(2);
         other.params.num_sweeps += 1;
         job_tx.try_send(other).expect("queue a mismatched job");
@@ -2571,7 +2715,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8);
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
         job_tx.try_send(job(2)).expect("queue a second job");
         job_tx.try_send(job(3)).expect("queue a third job");
 
@@ -2594,7 +2738,7 @@ mod tests {
     fn next_seed_carries_a_job_over_and_ends_on_a_closed_channel() {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
         drop(job_tx);
         let cancel = CancelToken::default();
         let mut feed = Feed {
