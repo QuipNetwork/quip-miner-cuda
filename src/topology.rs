@@ -1,4 +1,4 @@
-//! CSR topology + chromatic color-blocks + int8 quantization for the
+//! CSR topology + chromatic color-blocks + exact coefficient upload for the
 //! self-feeding kernels.
 //!
 //! Mirrors `GPU/sampler_utils.py::build_csr_structure_from_edges` /
@@ -14,6 +14,7 @@
 //! units; see `shared/quantum_proof_of_work.py`), so the int8 cast the
 //! original kernel relies on is lossless for real jobs.
 
+use crate::coefficients::to_milli;
 use quip_solver_core::IsingGraph;
 
 /// Chromatic color-block partition of a CSR graph's dense node indices.
@@ -30,10 +31,10 @@ use quip_solver_core::IsingGraph;
 /// # Examples
 ///
 /// External callers only observe coloring through the public topology +
-/// `fill_h_j` surface; the partition fields are `pub(crate)`.
+/// `fill_coefficients` surface; the partition fields are `pub(crate)`.
 ///
 /// ```
-/// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
+/// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_coefficients}};
 ///
 /// let graph = IsingGraph::new(
 ///     vec![0.0, 0.0, 0.0, 0.0],
@@ -42,8 +43,8 @@ use quip_solver_core::IsingGraph;
 /// );
 /// let topology = SelfFeedingTopology::build(&graph);
 /// // Proper coloring is an internal invariant of `build`; public surface is
-/// // the quantized CSR layout produced by `fill_h_j`.
-/// let (j_csr, h_i8) = fill_h_j(&topology, &graph);
+/// // the exact CSR layout produced by `fill_coefficients`.
+/// let (j_csr, h_i8) = fill_coefficients::<i8>(&topology, &graph, 1000).unwrap();
 /// assert_eq!(h_i8, vec![0, 0, 0, 0]);
 /// assert_eq!(j_csr.len(), 8); // 4 undirected edges × 2 directed halves
 /// assert!(j_csr.iter().all(|&v| v == 1));
@@ -165,7 +166,7 @@ pub struct SelfFeedingTopology {
 
 impl SelfFeedingTopology {
     /// Build CSR + coloring from a graph. `graph.edges` fixes the canonical
-    /// edge order used by `edge_pos` (and thus by [`fill_h_j`] for this and
+    /// edge order used by `edge_pos` (and thus by [`fill_coefficients`] for this and
     /// every later job sharing this topology).
     ///
     /// Skips edges whose endpoints are out of `0..n` (`n = graph.h.len()`).
@@ -175,7 +176,7 @@ impl SelfFeedingTopology {
     /// # Examples
     ///
     /// ```
-    /// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
+    /// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_coefficients}};
     ///
     /// let graph = IsingGraph::new(
     ///     vec![1.0, -1.0, 0.0],
@@ -183,8 +184,8 @@ impl SelfFeedingTopology {
     ///     vec![(0, 1), (1, 2)],
     /// );
     /// let topology = SelfFeedingTopology::build(&graph);
-    /// // Fields are crate-private; the public check is fill_h_j output shape.
-    /// let (j_csr, h_i8) = fill_h_j(&topology, &graph);
+    /// // Fields are crate-private; the public check is fill_coefficients output shape.
+    /// let (j_csr, h_i8) = fill_coefficients::<i8>(&topology, &graph, 1000).unwrap();
     /// assert_eq!(h_i8, vec![1, -1, 0]);
     /// assert_eq!(j_csr.len(), 4); // two undirected edges, both directions
     /// assert_eq!(j_csr.iter().filter(|&&v| v == 2).count(), 2);
@@ -220,7 +221,7 @@ impl SelfFeedingTopology {
         let mut row_ptr = vec![0i32; n + 1];
         let mut col_ind = Vec::new();
         // (0, 0) for an edge with an out-of-range endpoint: never read,
-        // since `fill_h_j` skips those edges too (matches the guard above).
+        // since `fill_coefficients` skips those edges too (matches the guard above).
         let mut edge_pos = vec![(0u32, 0u32); graph.edges.len()];
         for i in 0..n {
             // Pack kernel ABI: host length/index → i32/u32 at write boundary.
@@ -260,71 +261,80 @@ impl SelfFeedingTopology {
     }
 }
 
-/// Truncating cast to int8, saturating on overflow (Rust's `as` semantics
-/// since 1.45). Matches numpy's `dtype=np.int8` cast for the in-range
-/// values consensus actually produces (h in {-1,0,1}, J in {-1,1}, milli
-/// units); saturates instead of wrapping for out-of-range test fixtures.
-#[allow(clippy::cast_possible_truncation)] // intentional f64→i8 quantize
-fn quantize_i8(v: f64) -> i8 {
-    v as i8
+/// One coefficient in kernel units: `milli / scale_milli`, exactly.
+fn scaled<T: TryFrom<i64>>(v: f64, scale_milli: i64) -> Result<T, String> {
+    let milli = to_milli(v).ok_or_else(|| format!("coefficient {v} is not a whole milli value"))?;
+    if milli % scale_milli != 0 {
+        return Err(format!(
+            "coefficient {v} is not a multiple of {scale_milli} milli"
+        ));
+    }
+    T::try_from(milli / scale_milli).map_err(|_| {
+        format!("coefficient {v} at {scale_milli} milli per unit does not fit the kernel type")
+    })
 }
 
-/// Quantize one job's `h`/`J` into the topology's fixed CSR layout.
+/// Write one job's `h`/`J`, in kernel units, into the topology's CSR layout.
 ///
-/// `j_csr` has length `topology.nnz`; `h_i8` has length `graph.h.len()`.
-/// Positions not touched by any edge stay `0` (matches `j_csr` being
-/// allocated/cleared before this call).
+/// `scale_milli` comes from [`crate::coefficients::plan`]. `T` is `i8` for the
+/// int8 kernels and `i32` for the wide SA kernel. A value that is off the
+/// scale or does not fit `T` is an error, never a rounded or saturated value:
+/// the plan already admitted this job, so an error here is a bug between the
+/// two, and the caller refuses the job.
 ///
-/// Missing or short `graph.edges` / `graph.j` relative to
-/// `topology.edge_pos` are handled fallibly: out-of-range edge indices are
-/// skipped, and missing `j[k]` defaults to `0.0` (same style as the
-/// short-`j` path). Self-loops write only the forward CSR half.
+/// `j_csr` has length `topology.nnz`, and `h` has length `graph.h.len()`.
+/// Positions that no edge touches stay `0`. Out-of-range edge indices are
+/// skipped, and a missing `j[k]` counts as `0`. A self-loop writes only the
+/// forward CSR half.
 ///
-/// # Panics
+/// # Errors
 ///
-/// This function does **not** panic when `graph.edges.len() <
-/// topology.edge_pos.len()`: those slots are skipped. It also does not
-/// panic when `graph.j` is shorter than the edge list (defaults to `0.0`).
-/// Correct placement of `J` still requires that `topology` was built from
-/// an establishing graph whose `(n, edges)` match the caller's graph
-/// (checked by the session layer); mismatched topologies can still produce
-/// incorrect values, but not an edges-index panic.
+/// A message naming the first coefficient that is not exact in `T` at
+/// `scale_milli`.
 ///
 /// # Examples
 ///
 /// ```
-/// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_h_j}};
+/// use quip_solver_cuda::{IsingGraph, topology::{SelfFeedingTopology, fill_coefficients}};
 ///
-/// let graph = IsingGraph::new(
-///     vec![1.0, -1.0],
-///     vec![5.0],
-///     vec![(0, 1)],
-/// );
+/// let graph = IsingGraph::new(vec![1.0, -1.0], vec![5.0], vec![(0, 1)]);
 /// let topology = SelfFeedingTopology::build(&graph);
-/// let (j_csr, h_i8) = fill_h_j(&topology, &graph);
-/// assert_eq!(h_i8, vec![1, -1]);
+/// let (j_csr, h) = fill_coefficients::<i8>(&topology, &graph, 1000).unwrap();
+/// assert_eq!(h, vec![1, -1]);
 /// assert_eq!(j_csr, vec![5, 5]); // both directed halves
 /// ```
-#[must_use]
-pub fn fill_h_j(topology: &SelfFeedingTopology, graph: &IsingGraph) -> (Vec<i8>, Vec<i8>) {
-    let mut j_csr = vec![0i8; topology.nnz];
+pub fn fill_coefficients<T>(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+    scale_milli: u64,
+) -> Result<(Vec<T>, Vec<T>), String>
+where
+    T: Copy + Default + TryFrom<i64>,
+{
+    let scale = i64::try_from(scale_milli)
+        .map_err(|_| format!("scale {scale_milli} milli is out of range"))?;
+    let mut j_csr = vec![T::default(); topology.nnz];
     for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
-        // quip-miner-cuda-2sg: fallible get — edge_pos sized from establishing
-        // graph; caller-supplied graph.edges may be shorter.
+        // quip-miner-cuda-2sg: fallible get. edge_pos is sized from the
+        // establishing graph, and the caller's graph.edges may be shorter.
         let Some(&(u, v)) = graph.edges.get(k) else {
             continue;
         };
         if u >= topology.n || v >= topology.n {
             continue;
         }
-        let val = quantize_i8(graph.j.get(k).copied().unwrap_or(0.0));
+        let val = scaled(graph.j.get(k).copied().unwrap_or(0.0), scale)?;
         j_csr[pos_ij as usize] = val;
         if u != v {
             j_csr[pos_ji as usize] = val;
         }
     }
-    let h_i8: Vec<i8> = graph.h.iter().map(|&v| quantize_i8(v)).collect();
-    (j_csr, h_i8)
+    let h = graph
+        .h
+        .iter()
+        .map(|&v| scaled(v, scale))
+        .collect::<Result<Vec<T>, _>>()?;
+    Ok((j_csr, h))
 }
 
 #[cfg(test)]
@@ -383,9 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn quantization_is_lossless_for_consensus_range() {
+    fn coefficient_upload_is_lossless_for_consensus_range() {
         let t = SelfFeedingTopology::build(&g());
-        let (j, h) = fill_h_j(&t, &g());
+        let (j, h) = fill_coefficients::<i8>(&t, &g(), 1000).unwrap();
         assert_eq!(h, vec![1i8, -1, 0, 1]);
         // Each edge's J appears at both directed CSR positions.
         assert_eq!(j.iter().filter(|&&v| v != 0).count(), 8);
@@ -429,7 +439,7 @@ mod tests {
         // OOR edges keep default (0,0) edge_pos and never enter CSR.
         assert_eq!(t.edge_pos[1], (0, 0));
         assert_eq!(t.edge_pos[2], (0, 0));
-        let (j, _) = fill_h_j(&t, &graph);
+        let (j, _) = fill_coefficients::<i8>(&t, &graph, 1000).unwrap();
         assert_eq!(j, vec![3, 3]);
     }
 
@@ -443,7 +453,7 @@ mod tests {
         let (pos_ij, pos_ji) = t.edge_pos[0];
         assert_eq!(t.col_ind[pos_ij as usize], 0);
         assert_eq!(pos_ji, 0); // never written for self-loop
-        let (j, h) = fill_h_j(&t, &graph);
+        let (j, h) = fill_coefficients::<i8>(&t, &graph, 1000).unwrap();
         assert_eq!(h, vec![1, 0]);
         // Self-loop J appears once; (0,1) appears twice.
         assert_eq!(j.iter().filter(|&&v| v == 7).count(), 1);
@@ -451,38 +461,63 @@ mod tests {
     }
 
     #[test]
-    fn quantize_i8_saturates_via_fill_h_j() {
-        // Doc claims saturation for out-of-range fixtures (Rust float→i8 as).
+    fn fill_coefficients_refuses_out_of_range_fixtures() {
         let graph = IsingGraph::new(
             vec![300.0, -400.0, 0.0],
             vec![200.0, -300.0],
             vec![(0, 1), (1, 2)],
         );
         let t = SelfFeedingTopology::build(&graph);
-        let (j, h) = fill_h_j(&t, &graph);
-        assert_eq!(h, vec![i8::MAX, i8::MIN, 0]);
-        assert!(j.contains(&i8::MAX));
-        assert!(j.contains(&i8::MIN));
+        assert!(fill_coefficients::<i8>(&t, &graph, 1000).is_err());
+        let (j, h) = fill_coefficients::<i32>(&t, &graph, 1000).unwrap();
+        assert_eq!(h, vec![300, -400, 0]);
+        assert!(j.contains(&200));
+        assert!(j.contains(&-300));
     }
 
     #[test]
-    fn fill_h_j_short_j_defaults_to_zero() {
+    fn fill_coefficients_divides_by_the_scale() {
+        let graph = IsingGraph::new(vec![0.25, -0.75], vec![0.5], vec![(0, 1)]);
+        let topology = SelfFeedingTopology::build(&graph);
+        let (j, h) = fill_coefficients::<i8>(&topology, &graph, 250).unwrap();
+        assert_eq!(h, vec![1, -3]);
+        assert_eq!(j, vec![2, 2]);
+    }
+
+    #[test]
+    fn fill_coefficients_refuses_instead_of_saturating() {
+        let graph = IsingGraph::new(vec![200.0, 0.0], vec![1.0], vec![(0, 1)]);
+        let topology = SelfFeedingTopology::build(&graph);
+        assert!(fill_coefficients::<i8>(&topology, &graph, 1000).is_err());
+        let (_, h) = fill_coefficients::<i32>(&topology, &graph, 1000).unwrap();
+        assert_eq!(h, vec![200, 0]);
+    }
+
+    #[test]
+    fn fill_coefficients_refuses_a_value_off_the_scale() {
+        let graph = IsingGraph::new(vec![0.3, 0.0], vec![1.0], vec![(0, 1)]);
+        let topology = SelfFeedingTopology::build(&graph);
+        assert!(fill_coefficients::<i32>(&topology, &graph, 1000).is_err());
+    }
+
+    #[test]
+    fn fill_coefficients_short_j_defaults_to_zero() {
         // Two edges, j only for the first — second coupling defaults to 0.
         let graph = IsingGraph::new(vec![0.0, 0.0, 0.0], vec![9.0], vec![(0, 1), (1, 2)]);
         let t = SelfFeedingTopology::build(&graph);
-        let (j, _) = fill_h_j(&t, &graph);
+        let (j, _) = fill_coefficients::<i8>(&t, &graph, 1000).unwrap();
         assert_eq!(j.iter().filter(|&&v| v == 9).count(), 2);
         // Positions for the short-j edge stay 0.
         assert_eq!(j.iter().filter(|&&v| v == 0).count(), 2);
     }
 
     #[test]
-    fn fill_h_j_skips_missing_edges_when_graph_shorter() {
+    fn fill_coefficients_skips_missing_edges_when_graph_shorter() {
         // Establishing topology has 2 edges; call with a shorter edge list.
         let establish = IsingGraph::new(vec![0.0, 0.0, 0.0], vec![1.0, 2.0], vec![(0, 1), (1, 2)]);
         let t = SelfFeedingTopology::build(&establish);
         let short = IsingGraph::new(vec![0.0, 0.0, 0.0], vec![5.0], vec![(0, 1)]);
-        let (j, _) = fill_h_j(&t, &short);
+        let (j, _) = fill_coefficients::<i8>(&t, &short, 1000).unwrap();
         // Only the first edge's positions get 5; second edge_pos slot skipped.
         assert_eq!(j.iter().filter(|&&v| v == 5).count(), 2);
         assert_eq!(j.iter().filter(|&&v| v != 0).count(), 2);
@@ -497,10 +532,10 @@ mod tests {
             assert_eq!(t.col_ind[pos_ij as usize] as usize, v, "edge {k} forward");
             assert_eq!(t.col_ind[pos_ji as usize] as usize, u, "edge {k} reverse");
         }
-        let (j, _) = fill_h_j(&t, &graph);
+        let (j, _) = fill_coefficients::<i8>(&t, &graph, 1000).unwrap();
         for (k, &j_val) in graph.j.iter().enumerate() {
             let (pos_ij, pos_ji) = t.edge_pos[k];
-            let q = quantize_i8(j_val);
+            let q = j_val as i8;
             assert_eq!(j[pos_ij as usize], q);
             assert_eq!(j[pos_ji as usize], q);
         }
@@ -524,12 +559,17 @@ mod tests {
                 Just(n),
                 edge_strat,
                 j_len,
-                prop::collection::vec(-5.0f64..5.0, n),
+                prop::collection::vec(-5i8..5, n),
             )
                 .prop_flat_map(|(_n, edges, j_len, h)| {
                     let j_len = j_len.min(edges.len() + 4);
-                    prop::collection::vec(-200.0f64..200.0, j_len)
-                        .prop_map(move |j| IsingGraph::new(h.clone(), j, edges.clone()))
+                    prop::collection::vec(-127i8..=127, j_len).prop_map(move |j| {
+                        IsingGraph::new(
+                            h.iter().map(|&v| f64::from(v)).collect(),
+                            j.into_iter().map(f64::from).collect(),
+                            edges.clone(),
+                        )
+                    })
                 })
         })
     }
@@ -616,12 +656,12 @@ mod tests {
         }
     }
 
-    fn assert_fill_h_j(t: &SelfFeedingTopology, graph: &IsingGraph) {
-        let (j_csr, h_i8) = fill_h_j(t, graph);
+    fn assert_fill_coefficients(t: &SelfFeedingTopology, graph: &IsingGraph) {
+        let (j_csr, h_i8) = fill_coefficients::<i8>(t, graph, 1000).unwrap();
         assert_eq!(j_csr.len(), t.nnz);
         assert_eq!(h_i8.len(), graph.h.len());
         for (i, &hv) in graph.h.iter().enumerate() {
-            assert_eq!(h_i8[i], quantize_i8(hv));
+            assert_eq!(h_i8[i], hv as i8);
         }
         // Untouched positions stay 0: build a mask of written indices.
         let mut written = vec![false; t.nnz];
@@ -632,7 +672,7 @@ mod tests {
             if u >= t.n || v >= t.n {
                 continue;
             }
-            let val = quantize_i8(graph.j.get(k).copied().unwrap_or(0.0));
+            let val = graph.j.get(k).copied().unwrap_or(0.0) as i8;
             assert_eq!(j_csr[pos_ij as usize], val);
             written[pos_ij as usize] = true;
             if u != v {
@@ -683,13 +723,13 @@ mod tests {
             assert_partition(&t);
             assert_csr(&t);
             assert_edge_pos(&t, &graph);
-            assert_fill_h_j(&t, &graph);
+            assert_fill_coefficients(&t, &graph);
         }
     }
 
     proptest! {
         #[test]
-        fn prop_fill_h_j_with_shorter_edges(
+        fn prop_fill_coefficients_with_shorter_edges(
             n in 1usize..=8,
             edge_count in 1usize..=12,
         ) {
@@ -707,7 +747,7 @@ mod tests {
                 establish.j[..keep].to_vec(),
                 edges[..keep].to_vec(),
             );
-            assert_fill_h_j(&t, &short);
+            assert_fill_coefficients(&t, &short);
         }
     }
 }

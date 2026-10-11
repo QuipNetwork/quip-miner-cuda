@@ -21,7 +21,7 @@ use crate::driver_budget::{Bucket, DriverBudget};
 use crate::kernel::KernelKind;
 use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
-use crate::topology::{fill_h_j, SelfFeedingTopology};
+use crate::topology::{fill_coefficients, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use quip_protocol::scoring::energy_milli;
@@ -663,7 +663,8 @@ impl<'a> SelfFeedingSession<'a> {
 
         self.stage_j[..nnz.max(1)].fill(0);
         self.stage_h[..n.max(1)].fill(0);
-        let (j, h) = fill_h_j(&self.topology, graph);
+        let (j, h) = fill_coefficients::<i8>(&self.topology, graph, 1000)
+            .map_err(SampleError::Unsupported)?;
         self.stage_j[..j.len()].copy_from_slice(&j);
         self.stage_h[..h.len()].copy_from_slice(&h);
 
