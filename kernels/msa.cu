@@ -405,7 +405,9 @@ __global__ void cuda_msa_self_feeding(
 #ifdef QUIP_MSA_LANE_I32
                         const long long bound = __ldg(&neglog_table[draw & NEGLOG_MASK]);
 #else
-                        const float u = ((float)(draw >> 40) + 0.5f) * 5.9604645e-8f;
+                        // 23 bits keep k + 0.5f exact,
+                        // so u never reaches 1.0f.
+                        const float u = ((float)(draw >> 41) + 0.5f) * 1.1920929e-7f;
 #endif
                         u64 accept = 0ull;
                         for (int lane = 0; lane < 64; ++lane) {
