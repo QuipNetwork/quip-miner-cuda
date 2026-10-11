@@ -473,12 +473,12 @@ impl CudaDevice {
             }
         };
         let sa_nodes = nodes_for(KernelKind::Sa);
-        // The wide workspace is four bytes per node per thread, four times the
-        // int8 one. Its budget is resolved here, not at the identity, so a device
-        // that holds a mining job at `max_nodes` but no wide job that large still
-        // opens: the wide job is refused per job instead.
+        // The wide local frame is fixed at the compiled `sa_nodes`; only its
+        // four-byte delta workspace scales with the job size. Resolve that
+        // budget here so a device that holds a mining job but no wide job that
+        // large still opens: the wide job is refused per job instead.
         let sa_wide_max_nodes = if kernel == KernelKind::Sa {
-            capacity::sa_wide_budget(&limits).min(sa_nodes)
+            capacity::sa_wide_budget(sa_nodes, &limits)
         } else {
             0
         };
