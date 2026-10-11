@@ -97,11 +97,12 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         // SA has no degree bound (`Some(0)` is unbounded).
         limits: ModelLimits {
             max_degree: Some(0),
-            // The wide path holds every whole milli value up to a local field of
-            // i32::MAX / 4 milli (at scale 1, the worst case). Above that, the SDK
-            // refuses before the job reaches the device.
+            // The wide path holds a local field up to WIDE_MAX_FIELD milli. Advertise
+            // one milli less because quip-solver-core 0.0.3's --solve conversion
+            // (encoding::float_milli) does not round: 536870.91 units does not multiply
+            // to a whole milli in f64, while 536870.909 does.
             max_local_field_milli: Some(
-                u32::try_from(coefficients::WIDE_MAX_FIELD).unwrap_or(u32::MAX),
+                u32::try_from(coefficients::WIDE_MAX_FIELD - 1).unwrap_or(u32::MAX),
             ),
             exact_resolution_milli: Some(1),
         },
