@@ -26,6 +26,9 @@ const INT8_MAX_COEF: i64 = 127;
 /// `4 * field <= i32::MAX` keeps every intermediate in `int`.
 pub const WIDE_MAX_FIELD: i64 = 536_870_911;
 
+/// Largest local field, in scale units, the weighted MSA lanes hold exactly.
+pub const MSA_WEIGHTED_MAX_FIELD: i64 = (1 << 24) - 1;
+
 /// Relative bound on the rounding error of `milli / 1000 * 1000`, scaled by
 /// the rounded milli magnitude with a floor of one.
 const MILLI_TOLERANCE: f64 = 4.0 * f64::EPSILON;
@@ -35,7 +38,7 @@ const MILLI_TOLERANCE: f64 = 4.0 * f64::EPSILON;
 pub enum CoefficientPath {
     /// Today's kernels: `signed char` coefficients (and an int8 SA delta).
     Int8,
-    /// `kernels/sa.cu` built with `-DQUIP_SA_WIDE`: i32 coefficients and delta.
+    /// i32 coefficients: wide SA delta or weighted MSA lane arithmetic.
     Wide,
 }
 
@@ -110,8 +113,8 @@ fn max_local_field(h: &[i64], j: &[i64], edges: &[(usize, usize)]) -> i64 {
 
 /// Classify one job for `kind`.
 ///
-/// `wide_max_nodes` is the largest node count the wide SA workspace fits on
-/// this device (`CudaDevice::sa_wide_max_nodes`). Zero means no wide path.
+/// `wide_max_nodes` is the device's node budget for wide SA or weighted MSA.
+/// Zero means no wide path.
 ///
 /// # Errors
 ///
@@ -147,8 +150,19 @@ pub fn plan(
                     path: CoefficientPath::Int8,
                     scale_milli: 1000,
                 })
+            } else if field > MSA_WEIGHTED_MAX_FIELD {
+                Err(format!(
+                    "msa: local field {field} times the model's {scale_milli} milli step exceeds the weighted path's limit of {MSA_WEIGHTED_MAX_FIELD}"
+                ))
+            } else if wide_max_nodes == 0 {
+                Err("msa: the model needs the weighted path, which this device does not offer".into())
+            } else if graph.h.len() > wide_max_nodes {
+                Err(format!(
+                    "msa: the weighted path holds {wide_max_nodes} nodes on this device, the model has {}",
+                    graph.h.len()
+                ))
             } else {
-                Err("msa takes only unit models: every J must be ±1 and every h -1, 0 or +1".into())
+                Ok(CoefficientPlan { path: CoefficientPath::Wide, scale_milli })
             }
         }
         KernelKind::Gibbs if max_coef <= INT8_MAX_COEF => Ok(int8),
@@ -335,19 +349,44 @@ mod tests {
     }
 
     #[test]
-    fn msa_accepts_only_unit_models() {
-        let unit = graph(vec![1.0, 0.0], vec![-1.0], vec![(0, 1)]);
-        assert!(plan(KernelKind::Msa, &unit, NO_WIDE).is_ok());
-        for (h, j) in [
-            (vec![2.0, 0.0], -1.0),
-            (vec![1.0, 0.0], 2.0),
-            (vec![0.5, 0.0], 1.0),
-            (vec![1.0, 0.0], 0.0),
-        ] {
-            let g = graph(h.clone(), vec![j], vec![(0, 1)]);
-            let err = plan(KernelKind::Msa, &g, NO_WIDE).unwrap_err();
-            assert!(err.contains("msa"), "h {h:?} j {j}: {err}");
-        }
+    fn msa_unit_models_stay_on_the_unit_kernel() {
+        let g = IsingGraph::new(vec![1.0, 0.0, -1.0], vec![1.0, -1.0], vec![(0, 1), (1, 2)]);
+        let p = plan(KernelKind::Msa, &g, 0).unwrap();
+        assert_eq!((p.path, p.scale_milli), (CoefficientPath::Int8, 1000));
+    }
+
+    #[test]
+    fn msa_weighted_models_take_the_weighted_path_at_their_scale() {
+        // The conformance driver's session fixture.
+        let g = IsingGraph::new(
+            vec![1.0, -1.0, 0.25],
+            vec![0.5, -0.75],
+            vec![(0, 1), (1, 2)],
+        );
+        let p = plan(KernelKind::Msa, &g, 5000).unwrap();
+        assert_eq!((p.path, p.scale_milli), (CoefficientPath::Wide, 250));
+    }
+
+    #[test]
+    fn msa_weighted_field_bound_is_two_to_the_24_minus_one() {
+        // The 0.001 coupling pins the GCD scale at 1 milli. Node 1 touches both
+        // edges, so its field is the sum of the two magnitudes in milli.
+        let edges = vec![(0, 1), (1, 2)];
+        let fits = IsingGraph::new(vec![0.0; 3], vec![16_777.214, 0.001], edges.clone());
+        assert_eq!(
+            plan(KernelKind::Msa, &fits, 5000).unwrap().path,
+            CoefficientPath::Wide
+        );
+        let over = IsingGraph::new(vec![0.0; 3], vec![16_777.215, 0.001], edges);
+        assert!(plan(KernelKind::Msa, &over, 5000).is_err());
+    }
+
+    #[test]
+    fn msa_weighted_needs_a_node_budget() {
+        let g = IsingGraph::new(vec![0.5, 0.0], vec![1.0], vec![(0, 1)]);
+        assert!(plan(KernelKind::Msa, &g, 0).is_err());
+        assert!(plan(KernelKind::Msa, &g, 1).is_err());
+        assert!(plan(KernelKind::Msa, &g, 2).is_ok());
     }
 
     #[test]

@@ -19,6 +19,24 @@ pub const SA_WIDE_DEFINE: &str = "-DQUIP_SA_WIDE";
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 /// Multi-spin coded SA, see `kernels/msa.cu`.
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
+/// NVRTC define selecting i32 coefficients for weighted MSA.
+pub const MSA_WEIGHTED_DEFINE: &str = "-DQUIP_MSA_WEIGHTED";
+/// NVRTC define selecting integer lane arithmetic for weighted MSA.
+pub const MSA_LANE_I32_DEFINE: &str = "-DQUIP_MSA_LANE_I32";
+/// NVRTC define selecting floating-point lane arithmetic for weighted MSA.
+pub const MSA_LANE_F32_DEFINE: &str = "-DQUIP_MSA_LANE_F32";
+
+/// Lane arithmetic used by weighted MSA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsaLane {
+    /// Integer-only Metropolis decisions, consistent across GPU models.
+    I32,
+    /// Floating-point Metropolis decisions using `__expf`.
+    F32,
+}
+
+/// Default weighted MSA lane until measurements select the release default.
+pub const DEFAULT_MSA_LANE: MsaLane = MsaLane::I32;
 
 /// Every GPU architecture the miner supports: the intersection of what NVRTC
 /// 12.9 targets natively (`sm_50..sm_121`, measured via `nvrtcGetSupportedArchs`
@@ -56,6 +74,18 @@ fn select_arch(cc: i32) -> i32 {
         .filter(|&a| a <= cc)
         .max()
         .unwrap_or(70)
+}
+
+/// Detect the device capability and clamp it to the supported compile targets.
+fn device_arch(ctx: &CudaContext) -> i32 {
+    let cc = match (
+        ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
+        ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
+    ) {
+        (Ok(major), Ok(minor)) => major * 10 + minor,
+        _ => 70,
+    };
+    select_arch(cc)
 }
 
 /// `cuDriverGetVersion`, wrapped safely (cudarc exposes only the raw sys fn).
@@ -121,28 +151,33 @@ fn compile_for_arch(
         .map_err(|e| CudaError::Compile(format!("compute_{arch} compile failed: {e}")))
 }
 
-/// PTX modules for the four kernels, in `(sa, sa_wide, msa, gibbs)` order.
+/// PTX modules in `(sa, sa_wide, msa, gibbs, msa_weighted_i32, msa_weighted_f32)` order.
 type CompiledKernels = (
+    Arc<CudaModule>,
+    Arc<CudaModule>,
     Arc<CudaModule>,
     Arc<CudaModule>,
     Arc<CudaModule>,
     Arc<CudaModule>,
 );
 
-/// Compile all four kernels for `arch`, keyed by kernel name in the
-/// JIT cache. Kept out of [`CudaDevice::open_with_nodes`] to stay under the
-/// crate's function-length cap.
+/// Compile the four base kernels and, for MSA opens, both weighted lanes.
+/// Kept out of [`CudaDevice::open_with_nodes`] to stay under the function-length cap.
 fn compile_all_kernels(
     ctx: &Arc<CudaContext>,
     arch: &str,
     driver_ver: i32,
-    sa_nodes: usize,
-    msa_nodes: usize,
-    gibbs_nodes: usize,
+    nodes: (usize, usize, usize),
     sel: i32,
+    kernel: KernelKind,
 ) -> Result<CompiledKernels, CudaError> {
-    let _span = trace_span!("jit", kernels = 4).entered();
-    Ok((
+    let (sa_nodes, msa_nodes, gibbs_nodes) = nodes;
+    let _span = trace_span!(
+        "jit",
+        kernels = if kernel == KernelKind::Msa { 6 } else { 4 }
+    )
+    .entered();
+    let (sa, sa_wide, msa, gibbs) = (
         jit_cache::load_or_compile(
             ctx,
             KernelKind::Sa.name(),
@@ -183,7 +218,28 @@ fn compile_all_kernels(
             gibbs_nodes,
             || compile_for_arch(GIBBS_SRC, gibbs_nodes, sel, &[]),
         )?,
-    ))
+    );
+    let weighted = |name, lane| {
+        if kernel != KernelKind::Msa {
+            // Concrete handle fields reuse the unit module when these lanes
+            // cannot launch. Only MSA opens compile the weighted modules.
+            return Ok(Arc::clone(&msa));
+        }
+        let defines = [MSA_WEIGHTED_DEFINE, lane];
+        jit_cache::load_or_compile(
+            ctx,
+            name,
+            MSA_SRC,
+            &defines,
+            arch,
+            driver_ver,
+            msa_nodes,
+            || compile_for_arch(MSA_SRC, msa_nodes, sel, &defines),
+        )
+    };
+    let integer_lane = weighted("msa-weighted-i32", MSA_LANE_I32_DEFINE)?;
+    let float_lane = weighted("msa-weighted-f32", MSA_LANE_F32_DEFINE)?;
+    Ok((sa, sa_wide, msa, gibbs, integer_lane, float_lane))
 }
 
 /// Verify the loaded msa kernel declares no more static shared
@@ -322,6 +378,12 @@ pub struct CudaDevice {
     /// `cuda_msa_self_feeding` — persistent kernel, 1 block (1 SM) per
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
+    /// Weighted integer MSA. Aliases the unit function on non-MSA opens.
+    #[allow(dead_code)] // Weighted session launches are wired in Task 10.
+    pub(crate) msa_weighted_i32: CudaFunction,
+    /// Weighted floating-point MSA. Aliases the unit function on non-MSA opens.
+    #[allow(dead_code)] // Weighted session launches are wired in Task 10.
+    pub(crate) msa_weighted_f32: CudaFunction,
     /// Dynamic shared memory one msa block may request: the device's opt-in
     /// ceiling less the kernel's static members. `streaming` sizes msa
     /// sessions against it; `capacity::msa_budget` derives `max_nodes` from
@@ -346,6 +408,8 @@ pub struct CudaDevice {
     _sa_wide_mod: Arc<CudaModule>,
     _gibbs_mod: Arc<CudaModule>,
     _msa_mod: Arc<CudaModule>,
+    _msa_weighted_i32_mod: Arc<CudaModule>,
+    _msa_weighted_f32_mod: Arc<CudaModule>,
 }
 
 // Scalar device facts only; the context, stream, kernel handles and loaded
@@ -490,32 +554,30 @@ impl CudaDevice {
         // compute_70 PTX loads on every supported card. The selected arch
         // feeds both the compile and the cache key, so the key always
         // describes the artifact it stores.
-        let cc = match (
-            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
-            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
-        ) {
-            (Ok(major), Ok(minor)) => major * 10 + minor,
-            _ => 70,
-        };
-        let sel = select_arch(cc);
+        let sel = device_arch(&ctx);
         let arch = format!("sm_{sel}");
-        let driver_ver = driver_version()?;
 
-        let (sa_mod, sa_wide_mod, msa_mod, gibbs_mod) = compile_all_kernels(
-            &ctx,
-            &arch,
-            driver_ver,
-            sa_nodes,
-            msa_nodes,
-            gibbs_nodes,
-            sel,
-        )?;
+        let (sa_mod, sa_wide_mod, msa_mod, gibbs_mod, integer_mod, float_mod) =
+            compile_all_kernels(
+                &ctx,
+                &arch,
+                driver_version()?,
+                (sa_nodes, msa_nodes, gibbs_nodes),
+                sel,
+                kernel,
+            )?;
 
         let sa = sa_mod.load_function("cuda_sa_self_feeding")?;
         let sa_wide = sa_wide_mod.load_function("cuda_sa_self_feeding")?;
         let msa = msa_mod.load_function("cuda_msa_self_feeding")?;
+        let integer_lane = integer_mod.load_function("cuda_msa_self_feeding")?;
+        let float_lane = float_mod.load_function("cuda_msa_self_feeding")?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
         let msa_dynamic_shared_bytes = configure_msa_shared_memory(&msa, shared_per_block_optin)?;
+        if kernel == KernelKind::Msa {
+            configure_msa_shared_memory(&integer_lane, shared_per_block_optin)?;
+            configure_msa_shared_memory(&float_lane, shared_per_block_optin)?;
+        }
         let msa_replica_words =
             resolve_msa_replica_words(msa_dynamic_shared_bytes, msa_nodes, kernel)?;
 
@@ -536,6 +598,8 @@ impl CudaDevice {
             sa_wide,
             gibbs,
             msa,
+            msa_weighted_i32: integer_lane,
+            msa_weighted_f32: float_lane,
             msa_dynamic_shared_bytes,
             msa_replica_words,
             max_sms: max_sms.max(1),
@@ -545,6 +609,8 @@ impl CudaDevice {
             _sa_wide_mod: sa_wide_mod,
             _gibbs_mod: gibbs_mod,
             _msa_mod: msa_mod,
+            _msa_weighted_i32_mod: integer_mod,
+            _msa_weighted_f32_mod: float_mod,
         })
     }
 
@@ -652,6 +718,55 @@ fn device_from_miner_id(miner_id: &str) -> Option<usize> {
 pub fn device_label_mismatch(miner_id: Option<&str>, device: usize) -> Option<usize> {
     let labelled = miner_id.and_then(device_from_miner_id)?;
     (labelled != device).then_some(labelled)
+}
+
+#[cfg(test)]
+mod msa_weighted_gpu_tests {
+    use super::CudaDevice;
+    use crate::{capacity, KernelKind};
+
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "requires a CUDA GPU"]
+    fn msa_open_loads_both_weighted_lane_modules() {
+        if CudaDevice::device_count().unwrap_or(0) == 0 {
+            eprintln!("no CUDA device visible; skipping");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("quip-msa-weighted-test-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::env::set_var("QUIP_CUDA_CACHE", &dir);
+        std::env::remove_var("QUIP_CUDA_CACHE_DISABLE");
+
+        let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 5640).expect("MSA at 5640");
+        assert_eq!(device.max_nodes, 5640);
+        let ptx: Vec<_> = std::fs::read_dir(&dir)
+            .expect("cache dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "ptx"))
+            .collect();
+        assert_eq!(
+            ptx.len(),
+            6,
+            "MSA open must cache both weighted lane modules"
+        );
+        for name in ["msa-weighted-i32-", "msa-weighted-f32-"] {
+            assert!(ptx
+                .iter()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(name)));
+        }
+        for lane in [&device.msa_weighted_i32, &device.msa_weighted_f32] {
+            assert!(
+                usize::try_from(lane.shared_size_bytes().expect("loaded weighted function"))
+                    .expect("nonnegative static shared memory")
+                    <= capacity::MSA_STATIC_SHARED_BYTES
+            );
+        }
+
+        drop(std::fs::remove_dir_all(&dir));
+        std::env::remove_var("QUIP_CUDA_CACHE");
+    }
 }
 
 #[cfg(test)]
