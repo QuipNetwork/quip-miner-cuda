@@ -16,6 +16,7 @@
 
 pub mod bench;
 pub mod capacity;
+pub mod coefficients;
 pub mod corpus;
 pub mod cuda_device;
 pub mod driver_budget;
