@@ -121,6 +121,18 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
                 &[][..],
             ),
             ("sa-wide", SA_SRC, 512, &[SA_WIDE_DEFINE][..]),
+            (
+                "msa-weighted-i32",
+                MSA_SRC,
+                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+                &["-DQUIP_MSA_WEIGHTED", "-DQUIP_MSA_LANE_I32"][..],
+            ),
+            (
+                "msa-weighted-f32",
+                MSA_SRC,
+                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+                &["-DQUIP_MSA_WEIGHTED", "-DQUIP_MSA_LANE_F32"][..],
+            ),
         ] {
             if let Err(e) = compile_and_assemble(name, src, nodes, arch, defines) {
                 failures.push(e);
