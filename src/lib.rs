@@ -14,6 +14,7 @@
 //! its internal annealing accept/reject decisions. The coordinator session
 //! loop lives in `quip-solver-core`.
 
+pub mod accept_table;
 pub mod bench;
 pub mod capacity;
 pub mod coefficients;
