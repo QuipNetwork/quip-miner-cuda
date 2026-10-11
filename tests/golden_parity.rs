@@ -13,7 +13,7 @@ use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
 use quip_solver_conformance::GOLDEN_VECTORS;
 use quip_solver_cuda::cuda_device::CudaDevice;
-use quip_solver_cuda::sampler::sample_ising;
+use quip_solver_cuda::sampler::{sample_ising, SampleError};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serde_json::Value;
 use serial_test::serial;
@@ -112,8 +112,21 @@ fn live_sample_energies_match_energy_milli() {
         ..Default::default()
     };
 
+    let msa_graph = IsingGraph::new(
+        vec![1.0, -1.0, 0.0, 1.0],
+        graph.j.clone(),
+        graph.edges.to_vec(),
+    );
+    let err = sample_ising(dev, &graph, &params, KernelKind::Msa).unwrap_err();
+    assert!(matches!(err, SampleError::Unsupported(_)), "{err}");
+
     for kernel in [KernelKind::Sa, KernelKind::Msa, KernelKind::Gibbs] {
-        let results = sample_ising(dev, &graph, &params, kernel).expect("sample");
+        let graph = if kernel == KernelKind::Msa {
+            &msa_graph
+        } else {
+            &graph
+        };
+        let results = sample_ising(dev, graph, &params, kernel).expect("sample");
         assert_eq!(results.len(), 16);
         for r in &results {
             let expected = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);

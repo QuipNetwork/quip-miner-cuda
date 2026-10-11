@@ -2541,6 +2541,26 @@ mod tests {
     }
 
     #[test]
+    fn explicit_beta_schedule_applies_non_unit_plan_factor() {
+        let mut g = graph();
+        g.h.iter_mut().for_each(|v| *v *= 0.25);
+        g.j.iter_mut().for_each(|v| *v *= 0.25);
+        let plan = coefficients::plan(KernelKind::Sa, &g, 0).unwrap();
+        assert_eq!(plan.scale_milli, 250);
+        let (hot, cold) = (0.13_f64, 9.7_f64);
+        let (schedule, sweeps_per) =
+            build_beta_schedule(&g, 68, 4, Some((hot, cold)), plan.beta_factor());
+        assert_eq!(sweeps_per, 4);
+        assert_eq!(schedule.len(), 17);
+        for (i, actual) in (0_u32..17).zip(schedule) {
+            let fraction = f64::from(i) / 16.0;
+            let f64_beta = (hot.ln() + fraction * (cold.ln() - hot.ln())).exp();
+            let expected = (f64_beta * 0.25) as f32;
+            assert_eq!(actual.to_bits(), expected.to_bits(), "beta entry {i}");
+        }
+    }
+
+    #[test]
     fn beta_schedule_length_is_sweeps_over_sweeps_per_beta() {
         let (sched, sweeps_per) = build_beta_schedule(&graph(), 100, 10, Some((0.1, 10.0)), 1.0);
         assert_eq!(sweeps_per, 10);

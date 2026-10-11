@@ -5,8 +5,11 @@
 //! never confuses "self-skipped" with "passed" ([quip-miner-cuda-gp2] part b).
 //! Run them on a GPU host: `cargo test -p quip-solver-cuda -- --ignored`.
 
-use quip_solver_conformance::driver::{drive_miner, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER};
+use quip_solver_conformance::driver::{
+    drive_miner, DriverReport, Terminal, CONFIGURED_SWEEPS, GIBBS_SWEEP_MULTIPLIER,
+};
 use quip_solver_conformance::solve::drive_solve;
+use quip_solver_core::quip_proto::v1::RejectReason;
 use quip_solver_core::quip_protocol::session::PROTOCOL_VERSION;
 use serial_test::serial;
 use std::process::Command;
@@ -57,7 +60,61 @@ async fn quip_cuda_msa_passes_conformance() {
             .as_nanos()
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
-    assert!(report.is_conformant(), "{}", report.summary());
+    assert_msa_conformance_with_unit_model_refusals(&report);
+}
+
+/// Driver 0.0.3's `valid_ising`, `hash_ising`, `sparse_ising`, and `seeded_ising`
+/// fixtures use fractional J or h.
+/// Remove this helper when the driver sends unit fixtures to solvers advertising
+/// `exact_resolution_milli >= 1000`.
+fn assert_msa_conformance_with_unit_model_refusals(report: &DriverReport) {
+    assert!(
+        report.handshake_ok
+            && report.ready_received
+            && !report.job_request_credits.is_empty()
+            && report.job_request_credits.iter().all(|&c| c > 0)
+            && report.has_reject(b"job-bad-h", RejectReason::Malformed)
+            && report.has_reject(b"job-bad-j", RejectReason::Malformed)
+            && report.has_reject(b"job-gate", RejectReason::UnsupportedKind)
+            && report.has_reject(b"job-old", RejectReason::Expired)
+            && report.warm_start_conformant()
+            && report.lease_conformant()
+            && report.cancel_acked
+            && report.ping_acked
+            && report.capabilities_conformant()
+            && report.credit_ledger_balanced()
+            && report.terminal == Terminal::Closed
+            && report.timed_out_phases.is_empty()
+            && report.exit_code == 0,
+        "{}",
+        report.summary()
+    );
+    for id in [
+        b"job-1".as_slice(),
+        b"job-2",
+        b"job-hash",
+        b"job-sparse",
+        b"job-seeded",
+        b"job-cancel",
+        b"job-stale",
+    ] {
+        // SampleError::Capacity maps to TooLarge on the 0.0.3 wire.
+        assert!(
+            report.has_reject(id, RejectReason::TooLarge),
+            "{id:?} must be rejected as Capacity: {report:?}"
+        );
+        assert!(
+            !report.results.iter().any(|r| r.job_id == id),
+            "{id:?} must not produce a Result: {report:?}"
+        );
+    }
+    assert!(report.energies_rescore_clean(), "{report:?}");
+    assert!(report.sweeps_honoured(), "{report:?}");
+    assert!(report.cancelled_watermark > 0, "{report:?}");
+    assert!(
+        report.abandoned_watermark() >= report.cancelled_watermark,
+        "{report:?}"
+    );
 }
 
 #[tokio::test]
