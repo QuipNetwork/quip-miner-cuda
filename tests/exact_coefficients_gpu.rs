@@ -312,12 +312,18 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     use quip_solver_core::{CancelToken, SampleError as WireSampleError, StreamJob, StreamOutcome};
     use quip_solver_cuda::coefficients::{plan, CoefficientPath};
     use quip_solver_cuda::nvml_gov::UtilGovernor;
-    use quip_solver_cuda::streaming::run_stream;
+    use quip_solver_cuda::streaming::{run_stream, stream_width};
     use tokio::sync::mpsc::channel;
 
     let unit = IsingGraph::new(vec![0.0, 0.0], vec![1.0], vec![(0, 1)]);
-    // Field 65 exceeds SA's int8 delta bound and MSA's unit coefficients.
-    let wide = IsingGraph::new(vec![64.0, 0.0], vec![1.0], vec![(0, 1)]);
+    // Field 66 exceeds SA's int8 delta bound and MSA's unit coefficients.
+    let mut fields = vec![0.0; 12];
+    fields[0] = 64.0;
+    let wide = IsingGraph::new(
+        fields,
+        vec![1.0; 12],
+        (0..12).map(|i| (i, (i + 1) % 12)).collect(),
+    );
     let refused = IsingGraph::new(vec![1e-19, 0.0], vec![1.0], vec![(0, 1)]);
     let dev = device(kind);
     let node_budget = match kind {
@@ -334,15 +340,22 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
         CoefficientPath::Wide
     );
 
-    let graphs = [unit.clone(), wide, refused, unit];
-    let (job_tx, job_rx) = channel::<StreamJob>(16);
+    let mut graphs = vec![unit.clone()];
+    // Fill cold-start admission so the refusal reaches the running session's pump.
+    graphs.extend((0..stream_width(dev, kind)).map(|_| wide.clone()));
+    let refused_id = graphs.len();
+    graphs.extend([refused, unit]);
+    let (job_tx, job_rx) = channel::<StreamJob>(graphs.len());
     let (res_tx, mut res_rx) = channel(16);
     for (id, graph) in graphs.iter().enumerate() {
         job_tx
             .try_send(StreamJob {
                 job_id: vec![u8::try_from(id).unwrap()],
                 graph: graph.clone(),
-                params: params(),
+                params: SampleParams {
+                    num_sweeps: 8192,
+                    ..params()
+                },
                 watermark: None,
             })
             .unwrap();
@@ -352,7 +365,7 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
         let gov = UtilGovernor::start(&dev.pci_bus_id, 100, false);
         run_stream(dev, kind, job_rx, res_tx, CancelToken::default(), &gov);
     });
-    let mut seen = [false; 4];
+    let mut seen = vec![false; graphs.len()];
     while let Some(result) = res_rx.blocking_recv() {
         let id = usize::from(result.job_id[0]);
         assert!(!seen[id], "duplicate result for job {id}");
@@ -360,7 +373,7 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
         let StreamOutcome::Completed(reads) = result.outcome else {
             panic!("job {id} was cancelled");
         };
-        if id == 2 {
+        if id == refused_id {
             assert_eq!(reads.unwrap_err(), WireSampleError::Capacity);
         } else {
             let reads = reads.expect("accepted jobs in flight must complete");
@@ -369,7 +382,7 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
         }
     }
     driver.join().expect("stream driver exits after draining");
-    assert_eq!(seen, [true; 4], "one outcome for every job");
+    assert_eq!(seen, vec![true; graphs.len()], "one outcome for every job");
 }
 
 /// `K_n` with J in {-1, +1} from a fixed pattern and h = 0.
