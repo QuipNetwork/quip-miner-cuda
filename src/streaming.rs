@@ -1409,6 +1409,16 @@ struct SessionKey {
     plan: SessionArithmetic,
     kernel: KernelKind,
     wide_max_nodes: usize,
+    /// Unit-coupling field contribution, fixed by this session's topology.
+    unit_degree: Vec<usize>,
+    unit_connected: usize,
+}
+
+/// Arithmetic and literal-unit status validated for one admitted job.
+#[derive(Clone, Copy)]
+struct JobPlan {
+    arithmetic: SessionArithmetic,
+    unit_mining: bool,
 }
 
 impl SessionKey {
@@ -1420,6 +1430,14 @@ impl SessionKey {
         msa_lane: MsaLane,
     ) -> Result<Self, String> {
         let plan = coefficients::plan(kernel, &job.graph, wide_max_nodes)?;
+        let n = job.graph.h.len();
+        let mut unit_degree = vec![0; n];
+        for &(u, v) in job.graph.edges.iter() {
+            if u < n && v < n {
+                unit_degree[u] += 1;
+                unit_degree[v] += 1;
+            }
+        }
         Ok(Self {
             n: job.graph.h.len(),
             edges: job.graph.edges.clone(),
@@ -1436,30 +1454,57 @@ impl SessionKey {
             },
             kernel,
             wide_max_nodes,
+            unit_connected: unit_degree.iter().filter(|&&degree| degree > 0).count(),
+            unit_degree,
         })
     }
 
-    fn plan_for(&self, job: &StreamJob) -> Result<SessionArithmetic, String> {
-        coefficients::plan(self.kernel, &job.graph, self.wide_max_nodes).map(|coefficients| {
-            SessionArithmetic {
-                coefficients,
-                msa_lane: self.plan.msa_lane,
-            }
-        })
+    fn plan_for(&self, job: &StreamJob) -> Result<JobPlan, String> {
+        coefficients::plan_with_unit(self.kernel, &job.graph, self.wide_max_nodes).map(
+            |(coefficients, unit_mining)| JobPlan {
+                arithmetic: SessionArithmetic {
+                    coefficients,
+                    msa_lane: self.plan.msa_lane,
+                },
+                unit_mining,
+            },
+        )
     }
 
-    fn matches(&self, job: &StreamJob, plan: SessionArithmetic) -> bool {
+    fn matches(&self, job: &StreamJob, plan: JobPlan) -> bool {
         self.n == job.graph.h.len()
             && self.edges == job.graph.edges
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
-            && self.plan == plan
-            && self.beta_range
-                == job
-                    .params
-                    .beta_range
-                    .unwrap_or_else(|| default_ising_beta_range(&job.graph))
+            && self.plan == plan.arithmetic
+            && self.beta_range == self.beta_range_for(job, plan.unit_mining)
             && job.params.num_reads.max(1) <= self.reads_per_nonce
+    }
+
+    #[allow(clippy::cast_precision_loss)] // Device-sized degrees and gap counts are below 2^53.
+    fn beta_range_for(&self, job: &StreamJob, unit_mining: bool) -> (f64, f64) {
+        job.params.beta_range.unwrap_or_else(|| {
+            if !unit_mining {
+                return default_ising_beta_range(&job.graph);
+            }
+            // Called after matching N/edges. All nonzero gaps are exactly one.
+            // Device-sized integer degrees and gap counts are exact in f64.
+            let mut max_field = 0;
+            let mut gaps = self.unit_connected;
+            for (&h, &degree) in job.graph.h.iter().zip(&self.unit_degree) {
+                let has_field = h != 0.0;
+                max_field = max_field.max(degree + usize::from(has_field));
+                if degree == 0 && has_field {
+                    gaps += 1;
+                }
+            }
+            if gaps == 0 {
+                return (0.1, 1.0);
+            }
+            let hot = std::f64::consts::LN_2 / (2.0 * max_field as f64);
+            let cold = (gaps as f64 / 0.01).ln() / 2.0;
+            (hot, cold.max(hot))
+        })
     }
 }
 
@@ -2907,10 +2952,13 @@ mod tests {
         seed.graph.h[0] = 0.25;
         let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 5000, MsaLane::I32).unwrap();
         let integer = key.plan_for(&seed).unwrap();
-        assert_eq!(integer.coefficients.path, CoefficientPath::Wide);
+        assert_eq!(integer.arithmetic.coefficients.path, CoefficientPath::Wide);
         assert!(key.matches(&seed, integer));
-        let float = SessionArithmetic {
-            msa_lane: MsaLane::F32,
+        let float = JobPlan {
+            arithmetic: SessionArithmetic {
+                msa_lane: MsaLane::F32,
+                ..integer.arithmetic
+            },
             ..integer
         };
         assert!(!key.matches(&seed, float));
@@ -2924,7 +2972,7 @@ mod tests {
         thousand_x.graph.j.iter_mut().for_each(|v| *v *= 1000.0);
         let key = SessionKey::seed(&one_x, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let plan = key.plan_for(&thousand_x).unwrap();
-        assert_eq!(plan.coefficients.scale_milli, 1_000_000);
+        assert_eq!(plan.arithmetic.coefficients.scale_milli, 1_000_000);
         assert!(
             !key.matches(&thousand_x, plan),
             "a 1000x job must not reuse the 1x schedule"
@@ -2939,8 +2987,68 @@ mod tests {
         other.graph.h = vec![3.0, -3.0, 0.0, 3.0];
         let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let plan = key.plan_for(&other).unwrap();
-        assert_eq!(plan.coefficients.scale_milli, 1000);
+        assert_eq!(plan.arithmetic.coefficients.scale_milli, 1000);
         assert!(!key.matches(&other, plan));
+    }
+
+    #[test]
+    fn unit_session_beta_matches_sdk_for_fields_and_isolated_nodes() {
+        let mut seed = job(1);
+        seed.graph = IsingGraph::new(
+            vec![0.0; 5],
+            vec![1.0; 4],
+            vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+        );
+        let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 5000, DEFAULT_MSA_LANE).unwrap();
+        for fields in 0..243 {
+            let mut code = fields;
+            for h in &mut seed.graph.h {
+                *h = [-1.0, 0.0, 1.0][code % 3];
+                code /= 3;
+            }
+            for signs in 0..16 {
+                for (edge, j) in seed.graph.j.iter_mut().enumerate() {
+                    *j = if signs >> edge & 1 == 0 { -1.0 } else { 1.0 };
+                }
+                let expected = default_ising_beta_range(&seed.graph);
+                let actual = key.beta_range_for(&seed, key.plan_for(&seed).unwrap().unit_mining);
+                assert_eq!(
+                    (actual.0.to_bits(), actual.1.to_bits()),
+                    (expected.0.to_bits(), expected.1.to_bits())
+                );
+                assert_eq!(
+                    key.matches(&seed, key.plan_for(&seed).unwrap()),
+                    key.beta_range == expected
+                );
+            }
+        }
+        seed.params.beta_range = Some((0.125, 9.5));
+        assert_eq!(
+            key.beta_range_for(&seed, key.plan_for(&seed).unwrap().unit_mining),
+            (0.125, 9.5)
+        );
+    }
+
+    #[test]
+    fn unit_session_beta_keeps_sdk_fallbacks() {
+        for graph in [
+            IsingGraph::new(vec![], vec![], vec![]),
+            IsingGraph::new(vec![0.0, -0.0], vec![], vec![]),
+            IsingGraph::new(vec![1.0, 0.0], vec![], vec![(0, 1)]),
+            IsingGraph::new(vec![1.0, 0.0], vec![0.0], vec![(0, 1)]),
+            IsingGraph::new(vec![1.0 + f64::EPSILON, 0.0], vec![1.0], vec![(0, 1)]),
+            IsingGraph::new(vec![0.25, -0.75], vec![0.5], vec![(0, 1)]),
+        ] {
+            let mut seed = job(1);
+            seed.graph = graph;
+            let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 5000, DEFAULT_MSA_LANE).unwrap();
+            let actual = key.beta_range_for(&seed, key.plan_for(&seed).unwrap().unit_mining);
+            let expected = default_ising_beta_range(&seed.graph);
+            assert_eq!(
+                (actual.0.to_bits(), actual.1.to_bits()),
+                (expected.0.to_bits(), expected.1.to_bits())
+            );
+        }
     }
 
     #[test]

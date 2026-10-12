@@ -320,6 +320,29 @@ where
     }
     let scale = i64::try_from(scale_milli)
         .map_err(|_| format!("scale {scale_milli} milli is out of range"))?;
+    if scale == 1000 && crate::coefficients::is_unit_mining(graph) {
+        // Select the converter once, after validating every literal coefficient.
+        return fill_converted(topology, graph, |v| {
+            let units = if v == 0.0 {
+                0
+            } else if v.is_sign_negative() {
+                -1
+            } else {
+                1
+            };
+            T::try_from(units).map_err(|_| {
+                format!("coefficient {v} at 1000 milli per unit does not fit the kernel type")
+            })
+        });
+    }
+    fill_converted(topology, graph, |v| scaled(v, scale))
+}
+
+fn fill_converted<T: Copy + Default>(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+    convert: impl Fn(f64) -> Result<T, String>,
+) -> Result<(Vec<T>, Vec<T>), String> {
     let mut j_csr = vec![T::default(); topology.nnz];
     for (k, &(pos_ij, pos_ji)) in topology.edge_pos.iter().enumerate() {
         // quip-miner-cuda-2sg: fallible get. edge_pos is sized from the
@@ -330,7 +353,7 @@ where
         if u >= topology.n || v >= topology.n {
             continue;
         }
-        let val = scaled(graph.j.get(k).copied().unwrap_or(0.0), scale)?;
+        let val = convert(graph.j.get(k).copied().unwrap_or(0.0))?;
         j_csr[pos_ij as usize] = val;
         if u != v {
             j_csr[pos_ji as usize] = val;
@@ -339,7 +362,7 @@ where
     let h = graph
         .h
         .iter()
-        .map(|&v| scaled(v, scale))
+        .map(|&v| convert(v))
         .collect::<Result<Vec<T>, _>>()?;
     Ok((j_csr, h))
 }
@@ -487,6 +510,23 @@ mod tests {
         let graph = IsingGraph::new(vec![1.0], vec![], vec![]);
         let topology = SelfFeedingTopology::build(&graph);
         assert!(fill_coefficients::<i8>(&topology, &graph, 0).is_err());
+    }
+
+    #[test]
+    fn unit_fill_keeps_kernel_type_checks() {
+        for graph in [
+            IsingGraph::new(vec![-1.0, 0.0], vec![1.0], vec![(0, 1)]),
+            IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]),
+        ] {
+            let topology = SelfFeedingTopology::build(&graph);
+            assert!(fill_coefficients::<u8>(&topology, &graph, 1000).is_err());
+        }
+        let graph = IsingGraph::new(vec![1.0, 1.0], vec![1.0], vec![(0, 1)]);
+        let topology = SelfFeedingTopology::build(&graph);
+        assert_eq!(
+            fill_coefficients::<u8>(&topology, &graph, 1000).unwrap(),
+            (vec![1, 1], vec![1, 1])
+        );
     }
 
     #[test]

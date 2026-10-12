@@ -98,6 +98,19 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+/// Literal mining coefficients, whose integer scale is already known.
+pub(crate) fn is_unit_mining(graph: &IsingGraph) -> bool {
+    graph.j.len() == graph.edges.len()
+        && graph.h.iter().all(|&v| {
+            let magnitude = v.abs().to_bits();
+            magnitude == 0 || magnitude == 1.0_f64.to_bits()
+        })
+        && graph
+            .j
+            .iter()
+            .all(|&v| v.abs().to_bits() == 1.0_f64.to_bits())
+}
+
 /// `max_i(|h_i| + Σ_j |J_ij|)` in milli, each endpoint of every edge counted,
 /// as `quip_solver_core::ModelLimits::check` counts it.
 fn max_local_field(h: &[i64], j: &[i64], edges: &[(usize, usize)]) -> i64 {
@@ -126,6 +139,27 @@ pub fn plan(
     graph: &IsingGraph,
     wide_max_nodes: usize,
 ) -> Result<CoefficientPlan, String> {
+    plan_with_unit(kind, graph, wide_max_nodes).map(|(plan, _)| plan)
+}
+
+/// Preserve the literal-unit classification for the same job's beta resolution.
+pub(crate) fn plan_with_unit(
+    kind: KernelKind,
+    graph: &IsingGraph,
+    wide_max_nodes: usize,
+) -> Result<(CoefficientPlan, bool), String> {
+    let unit_mining = is_unit_mining(graph);
+    // Unit Gibbs coefficients fit int8, and unit MSA uses its original kernel.
+    // SA still needs its local-field bound, even with unit coefficients.
+    if kind != KernelKind::Sa && unit_mining {
+        return Ok((
+            CoefficientPlan {
+                path: CoefficientPath::Int8,
+                scale_milli: 1000,
+            },
+            true,
+        ));
+    }
     let h = milli_all("h", &graph.h)?;
     let j = milli_all("J", &graph.j)?;
 
@@ -142,7 +176,7 @@ pub fn plan(
         scale_milli,
     };
 
-    match kind {
+    let plan = match kind {
         KernelKind::Msa => {
             let unit_h = h.iter().all(|v| matches!(v, -1000 | 0 | 1000));
             let unit_j = j.iter().all(|v| v.abs() == 1000);
@@ -182,7 +216,8 @@ pub fn plan(
             graph.h.len()
         )),
         KernelKind::Sa => Ok(CoefficientPlan { path: CoefficientPath::Wide, scale_milli }),
-    }
+    };
+    plan.map(|plan| (plan, unit_mining))
 }
 
 #[cfg(test)]
