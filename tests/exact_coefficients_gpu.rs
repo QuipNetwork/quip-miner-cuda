@@ -6,7 +6,7 @@
 use quip_protocol::scoring::energy_milli;
 use quip_solver_cuda::cuda_device::{CudaDevice, MsaLane};
 use quip_solver_cuda::sampler::{sample_ising, SampleError};
-use quip_solver_cuda::streaming::bench_one;
+use quip_solver_cuda::streaming::{bench_one, max_reads};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serial_test::serial;
 use std::sync::OnceLock;
@@ -141,7 +141,9 @@ fn msa_weighted_f32_reaches_quarter_and_scaled_ground_states() {
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
-fn msa_forced_weighted_lanes_solve_unit_models_at_both_read_counts() {
+fn msa_forced_weighted_lanes_solve_unit_models_at_supported_read_counts() {
+    let dev = device(KernelKind::Msa);
+    let read_cap = max_reads(KernelKind::Msa, dev.msa_replica_words);
     let graph = IsingGraph::new(
         vec![0.0; 12],
         vec![1.0; 12],
@@ -149,18 +151,15 @@ fn msa_forced_weighted_lanes_solve_unit_models_at_both_read_counts() {
     );
     for lane in [MsaLane::I32, MsaLane::F32] {
         for num_reads in [64, 128] {
+            if num_reads == 128 && read_cap < 128 {
+                continue;
+            }
             let params = SampleParams {
                 num_reads,
                 ..params()
             };
-            let (reads, _) = bench_one(
-                device(KernelKind::Msa),
-                &graph,
-                &params,
-                KernelKind::Msa,
-                Some(lane),
-            )
-            .expect("forced weighted unit model");
+            let (reads, _) = bench_one(dev, &graph, &params, KernelKind::Msa, Some(lane))
+                .expect("forced weighted unit model");
             assert_eq!(reads.len(), num_reads);
             assert_ground_state(KernelKind::Msa, &graph, &reads);
         }
