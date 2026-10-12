@@ -27,7 +27,7 @@ f72af98b2bd6c1217d6d3c6389b3ba3e2790274d9e97822945c9f65b701ff4d3
 The eight corpus nonces come from the fixed seed `qui1641-task11-advantage2-v1`.
 For each index `i` from 0 through 7, hash the `ASCII` string `qui1641-task11-advantage2-v1:<i>`.
 The nonce is the `SHA-256` hex digest.
-The corpus file is `/tmp/qui1641-task11/corpus.jsonl`. Its `SHA-256` is:
+The corpus file is `/zfspool/quip-mining/bench-evidence/qui1641-msa-weighted-lanes/corpus.jsonl`. Its `SHA-256` is:
 
 ```text
 c0e88ba79af73075765a4ae60b861218c37ebfbc9c3696ef44439d0a19fad7e0
@@ -85,7 +85,7 @@ The 4,096-sweep rows use the largest tested `SA` budget as the target.
 The unit rows use different weights from `SA`. The energy values of those rows cannot measure how well weighted `SA` solves the model.
 
 The line-delimited JSON records supply the results. `bench fold` combines external Nsight reports and does not combine repeats.
-Raw records, run logs, and the summary script are under `/tmp/qui1641-task11/`.
+Raw records, run logs, and the summary script are under `/zfspool/quip-mining/bench-evidence/qui1641-msa-weighted-lanes/`.
 
 ## Reproduction
 
@@ -106,7 +106,7 @@ docker run --rm --gpus all -e CI=1 \
   -v /zfspool/quip-mining/quip-solver-cuda-wt-qui-1641:/src \
   -v quip-cuda-cargo:/root/.cargo/registry \
   -v quip-cuda-target:/src/target \
-  -v /tmp/qui1641-task11:/tmp/qui1641-task11 \
+  -v /zfspool/quip-mining/bench-evidence/qui1641-msa-weighted-lanes:/tmp/qui1641-task11 \
   -v /zfspool/quip-mining/isingmark/fixtures/advantage2-system1.spec.json:/zfspool/quip-mining/isingmark/fixtures/advantage2-system1.spec.json:ro \
   -w /src quip-solver-cuda-ci \
   /src/target/release/quip-cuda-msa --device 0 bench run \
