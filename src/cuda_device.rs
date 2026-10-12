@@ -35,7 +35,7 @@ pub enum MsaLane {
     F32,
 }
 
-/// Default weighted MSA lane until measurements select the release default.
+/// I32 is the default selected by `docs/benchmarks/2026-10-msa-weighted-lanes.md`.
 pub const DEFAULT_MSA_LANE: MsaLane = MsaLane::I32;
 
 /// Every GPU architecture the miner supports: the intersection of what NVRTC
@@ -382,7 +382,6 @@ pub struct CudaDevice {
     /// `cuda_sa_self_feeding` — persistent kernel, 1 block (1 SM) per nonce.
     pub(crate) sa: CudaFunction,
     /// Wide `cuda_sa_self_feeding`, compiled with [`SA_WIDE_DEFINE`].
-    #[allow(dead_code)] // Wide session launches are wired in the next implementation task.
     pub(crate) sa_wide: CudaFunction,
     /// `cuda_gibbs_self_feeding` — persistent kernel, `sms_per_nonce` blocks
     /// per nonce.
