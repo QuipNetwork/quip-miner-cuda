@@ -204,3 +204,244 @@ Each run times one model in isolation.
 The run does not test equal sample bytes across GPU models.
 It also does not measure the weighted paths.
 The [weighted lane benchmark](2026-10-msa-weighted-lanes.md) covers the I32 and F32 lane comparison.
+
+## Persistent stream throughput
+
+The final stream runs pass the throughput gate for all three binaries.
+The original branch slows MSA by 19.464%.
+The host changes remove that slowdown.
+
+The baseline is `8826ca3`. The original head is `5660186`.
+The final runtime source is `0177673`. The stream test follow-up is `07b4f11`.
+Base uses `quip-cuda-target-base`. Head uses `quip-cuda-target`.
+Both builds use the same CI image and device 0.
+The input files and hashes match the preceding corpus.
+
+### Stream method
+
+The published conformance driver has fixed fixtures.
+Its public entry points accept no corpus or workload settings.
+The core `driver` module provides a single solve.
+A test driver acts as the coordinator.
+It uses the same Unix-domain gRPC session.
+It depends on published protocol and solver crates, all at version 0.0.3.
+
+The test driver redraws the eight real models with the published ChaCha8 code.
+It sends exact I32 milli coefficients and dense edge lists.
+It sends ordinary sampling jobs through the real binary session.
+The session drives the CUDA sampler's persistent `run_stream` path.
+The driver keeps the credit window full and checks every refund.
+
+Each job requests 64 reads and 64 configured sweeps.
+Gibbs reports its normal doubled budget, 128 sweeps.
+Each beta step takes four sweeps. The beta range stays unset.
+The queue depth is three.
+SA and MSA grant 96 initial credits. Gibbs grants 24.
+These grants match between base and head.
+
+Each SA or Gibbs run completes 240 jobs.
+Each MSA run completes 2,400 jobs.
+Three pairs reverse their order in the middle pair.
+Three extra MSA pairs check energy variation across independent session seeds.
+Those pairs keep the same workload and alternate run order.
+
+Timing starts at the first job dispatch and ends at the final result.
+It includes preparation, admission, uploads, GPU work, host scoring, packing, and gRPC delivery.
+It excludes pre-Hello startup, shutdown, and the driver's separate energy check.
+The driver verifies every returned read after timing ends.
+It uses the published integer-milli consensus scorer.
+
+The 64-sweep budget is the SDK default.
+A longer pilot uses 2,048 sweeps.
+It heats device 0 to 95 °C and makes each SA run take minutes.
+A second pilot uses larger job counts with the default budget.
+Both pilots remain in the archive.
+The final counts keep all stream lanes active and limit test time.
+
+Stopping the first pilot's task leaves its child driver alive.
+That driver overlaps a later try.
+Process snapshots expose the interference.
+The report excludes those attempts.
+The final driver checks for other compute processes before and after every run.
+Each container has a unique Docker name.
+Signal cleanup stops the container if the driver ends early.
+
+### Throughput results
+
+Values are medians of completed jobs per second.
+The original comparison is `before`. The final comparison is `packed`.
+SA and Gibbs use three pairs. Final MSA uses six pairs.
+Take each head/base ratio before computing the paired spread.
+The 95% paired interval uses Student's t with two or five degrees of freedom.
+A run passes within paired noise or a slowdown of at most 2%.
+Every final binary passes both rules.
+
+| Stage | Binary | Base jobs/s | Head jobs/s | Median change | Paired changes |
+| --- | --- | --- | --- | --- | --- |
+| before | `quip-cuda-sa` | 27.749 | 27.882 | +0.480% | −0.203%, +0.480%, −0.840% |
+| before | `quip-cuda-gibbs` | 54.839 | 54.544 | −0.537% | −0.635%, −0.537%, −0.047% |
+| before | `quip-cuda-msa` | 216.879 | 174.665 | −19.464% | −20.009%, −19.464%, −19.649% |
+| packed | `quip-cuda-sa` | 28.212 | 28.104 | −0.381% | −0.564%, −0.381%, +0.030% |
+| packed | `quip-cuda-gibbs` | 57.667 | 57.799 | +0.230% | +0.334%, +0.158%, −0.250% |
+| packed | `quip-cuda-msa` | 218.920 | 219.192 | +0.124% | +0.280%, −0.168%, −0.109%, +0.187%, +1.092%, +0.667% |
+
+### Host cost and fix
+
+A normal job has one admission plan.
+Upload originally converts its coefficients again.
+The profile times actual planner and packing calls across the eight models.
+Each stage has seven timed samples after warm-up.
+
+| Stage | Original µs/job | Final µs/job |
+| --- | ---: | ---: |
+| SA plan | 421.516 | 428.621 |
+| Gibbs plan | 420.033 | 27.671 |
+| MSA plan | 450.816 | 28.152 |
+| Coefficient packing | 558.798 | 102.318 |
+
+Default beta resolution originally costs another 145.238 µs per job.
+The final session caches integer topology degrees and the number of connected nodes.
+It finds the unit model's largest field and gap count from each job's fields.
+Tests compare the result bit for bit with the SDK across 3,888 field and sign cases.
+
+The planner checks literal unit coefficients once.
+It passes the result to session matching.
+Gibbs and MSA can select their unit arithmetic without building milli vectors.
+SA keeps its full local-field checks.
+Packing selects one converter for the complete model, outside the CSR loop.
+The unit converter keeps the target type check.
+Other models keep the full milli, scale, and range checks.
+
+Intermediate MSA changes leave slowdowns of 9.157%, 4.316%, and 3.842%.
+The archive retains those results.
+The final packing change brings MSA within the gate.
+The source changes leave kernel code and launch parameters unchanged.
+
+### Energy quality
+
+The SDK calls `os_seed` for session jobs.
+The persistent kernel carries its random state across jobs.
+Treat independent runs as replicates.
+Pooling jobs as independent trials understates the variation.
+
+Each row below compares the mean of per-job best energies for one model.
+Values are whole energy units. Higher means worse.
+The interval half width comes from paired run means.
+SA and Gibbs have three run pairs. MSA has six.
+All returned read energies match independent consensus scoring.
+Corpus mean differences fit paired run noise.
+Every higher model mean fits its paired interval.
+Gibbs model 2 improves beyond its unadjusted interval.
+The raw records keep every job's best energy.
+
+| Binary | Model | Base mean | Head mean | Head minus base | 95% half width | Within paired noise |
+| --- | --- | --- | --- | --- | --- | --- |
+| sa | 0 | −14491.911 | −14489.222 | +2.689 | 21.133 | yes |
+| sa | 1 | −14428.267 | −14428.644 | −0.378 | 4.835 | yes |
+| sa | 2 | −14461.333 | −14453.244 | +8.089 | 29.155 | yes |
+| sa | 3 | −14458.356 | −14457.267 | +1.089 | 13.336 | yes |
+| sa | 4 | −14416.267 | −14413.822 | +2.444 | 8.518 | yes |
+| sa | 5 | −14441.089 | −14439.267 | +1.822 | 32.656 | yes |
+| sa | 6 | −14440.667 | −14435.733 | +4.933 | 13.804 | yes |
+| sa | 7 | −14385.444 | −14385.244 | +0.200 | 16.967 | yes |
+| gibbs | 0 | −14518.089 | −14511.333 | +6.756 | 49.241 | yes |
+| gibbs | 1 | −14455.289 | −14444.800 | +10.489 | 21.728 | yes |
+| gibbs | 2 | −14474.067 | −14482.978 | −8.911 | 7.122 | no |
+| gibbs | 3 | −14486.756 | −14474.822 | +11.933 | 51.489 | yes |
+| gibbs | 4 | −14441.422 | −14445.422 | −4.000 | 22.343 | yes |
+| gibbs | 5 | −14468.800 | −14465.489 | +3.311 | 23.228 | yes |
+| gibbs | 6 | −14471.711 | −14471.289 | +0.422 | 10.648 | yes |
+| gibbs | 7 | −14406.867 | −14407.711 | −0.844 | 25.992 | yes |
+| msa | 0 | −14488.509 | −14490.556 | −2.047 | 13.920 | yes |
+| msa | 1 | −14428.649 | −14423.033 | +5.616 | 13.195 | yes |
+| msa | 2 | −14461.586 | −14459.830 | +1.756 | 16.098 | yes |
+| msa | 3 | −14458.702 | −14458.619 | +0.083 | 3.276 | yes |
+| msa | 4 | −14422.312 | −14415.973 | +6.339 | 10.957 | yes |
+| msa | 5 | −14436.016 | −14444.181 | −8.166 | 9.170 | yes |
+| msa | 6 | −14435.478 | −14438.194 | −2.717 | 12.912 | yes |
+| msa | 7 | −14388.167 | −14385.210 | +2.957 | 16.222 | yes |
+
+The preceding single-shot results also keep identical energies for every model with fixed seeds.
+Session results use independent OS seeds and do not require identical sample bytes.
+
+### Clock and temperature records
+
+These are device 0 snapshots before and after each complete run.
+They do not measure the average clock during the timed interval.
+The archive keeps memory clocks, power, GPU load, and both cards' process lists.
+Every final run starts and ends with no other compute process on device 0.
+
+| Stage | Binary | Pair | Tree | Jobs/s | SM MHz before → after | °C before → after |
+| --- | --- | --- | --- | --- | --- | --- |
+| before | sa | 1 | base | 28.109 | 210 → 1560 | 68 → 78 |
+| before | sa | 1 | head-before | 28.052 | 1560 → 1560 | 77 → 83 |
+| before | sa | 2 | head-before | 27.882 | 1560 → 1860 | 83 → 87 |
+| before | sa | 2 | base | 27.749 | 1860 → 1845 | 87 → 88 |
+| before | sa | 3 | base | 27.551 | 1560 → 1560 | 88 → 89 |
+| before | sa | 3 | head-before | 27.320 | 1560 → 1845 | 89 → 90 |
+| before | gibbs | 1 | base | 54.740 | 1560 → 1560 | 89 → 89 |
+| before | gibbs | 1 | head-before | 54.393 | 1560 → 1560 | 88 → 89 |
+| before | gibbs | 2 | head-before | 54.544 | 1560 → 1560 | 88 → 89 |
+| before | gibbs | 2 | base | 54.839 | 1560 → 1560 | 88 → 88 |
+| before | gibbs | 3 | base | 54.917 | 1560 → 1560 | 88 → 88 |
+| before | gibbs | 3 | head-before | 54.891 | 1560 → 1560 | 87 → 88 |
+| before | msa | 1 | base | 219.031 | 1560 → 210 | 87 → 74 |
+| before | msa | 1 | head-before | 175.205 | 210 → 210 | 74 → 71 |
+| before | msa | 2 | head-before | 174.665 | 210 → 210 | 71 → 70 |
+| before | msa | 2 | base | 216.879 | 210 → 210 | 70 → 69 |
+| before | msa | 3 | base | 216.861 | 210 → 210 | 69 → 68 |
+| before | msa | 3 | head-before | 174.251 | 210 → 210 | 68 → 68 |
+| packed | sa | 1 | base | 28.340 | 210 → 1905 | 53 → 63 |
+| packed | sa | 1 | head-packed | 28.180 | 1560 → 1875 | 63 → 70 |
+| packed | sa | 2 | head-packed | 28.104 | 1560 → 1875 | 69 → 74 |
+| packed | sa | 2 | base | 28.212 | 1560 → 1875 | 74 → 78 |
+| packed | sa | 3 | base | 28.028 | 1560 → 1860 | 78 → 80 |
+| packed | sa | 3 | head-packed | 28.037 | 1560 → 1560 | 79 → 82 |
+| packed | gibbs | 1 | base | 57.629 | 1560 → 1560 | 81 → 81 |
+| packed | gibbs | 1 | head-packed | 57.822 | 675 → 1560 | 81 → 82 |
+| packed | gibbs | 2 | head-packed | 57.799 | 1560 → 1560 | 81 → 82 |
+| packed | gibbs | 2 | base | 57.708 | 1560 → 1560 | 82 → 82 |
+| packed | gibbs | 3 | base | 57.667 | 1560 → 1560 | 82 → 83 |
+| packed | gibbs | 3 | head-packed | 57.523 | 630 → 1560 | 82 → 83 |
+| packed | msa | 1 | base | 219.472 | 1560 → 210 | 82 → 70 |
+| packed | msa | 1 | head-packed | 220.086 | 210 → 210 | 70 → 67 |
+| packed | msa | 2 | head-packed | 219.210 | 210 → 210 | 67 → 66 |
+| packed | msa | 2 | base | 219.579 | 210 → 210 | 66 → 65 |
+| packed | msa | 3 | base | 218.369 | 210 → 210 | 65 → 65 |
+| packed | msa | 3 | head-packed | 218.131 | 210 → 210 | 65 → 65 |
+| packed | msa | 4 | base | 219.506 | 210 → 210 | 66 → 67 |
+| packed | msa | 4 | head-packed | 219.915 | 210 → 210 | 63 → 66 |
+| packed | msa | 5 | base | 216.808 | 210 → 210 | 67 → 68 |
+| packed | msa | 5 | head-packed | 219.174 | 210 → 210 | 68 → 68 |
+| packed | msa | 6 | base | 215.521 | 210 → 210 | 68 → 68 |
+| packed | msa | 6 | head-packed | 216.960 | 210 → 210 | 68 → 68 |
+
+### Stream evidence
+
+The complete evidence directory is:
+
+```text
+/zfspool/quip-mining/bench-evidence/qui1641-stream-throughput/
+```
+
+`harness/` contains the Cargo project and lockfile.
+`run.py` records commands, exit codes, raw output, and device snapshots.
+`reduce.py` computes rates and paired noise.
+`tables.py` computes energy comparisons from independent run means.
+`host-profile/` times actual host calls.
+`before/` and `packed/` hold the accepted original and final runs.
+Other directories hold pilots and intermediate changes.
+The report records every excluded try and setup failure.
+
+To repeat the final runs after recreating the base worktree and binaries:
+
+```sh
+uv run --no-project --python 3.13 /zfspool/quip-mining/bench-evidence/qui1641-stream-throughput/run.py packed
+uv run --no-project --python 3.13 /zfspool/quip-mining/bench-evidence/qui1641-stream-throughput/run.py packed --algorithms msa --first-pair 4 --pairs 6
+```
+
+The base worktree uses `/tmp/qui1641-final-base`.
+The final run removes it after validation.
+These results cover one GPU model and eight fixed mining models.
+They measure ordinary sampling sessions without lease generation or target feedback.
+They do not measure weighted-model throughput.
