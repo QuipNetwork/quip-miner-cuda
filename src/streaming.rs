@@ -1142,7 +1142,7 @@ pub fn sample_one(
         SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
-    let seed = kernel_seed(params.seed).wrapping_add(1);
+    let seed = kernel_seed(params.seed);
     sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
 
     let deadline = Instant::now() + Duration::from_mins(2);
@@ -1283,7 +1283,7 @@ pub fn bench_one(
     // --- Timed launch on the compute stream (one model, then kernel returns). ---
     let k0 = timing_event(device)?;
     let k1 = timing_event(device)?;
-    let seed = kernel_seed(params.seed).wrapping_add(1);
+    let seed = kernel_seed(params.seed);
     k0.record(&sess.stream_compute)?;
     sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
     k1.record(&sess.stream_compute)?;
