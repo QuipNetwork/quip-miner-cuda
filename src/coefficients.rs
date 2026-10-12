@@ -70,6 +70,7 @@ pub fn to_milli(v: f64) -> Option<i64> {
     let x = v * 1000.0;
     let m = x.round();
     if !m.is_finite()
+        || (v != 0.0 && m == 0.0)
         || (x - m).abs() > MILLI_TOLERANCE * m.abs().max(1.0)
         || m.abs() > f64::from(i32::MAX)
     {
@@ -411,6 +412,53 @@ mod tests {
     #[test]
     fn to_milli_refuses_tiny_off_grid_values() {
         assert_eq!(to_milli(1e-10), None);
+    }
+
+    #[test]
+    fn nonzero_values_rounding_to_zero_are_refused_by_all_paths() {
+        use crate::topology::{fill_coefficients, SelfFeedingTopology};
+
+        for value in [1e-19, -1e-19, f64::MIN_POSITIVE, -f64::MIN_POSITIVE] {
+            assert_eq!(to_milli(value), None, "accepted {value}");
+            for g in [
+                graph(vec![value, 0.0], vec![1.0], vec![(0, 1)]),
+                graph(vec![0.0, 0.0], vec![value], vec![(0, 1)]),
+            ] {
+                for kind in [KernelKind::Sa, KernelKind::Gibbs, KernelKind::Msa] {
+                    assert!(
+                        plan(kind, &g, BIG_WIDE).is_err(),
+                        "{kind:?} accepted {value}"
+                    );
+                }
+                let topology = SelfFeedingTopology::build(&g);
+                assert!(fill_coefficients::<i8>(&topology, &g, 1000).is_err());
+                assert!(fill_coefficients::<i32>(&topology, &g, 1000).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn to_milli_accepts_exact_signed_zero() {
+        for zero in [0.0, -0.0] {
+            assert_eq!(to_milli(zero), Some(0));
+            let g = graph(vec![zero, zero], vec![1.0], vec![(0, 1)]);
+            for kind in [KernelKind::Sa, KernelKind::Gibbs, KernelKind::Msa] {
+                assert!(plan(kind, &g, BIG_WIDE).is_ok());
+            }
+            let topology = crate::topology::SelfFeedingTopology::build(&g);
+            assert_eq!(
+                crate::topology::fill_coefficients::<i8>(&topology, &g, 1000)
+                    .unwrap()
+                    .1,
+                [0, 0]
+            );
+            assert_eq!(
+                crate::topology::fill_coefficients::<i32>(&topology, &g, 1000)
+                    .unwrap()
+                    .1,
+                [0, 0]
+            );
+        }
     }
 
     #[test]
