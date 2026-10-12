@@ -105,11 +105,63 @@ Both trees run `make bench-arch`.
 It uses SA on a 512-node unit ring.
 The run has eight reads, 1,024 sweeps, and five repeats.
 Git ignores its output directory. The archive contains copies of the raw JSONL.
-This benchmark also passes the 2% timing rule.
+The original branch median is 3.082 µs slower than base, a 1.600% increase.
+Its repeat range, 195.658–195.660 µs, does not overlap the base range, 192.576–194.140 µs.
+The result passes the 2% timing rule, but that pass does not explain the slowdown.
 
 | Base median µs | Base spread µs | Branch median µs | Branch spread µs | Absolute change µs | Change % |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 192.577 | 1.564 | 195.659 | 0.002 | 3.082 | 1.600 |
+
+### Interleaved timing check
+
+The follow-up compares base `8826ca3` with branch `8cc5347` in six consecutive runs.
+It rebuilds base in `quip-cuda-target-base` and reuses the branch build in `quip-cuda-target`.
+Each run uses the same benchmark arguments, one warm-up, and five measured repeats.
+Each run writes to a separate directory and uses a fresh `QUIP_CUDA_CACHE` directory.
+The sweep median and spread come from the five CUDA-event measurements.
+The spread is the largest measurement minus the smallest.
+
+The table shows device 0 clock and temperature snapshots before → after each run.
+These snapshots do not measure clocks during every repeat.
+
+| Run | Tree | Median µs | Spread µs | SM clock MHz | Temperature °C |
+| ---: | --- | ---: | ---: | --- | --- |
+| 1 | Base | 192.580 | 5.477 | 210 → 1905 | 59 → 62 |
+| 2 | Branch | 192.581 | 0.007 | 1905 → 1905 | 62 → 63 |
+| 3 | Base | 192.580 | 5.410 | 1905 → 1905 | 63 → 64 |
+| 4 | Branch | 192.579 | 2.629 | 1905 → 1905 | 64 → 65 |
+| 5 | Base | 192.579 | 1.076 | 1905 → 1890 | 65 → 66 |
+| 6 | Branch | 194.110 | 6.567 | 1890 → 1890 | 66 → 67 |
+
+Branch minus base is +0.001, −0.001, and +1.531 µs in the three adjacent pairs.
+The last difference is +0.795%, within that pair's repeat spread.
+The clock change predicts +0.794% for a workload whose time varies inversely with clock frequency.
+The temperature rises with run order, and the clock drops before the last branch run.
+At 1,905 MHz, the first two pairs show no consistent branch slowdown.
+These results support an environmental explanation for the original gap, rather than a consistent branch-dependent difference.
+The original run lacks matching clock snapshots, so the exact cause of its +1.600% increase remains unverified.
+
+All before/after compute-process queries contain no process entries.
+The archive includes SM and memory clocks, temperature, power draw, `utilization.gpu`, and process snapshots for both GPUs.
+Device 0 memory clock rises from 405 to 7,001 MHz in the first run and stays at 7,001 MHz.
+
+The SA int8 PTX has the same SHA-256 hash in all six fresh caches:
+
+```text
+ecec42285664d67b079a53d4e6be81dd8d208a02c7714667c9dd6d36ce244e1d
+```
+
+Both trees launch grid `(1, 1, 1)` and block `(256, 1, 1)`, with `shared_mem_bytes = 0`.
+Both pass the same 18 kernel arguments in the same order and types.
+The ring uses eight reads, 512 nodes, 1,024 directed adjacency entries, and 64 packed bytes per read.
+Both pass 256 beta steps, four sweeps per step, and kernel seed 1.
+The branch selects int8 at scale 1,000 milli, so coefficients and the beta schedule match base.
+No launch dimension or argument difference exists for this int8 SA benchmark.
+
+Raw JSONL, logs, PTX, command exit codes, and `summary.json` are under the archive's `interleaved/` directory.
+Its `run.py` records the six runs, and `audit.py` records each command and exit code.
+The follow-up removes the base worktree after the comparison.
 
 ## Evidence and reproduction
 

@@ -49,16 +49,20 @@ At each spin, add `|h|` and all `|J|` on its edges.
 The local field bound is the largest of these sums.
 
 - **SA:** solves every whole-milli model up to a local field of 536,870,911 milli.
-  Models whose coefficients fit int8 at the model's own scale use the int8 kernel.
+  SA uses the int8 kernel when `max_i(|h_i| + sum_j |J_ij|) / GCD_step <= 63`.
+  This bound keeps the flip delta within int8 because `2 * field <= 127`.
   Other models use the fixed-point wide kernel.
+  A complete graph with unit couplings and zero fields has field 63 at 64 nodes and uses int8.
+  At 65 nodes, its field is 64 and it uses wide.
   Its accept decision uses integers only, so the same seed gives the same decision on every GPU.
   The SA identity advertises 536,870,910 milli because `quip-solver-core` 0.0.3 `--solve` does not round coefficients (QUI-1813).
   The wide kernel cannot accept a move whose Metropolis probability is below about 7.6e-6.
 - **Gibbs:** accepts models whose absolute coefficients are at most 127 times the model's GCD step.
   Gibbs refuses models that need a wide path.
 - **MSA:** accepts models of degree at most 20.
-  Unit models use the unit-weight kernel.
-  Other models use the weighted kernel at the model's own scale, up to a local field of 16,777,215 milli at scale 1.
+  Models with `h` in {-1, 0, 1} and `J` in {-1, 1} use the unit-weight kernel.
+  Other models use the weighted kernel at the model's GCD step.
+  Its local field bound is 16,777,215 times that step, or 16,777,215 milli at scale 1.
   The default weighted lane is I32. F32 is also available.
   See the [weighted lane measurements](docs/benchmarks/2026-10-msa-weighted-lanes.md).
 
