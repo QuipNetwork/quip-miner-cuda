@@ -130,12 +130,14 @@ fn to_kernel_i32(name: &str, value: usize) -> Result<i32, SampleError> {
 /// trajectories. The `SplitMix64` finalizer spreads every input bit over the
 /// high word it returns, so any change to the seed changes the kernel seed,
 /// short of a 2^-32 collision.
+// `z >> 32` always fits in a u32, so the cast keeps every bit of the high word.
+#[allow(clippy::cast_possible_truncation)]
 fn kernel_seed(seed: u64) -> u32 {
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
-    u32::try_from(z >> 32).unwrap_or(u32::MAX)
+    (z >> 32) as u32
 }
 
 /// Per-algorithm constants dictated by the verbatim kernel's fixed-size
