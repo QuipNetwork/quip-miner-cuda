@@ -156,13 +156,15 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
         // Same capability set as `cuda_sa_identity`.
         features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
         adapt: cuda_msa_adapt(max_reads),
-        // The kernel unrolls 20 neighbours and reads J and h by sign. The step is
-        // one unit. Magnitudes other than one are refused per job: a field bound
-        // would let a 21-unit h through.
+        // Unit models run the unit-weight kernel (by sign, 64 lanes per word).
+        // Other models run the weighted kernel at the model's own scale, up to a
+        // local field of 2^24 - 1 milli at scale 1, the worst case.
         limits: ModelLimits {
             max_degree: Some(u32::try_from(capacity::MSA_MAX_DEGREE).unwrap_or(u32::MAX)),
-            max_local_field_milli: None,
-            exact_resolution_milli: Some(1000),
+            max_local_field_milli: Some(
+                u32::try_from(coefficients::MSA_WEIGHTED_MAX_FIELD).unwrap_or(u32::MAX),
+            ),
+            exact_resolution_milli: Some(1),
         },
     }
 }

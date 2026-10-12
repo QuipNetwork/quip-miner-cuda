@@ -13,7 +13,7 @@ use quip_protocol::scoring::energy_milli;
 use quip_protocol::wire::{decode_spins, encode_spins};
 use quip_solver_conformance::GOLDEN_VECTORS;
 use quip_solver_cuda::cuda_device::CudaDevice;
-use quip_solver_cuda::sampler::{sample_ising, SampleError};
+use quip_solver_cuda::sampler::sample_ising;
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serde_json::Value;
 use serial_test::serial;
@@ -23,10 +23,17 @@ fn golden() -> Value {
     serde_json::from_str(GOLDEN_VECTORS).unwrap()
 }
 
-fn device() -> &'static CudaDevice {
-    static DEV: OnceLock<CudaDevice> = OnceLock::new();
-    DEV.get_or_init(|| {
-        CudaDevice::open(0).unwrap_or_else(|e| {
+fn device(kind: KernelKind) -> &'static CudaDevice {
+    static SA: OnceLock<CudaDevice> = OnceLock::new();
+    static MSA: OnceLock<CudaDevice> = OnceLock::new();
+    static GIBBS: OnceLock<CudaDevice> = OnceLock::new();
+    let cell = match kind {
+        KernelKind::Sa => &SA,
+        KernelKind::Msa => &MSA,
+        KernelKind::Gibbs => &GIBBS,
+    };
+    cell.get_or_init(|| {
+        CudaDevice::open_with_nodes(0, kind, 0).unwrap_or_else(|e| {
             panic!("CUDA device 0 required for golden_parity tests: {e}");
         })
     })
@@ -99,7 +106,6 @@ fn truncation_matches_golden() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 fn live_sample_energies_match_energy_milli() {
-    let dev = device();
     let graph = IsingGraph::new(
         vec![1.0, -0.5, 0.0, 0.25],
         vec![1.0, -1.0, -1.0, 1.0],
@@ -112,21 +118,9 @@ fn live_sample_energies_match_energy_milli() {
         ..Default::default()
     };
 
-    let msa_graph = IsingGraph::new(
-        vec![1.0, -1.0, 0.0, 1.0],
-        graph.j.clone(),
-        graph.edges.to_vec(),
-    );
-    let err = sample_ising(dev, &graph, &params, KernelKind::Msa).unwrap_err();
-    assert!(matches!(err, SampleError::Unsupported(_)), "{err}");
-
     for kernel in [KernelKind::Sa, KernelKind::Msa, KernelKind::Gibbs] {
-        let graph = if kernel == KernelKind::Msa {
-            &msa_graph
-        } else {
-            &graph
-        };
-        let results = sample_ising(dev, graph, &params, kernel).expect("sample");
+        let graph = &graph;
+        let results = sample_ising(device(kernel), graph, &params, kernel).expect("sample");
         assert_eq!(results.len(), 16);
         for r in &results {
             let expected = energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges);
@@ -147,7 +141,7 @@ fn live_sample_energies_match_energy_milli() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 fn sa_finds_ground_state_on_ferro() {
-    let dev = device();
+    let dev = device(KernelKind::Sa);
     let graph = IsingGraph::new(vec![0.0, 0.0], vec![-1.0], vec![(0, 1)]);
     let params = SampleParams {
         num_reads: 16,
@@ -170,7 +164,7 @@ fn sa_finds_ground_state_on_ferro() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 fn msa_finds_ground_state_on_ferro_with_fields() {
-    let dev = device();
+    let dev = device(KernelKind::Msa);
     let graph = IsingGraph::new(vec![1.0, 1.0], vec![-1.0], vec![(0, 1)]);
     let params = SampleParams {
         num_reads: 16,

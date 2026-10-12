@@ -39,12 +39,12 @@
 //! ```
 
 use crate::corpus;
-use crate::cuda_device::CudaDevice;
+use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
 use crate::schema::{BenchRecord, Part, Scope, Source};
-use crate::streaming::{bench_one, DeviceTimings};
+use crate::streaming::{bench_one, bench_plan, DeviceTimings};
 use crate::{IsingGraph, KernelKind, SampleParams};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write as _;
@@ -70,9 +70,33 @@ pub enum BenchAction {
     Fold(FoldArgs),
 }
 
+/// MSA path selected for an isolated benchmark.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsaPath {
+    /// Plan normally, using the default lane for weighted jobs.
+    Auto,
+    /// Force the weighted integer lane, including for unit models.
+    WeightedI32,
+    /// Force the weighted floating-point lane, including for unit models.
+    WeightedF32,
+}
+
+impl MsaPath {
+    fn lane(self) -> Option<MsaLane> {
+        match self {
+            Self::Auto => None,
+            Self::WeightedI32 => Some(MsaLane::I32),
+            Self::WeightedF32 => Some(MsaLane::F32),
+        }
+    }
+}
+
 /// Arguments for `bench run`.
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
+    /// MSA path (default: auto). Accepted only by the MSA kernel.
+    #[arg(long, value_enum)]
+    pub msa_path: Option<MsaPath>,
     /// Reads per model, at most the kernel's cap (256 for sa and gibbs, 128 for msa).
     #[arg(long, default_value_t = 8)]
     pub reads: u64,
@@ -472,6 +496,11 @@ fn run_run(
     max_nodes: usize,
     args: &RunArgs,
 ) -> Result<(), BenchError> {
+    if args.msa_path.is_some() && kernel != KernelKind::Msa {
+        return Err(BenchError::Args(
+            "--msa-path requires the MSA kernel".into(),
+        ));
+    }
     std::fs::create_dir_all(&args.out).map_err(|e| BenchError::Io(e.to_string()))?;
     let sweeps: Vec<u64> = if args.sweeps.is_empty() {
         vec![1024]
@@ -570,12 +599,9 @@ fn run_model(
         sweeps_per_beta: usize::try_from(args.sweeps_per_beta).unwrap_or(1),
         ..SampleParams::default()
     };
-    let plan = crate::coefficients::plan(
-        ctx.kernel,
-        graph,
-        crate::streaming::wide_max_nodes(ctx.device, ctx.kernel),
-    )
-    .map_err(|why| BenchError::Device(crate::sampler::SampleError::Unsupported(why).to_string()))?;
+    let msa_lane = args.msa_path.and_then(MsaPath::lane);
+    let plan = bench_plan(ctx.device, graph, ctx.kernel, msa_lane)
+        .map_err(|e| BenchError::Device(e.to_string()))?;
     let (beta, sweeps_per_beta) = crate::streaming::build_beta_schedule(
         graph,
         params.num_sweeps,
@@ -595,7 +621,7 @@ fn run_model(
     for i in 0..(args.warmup + args.repeats) {
         take_cell(&ctx.totals); // clear stale totals before the measured call
         let model_start = Instant::now();
-        let (_reads, dev) = bench_one(ctx.device, graph, &params, ctx.kernel)
+        let (_reads, dev) = bench_one(ctx.device, graph, &params, ctx.kernel, msa_lane)
             .map_err(|e| BenchError::Device(e.to_string()))?;
         let model_total_ns = u64::try_from(model_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let spans = take_cell(&ctx.totals);
@@ -699,6 +725,62 @@ mod tests {
     use std::sync::Arc;
     use tracing::info_span;
     use tracing_subscriber::prelude::*;
+
+    #[derive(clap::Parser, Debug)]
+    struct RunCli {
+        #[command(flatten)]
+        args: super::RunArgs,
+    }
+
+    #[test]
+    fn msa_path_cli_parses_all_lanes() {
+        use clap::Parser as _;
+        for path in ["auto", "weighted-i32", "weighted-f32"] {
+            let parsed = RunCli::try_parse_from(["bench", "--out", "unused", "--msa-path", path]);
+            assert!(parsed.is_ok(), "{path}: {parsed:?}");
+            let selected = parsed.unwrap().args.msa_path.unwrap();
+            let expected = match path {
+                "weighted-i32" => Some(crate::cuda_device::MsaLane::I32),
+                "weighted-f32" => Some(crate::cuda_device::MsaLane::F32),
+                _ => None,
+            };
+            assert_eq!(selected.lane(), expected);
+        }
+        assert!(
+            RunCli::try_parse_from(["bench", "--out", "unused", "--msa-path", "invalid"]).is_err()
+        );
+        assert_eq!(
+            RunCli::try_parse_from(["bench", "--out", "unused"])
+                .unwrap()
+                .args
+                .msa_path,
+            None
+        );
+    }
+
+    #[test]
+    fn msa_path_flag_rejected_for_other_kernels() {
+        use clap::Parser as _;
+        for path in ["auto", "weighted-i32", "weighted-f32"] {
+            let args = RunCli::try_parse_from(["bench", "--out", "unused", "--msa-path", path])
+                .unwrap()
+                .args;
+            for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+                let err = super::run_bench(
+                    usize::MAX,
+                    kernel,
+                    0,
+                    &super::BenchAction::Run(args.clone()),
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("--msa-path requires the MSA kernel"),
+                    "{err}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn assemble_record_maps_timings_to_contract_parts() {

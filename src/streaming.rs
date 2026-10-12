@@ -18,7 +18,7 @@
 use crate::accept_table::{neglog_table, wide_rungs};
 use crate::capacity;
 use crate::coefficients::{self, CoefficientPath, CoefficientPlan};
-use crate::cuda_device::CudaDevice;
+use crate::cuda_device::{CudaDevice, MsaLane, DEFAULT_MSA_LANE};
 use crate::driver_budget::{Bucket, DriverBudget};
 use crate::kernel::KernelKind;
 use crate::nvml_gov::UtilGovernor;
@@ -407,19 +407,60 @@ struct KernelDims {
     reads_per_nonce: i32,
 }
 
+/// Shared colouring buffers and spin layout for both MSA paths.
+struct MsaState {
+    d_color_starts: CudaSlice<i32>,
+    d_color_counts: CudaSlice<i32>,
+    d_color_nodes: CudaSlice<i32>,
+    num_colors: i32,
+    words: i32,
+    shared_bytes: u32,
+}
+
+impl SlotCoefficients {
+    fn allocate(
+        stream: &Arc<CudaStream>,
+        path: CoefficientPath,
+        total_slots: usize,
+        nnz_alloc: usize,
+        n: usize,
+    ) -> Result<Self, SampleError> {
+        Ok(match path {
+            CoefficientPath::Int8 => SlotCoefficients::Int8 {
+                d_j: stream.alloc_zeros::<i8>(total_slots * nnz_alloc)?,
+                d_h: stream.alloc_zeros::<i8>(total_slots * n.max(1))?,
+                stage_j: vec![0i8; nnz_alloc],
+                stage_h: vec![0i8; n.max(1)],
+            },
+            CoefficientPath::Wide => SlotCoefficients::Wide {
+                d_j: stream.alloc_zeros::<i32>(total_slots * nnz_alloc)?,
+                d_h: stream.alloc_zeros::<i32>(total_slots * n.max(1))?,
+                stage_j: vec![0i32; nnz_alloc],
+                stage_h: vec![0i32; n.max(1)],
+            },
+        })
+    }
+}
+
+/// Arithmetic choices fixed for the lifetime of a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionArithmetic {
+    coefficients: CoefficientPlan,
+    msa_lane: MsaLane,
+}
+
 /// Kernel-specific buffers, kept out of `Option`s: which variant is
 /// populated always matches `SelfFeedingSession::kernel` by construction,
 /// so `launch()` destructures it directly instead of unwrapping an `Option`
 /// known-Some-by-invariant.
 enum AlgoState {
-    /// Multi-spin kernel: colour classes plus its shared-memory footprint.
-    Msa {
-        d_color_starts: CudaSlice<i32>,
-        d_color_counts: CudaSlice<i32>,
-        d_color_nodes: CudaSlice<i32>,
-        num_colors: i32,
-        words: i32,
-        shared_bytes: u32,
+    Msa(MsaState),
+    MsaWeighted {
+        lane: MsaLane,
+        msa: MsaState,
+        d_beta_fixed: Option<CudaSlice<i64>>,
+        d_delta_cut: Option<CudaSlice<i32>>,
+        d_neglog: Option<CudaSlice<i64>>,
     },
     Sa {
         d_delta_energy: CudaSlice<i8>,
@@ -440,20 +481,28 @@ enum AlgoState {
     },
 }
 
+impl AlgoState {
+    fn shared_mem_bytes(&self) -> u32 {
+        match self {
+            Self::Msa(msa) | Self::MsaWeighted { msa, .. } => msa.shared_bytes,
+            Self::Sa { .. } | Self::SaWide { .. } | Self::Gibbs { .. } => 0,
+        }
+    }
+}
+
 /// Device buffers for the multi-spin kernel: the colour classes plus the
 /// dynamic shared-memory footprint the launch asks for.
 ///
 /// The kernel unrolls a fixed neighbour budget (`MSA_MAX_DEG` in
 /// `kernels/msa.cu`). A denser topology cannot run on it and is refused per
-/// job as `Unsupported`. The coefficient plan also refuses non-unit models
-/// per job. Both checks map to `Capacity` on the wire: permanent for this
-/// graph, harmless to the session.
+/// job as `Unsupported`. This maps to `Capacity` on the wire: permanent
+/// for this graph, harmless to the session.
 fn build_msa_state(
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
     topology: &SelfFeedingTopology,
     reads_per_nonce: usize,
-) -> Result<AlgoState, SampleError> {
+) -> Result<MsaState, SampleError> {
     let max_deg = topology.max_degree();
     if max_deg > capacity::MSA_MAX_DEGREE {
         return Err(SampleError::Unsupported(format!(
@@ -506,13 +555,45 @@ fn build_msa_state(
             "msa shared memory {shared} bytes does not fit the launch ABI"
         ))
     })?;
-    Ok(AlgoState::Msa {
+    Ok(MsaState {
         d_color_starts: stream.clone_htod(&starts)?,
         d_color_counts: stream.clone_htod(&counts)?,
         d_color_nodes: stream.clone_htod(&nodes)?,
         num_colors: topology.colors.num_colors,
         words: to_kernel_i32("words", words)?,
         shared_bytes,
+    })
+}
+
+/// Reuse the MSA layout and allocate acceptance tables only for the integer lane.
+fn build_msa_weighted_state(
+    device: &CudaDevice,
+    stream: &Arc<CudaStream>,
+    topology: &SelfFeedingTopology,
+    reads_per_nonce: usize,
+    max_num_betas: usize,
+    lane: MsaLane,
+) -> Result<AlgoState, SampleError> {
+    if device.msa_weighted.is_none() {
+        return Err(SampleError::Unsupported(
+            "weighted MSA requires an MSA device open".into(),
+        ));
+    }
+    let msa = build_msa_state(device, stream, topology, reads_per_nonce)?;
+    let (d_beta_fixed, d_delta_cut, d_neglog) = match lane {
+        MsaLane::I32 => (
+            Some(stream.alloc_zeros::<i64>(max_num_betas.max(1))?),
+            Some(stream.alloc_zeros::<i32>(max_num_betas.max(1))?),
+            Some(stream.clone_htod(&neglog_table())?),
+        ),
+        MsaLane::F32 => (None, None, None),
+    };
+    Ok(AlgoState::MsaWeighted {
+        lane,
+        msa,
+        d_beta_fixed,
+        d_delta_cut,
+        d_neglog,
     })
 }
 
@@ -549,7 +630,9 @@ fn build_algo_state(
 ) -> Result<AlgoState, SampleError> {
     let limits = algo_limits(kernel, device.msa_replica_words);
     match kernel {
-        KernelKind::Msa => build_msa_state(device, stream, topology, reads_per_nonce),
+        KernelKind::Msa => {
+            build_msa_state(device, stream, topology, reads_per_nonce).map(AlgoState::Msa)
+        }
         KernelKind::Sa => {
             let total_threads = num_nonces * 256;
             Ok(AlgoState::Sa {
@@ -597,9 +680,11 @@ impl<'a> SelfFeedingSession<'a> {
         num_nonces: usize,
         reads_per_nonce: usize,
         max_num_betas: usize,
-        plan: CoefficientPlan,
+        arithmetic: SessionArithmetic,
     ) -> Result<Self, SampleError> {
         let _span = trace_span!("problem_setup", n = topology.n, nnz = topology.nnz).entered();
+        let plan = arithmetic.coefficients;
+        let msa_lane = arithmetic.msa_lane;
         let n = topology.n;
         // Defense in depth: the backend identity's `max_nodes` already rejects
         // an oversized job in `job.rs` before it reaches the sampler. This
@@ -649,20 +734,8 @@ impl<'a> SelfFeedingSession<'a> {
         let d_row_ptr = stream_compute.clone_htod(&row_ptr)?;
         let d_col_ind = stream_compute.clone_htod(&col_ind)?;
 
-        let coefs = match plan.path {
-            CoefficientPath::Int8 => SlotCoefficients::Int8 {
-                d_j: stream_compute.alloc_zeros::<i8>(total_slots * nnz_alloc)?,
-                d_h: stream_compute.alloc_zeros::<i8>(total_slots * n.max(1))?,
-                stage_j: vec![0i8; nnz_alloc],
-                stage_h: vec![0i8; n.max(1)],
-            },
-            CoefficientPath::Wide => SlotCoefficients::Wide {
-                d_j: stream_compute.alloc_zeros::<i32>(total_slots * nnz_alloc)?,
-                d_h: stream_compute.alloc_zeros::<i32>(total_slots * n.max(1))?,
-                stage_j: vec![0i32; nnz_alloc],
-                stage_h: vec![0i32; n.max(1)],
-            },
-        };
+        let coefs =
+            SlotCoefficients::allocate(&stream_compute, plan.path, total_slots, nnz_alloc, n)?;
         let d_samples =
             stream_compute.alloc_zeros::<i8>(total_slots * reads_per_nonce * max_packed_size)?;
         let d_energies =
@@ -672,6 +745,15 @@ impl<'a> SelfFeedingSession<'a> {
 
         let algo_state = if kernel == KernelKind::Sa && plan.path == CoefficientPath::Wide {
             build_sa_wide_state(&stream_compute, n, num_nonces, max_num_betas)?
+        } else if kernel == KernelKind::Msa && plan.path == CoefficientPath::Wide {
+            build_msa_weighted_state(
+                device,
+                &stream_compute,
+                &topology,
+                reads_per_nonce,
+                max_num_betas,
+                msa_lane,
+            )?
         } else {
             build_algo_state(
                 device,
@@ -733,6 +815,12 @@ impl<'a> SelfFeedingSession<'a> {
         if let AlgoState::SaWide {
             d_beta_fixed,
             d_delta_cut,
+            ..
+        }
+        | AlgoState::MsaWeighted {
+            lane: MsaLane::I32,
+            d_beta_fixed: Some(d_beta_fixed),
+            d_delta_cut: Some(d_delta_cut),
             ..
         } = &mut self.algo_state
         {
@@ -854,17 +942,17 @@ impl<'a> SelfFeedingSession<'a> {
         sweeps_per_beta: i32,
         seed: u32,
     ) -> Result<(), SampleError> {
-        let AlgoState::Msa {
+        let AlgoState::Msa(msa) = &self.algo_state else {
+            return Err(SampleError::Driver("launch_msa without msa state".into()));
+        };
+        let MsaState {
             d_color_starts,
             d_color_counts,
             d_color_nodes,
             num_colors,
             words,
             ..
-        } = &self.algo_state
-        else {
-            return Err(SampleError::Driver("launch_msa without msa state".into()));
-        };
+        } = msa;
         let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
             return Err(SampleError::Driver(
                 "launch_msa without int8 coefficients".into(),
@@ -897,6 +985,91 @@ impl<'a> SelfFeedingSession<'a> {
         // `kernels/msa.cu` in order, type and count; every buffer is sized by
         // `build` from the same `dims` the kernel receives, and the colour
         // buffers are bounded by `num_colors` / `dims.n`.
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    fn launch_msa_weighted(
+        &self,
+        cfg: LaunchConfig,
+        num_betas: i32,
+        sweeps_per_beta: i32,
+        seed: u32,
+    ) -> Result<(), SampleError> {
+        let AlgoState::MsaWeighted {
+            lane,
+            msa,
+            d_beta_fixed,
+            d_delta_cut,
+            d_neglog,
+        } = &self.algo_state
+        else {
+            return Err(SampleError::Driver(
+                "launch_msa_weighted without weighted MSA state".into(),
+            ));
+        };
+        let kernels = self.device.msa_weighted.as_ref().ok_or_else(|| {
+            SampleError::Unsupported("weighted MSA requires an MSA device open".into())
+        })?;
+        let function = match lane {
+            MsaLane::I32 => &kernels.i32,
+            MsaLane::F32 => &kernels.f32,
+        };
+        let MsaState {
+            d_color_starts,
+            d_color_counts,
+            d_color_nodes,
+            num_colors,
+            words,
+            ..
+        } = msa;
+        let SlotCoefficients::Wide { d_j, d_h, .. } = &self.coefs else {
+            return Err(SampleError::Driver(
+                "launch_msa_weighted without wide coefficients".into(),
+            ));
+        };
+        let dims = &self.dims;
+        let mut b = self.stream_compute.launch_builder(function);
+        b.arg(&self.d_row_ptr);
+        b.arg(&self.d_col_ind);
+        b.arg(d_color_starts);
+        b.arg(d_color_counts);
+        b.arg(d_color_nodes);
+        b.arg(num_colors);
+        b.arg(d_j);
+        b.arg(d_h);
+        b.arg(&self.d_samples);
+        b.arg(&self.d_energies);
+        b.arg(&self.d_beta);
+        b.arg(&num_betas);
+        b.arg(&sweeps_per_beta);
+        b.arg(&self.d_ctrl);
+        b.arg(&dims.num_nonces);
+        b.arg(&dims.reads_per_nonce);
+        b.arg(&dims.n);
+        b.arg(&dims.nnz);
+        b.arg(&dims.max_packed);
+        b.arg(&seed);
+        b.arg(words);
+        if *lane == MsaLane::I32 {
+            let (Some(beta_fixed), Some(delta_cut), Some(neglog)) =
+                (d_beta_fixed, d_delta_cut, d_neglog)
+            else {
+                return Err(SampleError::Driver(
+                    "integer MSA acceptance buffers are missing".into(),
+                ));
+            };
+            b.arg(beta_fixed);
+            b.arg(delta_cut);
+            b.arg(neglog);
+        }
+        // SAFETY: the 24 arguments for I32, or 21 for F32, mirror
+        // `cuda_msa_self_feeding` compiled with QUIP_MSA_WEIGHTED and its lane
+        // define, in order, type and count. J and h are i32. `build` sizes
+        // every slot and colouring buffer from these same dimensions, and
+        // checks both the degree and shared spin-state budget. The three I32
+        // buffers hold num_betas, num_betas and NEGLOG_LEN entries. `Drop`
+        // signals exit and synchronizes the compute stream before freeing them.
         unsafe { b.launch(cfg) }?;
         Ok(())
     }
@@ -980,10 +1153,7 @@ impl<'a> SelfFeedingSession<'a> {
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (limits.threads_per_block, 1, 1),
-            shared_mem_bytes: match &self.algo_state {
-                AlgoState::Msa { shared_bytes, .. } => *shared_bytes,
-                AlgoState::Sa { .. } | AlgoState::SaWide { .. } | AlgoState::Gibbs { .. } => 0,
-            },
+            shared_mem_bytes: self.algo_state.shared_mem_bytes(),
         };
         let num_betas = to_kernel_i32("num_betas", num_betas)?;
         let sweeps_per_beta = to_kernel_i32("sweeps_per_beta", sweeps_per_beta)?;
@@ -1014,8 +1184,11 @@ impl<'a> SelfFeedingSession<'a> {
         // cudarc's read/write distinction is inert here — the kernel's own
         // volatile ctrl protocol is the actual synchronization.
         match &self.algo_state {
-            AlgoState::Msa { .. } => {
+            AlgoState::Msa(_) => {
                 self.launch_msa(cfg, num_betas, sweeps_per_beta, seed)?;
+            }
+            AlgoState::MsaWeighted { .. } => {
+                self.launch_msa_weighted(cfg, num_betas, sweeps_per_beta, seed)?;
             }
             AlgoState::Sa { d_delta_energy } => {
                 let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
@@ -1233,7 +1406,7 @@ struct SessionKey {
     /// Path and scale every job in the session runs at. A job at another
     /// scale needs another schedule, and a job on another path another
     /// kernel.
-    plan: CoefficientPlan,
+    plan: SessionArithmetic,
     kernel: KernelKind,
     wide_max_nodes: usize,
 }
@@ -1244,6 +1417,7 @@ impl SessionKey {
         reads_per_nonce: usize,
         kernel: KernelKind,
         wide_max_nodes: usize,
+        msa_lane: MsaLane,
     ) -> Result<Self, String> {
         let plan = coefficients::plan(kernel, &job.graph, wide_max_nodes)?;
         Ok(Self {
@@ -1256,17 +1430,25 @@ impl SessionKey {
                 .params
                 .beta_range
                 .unwrap_or_else(|| default_ising_beta_range(&job.graph)),
-            plan,
+            plan: SessionArithmetic {
+                coefficients: plan,
+                msa_lane,
+            },
             kernel,
             wide_max_nodes,
         })
     }
 
-    fn plan_for(&self, job: &StreamJob) -> Result<CoefficientPlan, String> {
-        coefficients::plan(self.kernel, &job.graph, self.wide_max_nodes)
+    fn plan_for(&self, job: &StreamJob) -> Result<SessionArithmetic, String> {
+        coefficients::plan(self.kernel, &job.graph, self.wide_max_nodes).map(|coefficients| {
+            SessionArithmetic {
+                coefficients,
+                msa_lane: self.plan.msa_lane,
+            }
+        })
     }
 
-    fn matches(&self, job: &StreamJob, plan: CoefficientPlan) -> bool {
+    fn matches(&self, job: &StreamJob, plan: SessionArithmetic) -> bool {
         self.n == job.graph.h.len()
             && self.edges == job.graph.edges
             && self.num_sweeps == job.params.num_sweeps
@@ -1285,8 +1467,32 @@ impl SessionKey {
 pub(crate) fn wide_max_nodes(device: &CudaDevice, kernel: KernelKind) -> usize {
     match kernel {
         KernelKind::Sa => device.sa_wide_max_nodes,
-        KernelKind::Msa | KernelKind::Gibbs => 0,
+        KernelKind::Msa => device.max_nodes,
+        KernelKind::Gibbs => 0,
     }
+}
+
+/// Plan a bench job, forcing weighted MSA at its GCD scale when a lane is given.
+pub(crate) fn bench_plan(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    kernel: KernelKind,
+    msa_lane: Option<MsaLane>,
+) -> Result<CoefficientPlan, SampleError> {
+    if msa_lane.is_some() && kernel != KernelKind::Msa {
+        return Err(SampleError::Unsupported(
+            "--msa-path requires the MSA kernel".into(),
+        ));
+    }
+    let mut plan = coefficients::plan(kernel, graph, wide_max_nodes(device, kernel))
+        .map_err(SampleError::Unsupported)?;
+    if msa_lane.is_some() {
+        // A unit model's nonzero coefficients are +/-1000 milli, so its GCD
+        // is already 1000, as is the all-zero fallback. Other models' plans
+        // already carry their own GCD scale.
+        plan.path = CoefficientPath::Wide;
+    }
+    Ok(plan)
 }
 
 /// Run one job through a dedicated single-nonce self-feeding session:
@@ -1370,7 +1576,10 @@ pub fn sample_one(
         1,
         reads_per_nonce,
         beta.len(),
-        plan,
+        SessionArithmetic {
+            coefficients: plan,
+            msa_lane: DEFAULT_MSA_LANE,
+        },
     )?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
@@ -1463,6 +1672,9 @@ fn poll_until_complete(
 /// making the launch a discrete instance `nsys`/`ncu` attribute cleanly.
 /// Reuses the `.cu` kernels unchanged — no device code is added.
 ///
+/// `msa_lane == None` plans normally and uses the default weighted lane.
+/// `Some(lane)` forces weighted MSA, even for unit models, at the GCD scale.
+///
 /// # Errors
 ///
 /// Same set as [`sample_one`]: [`SampleError::GraphTooLarge`] for an oversized
@@ -1476,9 +1688,9 @@ pub fn bench_one(
     graph: &IsingGraph,
     params: &SampleParams,
     kernel: KernelKind,
+    msa_lane: Option<MsaLane>,
 ) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
-    let plan = coefficients::plan(kernel, graph, wide_max_nodes(device, kernel))
-        .map_err(SampleError::Unsupported)?;
+    let plan = bench_plan(device, graph, kernel, msa_lane)?;
     let n = graph.num_nodes();
     if n == 0 {
         let reads = params.num_reads.max(1);
@@ -1507,7 +1719,10 @@ pub fn bench_one(
         1,
         reads_per_nonce,
         beta.len(),
-        plan,
+        SessionArithmetic {
+            coefficients: plan,
+            msa_lane: msa_lane.unwrap_or(DEFAULT_MSA_LANE),
+        },
     )?;
 
     // --- Timed upload (beta + slot 0 + exit flag) on the transfer stream. ---
@@ -2223,6 +2438,7 @@ fn run_session(
         reads_per_nonce,
         kernel,
         wide_max_nodes(device, kernel),
+        DEFAULT_MSA_LANE,
     ) {
         Ok(key) => key,
         Err(why) => {
@@ -2256,7 +2472,7 @@ fn run_session(
         seed.params.num_sweeps,
         seed.params.sweeps_per_beta,
         Some(key.beta_range),
-        key.plan.beta_factor(),
+        key.plan.coefficients.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(&seed.graph);
     let mut feed = Feed {
@@ -2617,13 +2833,13 @@ mod tests {
     #[test]
     fn session_key_matches_an_identical_job() {
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         assert!(key.matches(&seed, key.plan_for(&seed).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_node_count() {
-        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.graph.h.push(0.5);
         assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
@@ -2631,7 +2847,7 @@ mod tests {
 
     #[test]
     fn session_key_rejects_different_edges() {
-        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.graph.edges = vec![(0, 1), (1, 2), (2, 3), (0, 2)].into();
         assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
@@ -2639,7 +2855,7 @@ mod tests {
 
     #[test]
     fn session_key_rejects_a_different_sweep_count() {
-        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.num_sweeps += 1;
         assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
@@ -2647,7 +2863,7 @@ mod tests {
 
     #[test]
     fn session_key_rejects_a_different_sweeps_per_beta() {
-        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.sweeps_per_beta = 4;
         assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
@@ -2655,7 +2871,7 @@ mod tests {
 
     #[test]
     fn session_key_rejects_a_different_beta_range() {
-        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.beta_range = Some((0.1, 10.0));
         assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
@@ -2663,7 +2879,7 @@ mod tests {
 
     #[test]
     fn session_key_rejects_more_reads_than_the_session_allocated() {
-        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.num_reads = 8;
         assert!(
@@ -2679,10 +2895,25 @@ mod tests {
         // Both sides apply `.max(1)`, so 0 and 1 are the same session.
         let mut seed = job(1);
         seed.params.sweeps_per_beta = 0;
-        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.sweeps_per_beta = 1;
         assert!(key.matches(&other, key.plan_for(&other).unwrap()));
+    }
+
+    #[test]
+    fn session_key_separates_weighted_msa_lanes() {
+        let mut seed = job(1);
+        seed.graph.h[0] = 0.25;
+        let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 5000, MsaLane::I32).unwrap();
+        let integer = key.plan_for(&seed).unwrap();
+        assert_eq!(integer.coefficients.path, CoefficientPath::Wide);
+        assert!(key.matches(&seed, integer));
+        let float = SessionArithmetic {
+            msa_lane: MsaLane::F32,
+            ..integer
+        };
+        assert!(!key.matches(&seed, float));
     }
 
     #[test]
@@ -2691,9 +2922,9 @@ mod tests {
         let mut thousand_x = job(2);
         thousand_x.graph.h.iter_mut().for_each(|v| *v *= 1000.0);
         thousand_x.graph.j.iter_mut().for_each(|v| *v *= 1000.0);
-        let key = SessionKey::seed(&one_x, 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&one_x, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let plan = key.plan_for(&thousand_x).unwrap();
-        assert_eq!(plan.scale_milli, 1_000_000);
+        assert_eq!(plan.coefficients.scale_milli, 1_000_000);
         assert!(
             !key.matches(&thousand_x, plan),
             "a 1000x job must not reuse the 1x schedule"
@@ -2706,16 +2937,16 @@ mod tests {
         let seed = job(1);
         let mut other = job(2);
         other.graph.h = vec![3.0, -3.0, 0.0, 3.0];
-        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let plan = key.plan_for(&other).unwrap();
-        assert_eq!(plan.scale_milli, 1000);
+        assert_eq!(plan.coefficients.scale_milli, 1000);
         assert!(!key.matches(&other, plan));
     }
 
     #[test]
     fn try_pull_refuses_without_ending_the_session() {
         let (tx, mut rx) = channel::<StreamJob>(4);
-        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut bad = job(2);
         bad.graph.h[0] = 0.0005; // sub-milli
         tx.try_send(bad).unwrap();
@@ -2880,7 +3111,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         job_tx.try_send(job(2)).expect("queue a second job");
         drop(job_tx);
 
@@ -2903,7 +3134,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.num_sweeps += 1;
         job_tx.try_send(other).expect("queue a mismatched job");
@@ -2929,7 +3160,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         job_tx.try_send(job(2)).expect("queue a second job");
         job_tx.try_send(job(3)).expect("queue a third job");
 
@@ -2952,7 +3183,7 @@ mod tests {
     fn next_seed_carries_a_job_over_and_ends_on_a_closed_channel() {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
-        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0).unwrap();
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         drop(job_tx);
         let cancel = CancelToken::default();
         let mut feed = Feed {

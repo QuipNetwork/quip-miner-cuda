@@ -4,8 +4,9 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // small literal fixtures
 
 use quip_protocol::scoring::energy_milli;
-use quip_solver_cuda::cuda_device::CudaDevice;
+use quip_solver_cuda::cuda_device::{CudaDevice, MsaLane};
 use quip_solver_cuda::sampler::{sample_ising, SampleError};
+use quip_solver_cuda::streaming::bench_one;
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serial_test::serial;
 use std::sync::OnceLock;
@@ -58,7 +59,15 @@ fn params() -> SampleParams {
 
 fn assert_finds_ground_state(kind: KernelKind, g: &IsingGraph) {
     let reads = sample_ising(device(kind), g, &params(), kind).expect("solves");
-    for r in &reads {
+    assert_ground_state(kind, g, &reads);
+}
+
+fn assert_ground_state(
+    kind: KernelKind,
+    g: &IsingGraph,
+    reads: &[quip_solver_cuda::SamplerResult],
+) {
+    for r in reads {
         assert_eq!(
             r.energy_milli,
             energy_milli(&r.spins, &g.h, &g.j, &g.edges),
@@ -76,6 +85,7 @@ fn quarter_unit_qubo_reaches_brute_force_minimum() {
     let g = quarter_ring(12);
     assert_finds_ground_state(KernelKind::Sa, &g);
     assert_finds_ground_state(KernelKind::Gibbs, &g);
+    assert_finds_ground_state(KernelKind::Msa, &g);
 }
 
 #[test]
@@ -90,6 +100,111 @@ fn one_x_and_thousand_x_reach_the_same_ground_state() {
     );
     assert_finds_ground_state(KernelKind::Sa, &one);
     assert_finds_ground_state(KernelKind::Sa, &thousand);
+    assert_finds_ground_state(KernelKind::Msa, &one);
+    assert_finds_ground_state(KernelKind::Msa, &thousand);
+}
+
+fn assert_msa_weighted_ground_states(lane: MsaLane) {
+    let one = quarter_ring(12);
+    let thousand = IsingGraph::new(
+        one.h.iter().map(|v| v * 1000.0).collect(),
+        one.j.iter().map(|v| v * 1000.0).collect(),
+        one.edges.to_vec(),
+    );
+    for graph in [&one, &thousand] {
+        let (reads, _) = bench_one(
+            device(KernelKind::Msa),
+            graph,
+            &params(),
+            KernelKind::Msa,
+            Some(lane),
+        )
+        .unwrap_or_else(|e| panic!("{lane:?}: {e}"));
+        assert_ground_state(KernelKind::Msa, graph, &reads);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn msa_weighted_i32_reaches_quarter_and_scaled_ground_states() {
+    assert_msa_weighted_ground_states(MsaLane::I32);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn msa_weighted_f32_reaches_quarter_and_scaled_ground_states() {
+    assert_msa_weighted_ground_states(MsaLane::F32);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn msa_forced_weighted_lanes_solve_unit_models_at_both_read_counts() {
+    let graph = IsingGraph::new(
+        vec![0.0; 12],
+        vec![1.0; 12],
+        (0..12).map(|i| (i, (i + 1) % 12)).collect(),
+    );
+    for lane in [MsaLane::I32, MsaLane::F32] {
+        for num_reads in [64, 128] {
+            let params = SampleParams {
+                num_reads,
+                ..params()
+            };
+            let (reads, _) = bench_one(
+                device(KernelKind::Msa),
+                &graph,
+                &params,
+                KernelKind::Msa,
+                Some(lane),
+            )
+            .expect("forced weighted unit model");
+            assert_eq!(reads.len(), num_reads);
+            assert_ground_state(KernelKind::Msa, &graph, &reads);
+        }
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn weighted_msa_requires_an_msa_device_open() {
+    let err = sample_ising(
+        device(KernelKind::Sa),
+        &quarter_ring(12),
+        &params(),
+        KernelKind::Msa,
+    )
+    .unwrap_err();
+    assert!(matches!(err, SampleError::Unsupported(_)), "{err}");
+    assert!(
+        err.to_string().contains("requires an MSA device open"),
+        "{err}"
+    );
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn msa_refuses_k22_on_unit_and_weighted_paths() {
+    let graph = complete_pm1(22);
+    for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
+        let err = bench_one(
+            device(KernelKind::Msa),
+            &graph,
+            &params(),
+            KernelKind::Msa,
+            lane,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SampleError::Unsupported(_)), "{err}");
+        assert!(
+            err.to_string().contains("21") && err.to_string().contains("20-neighbour"),
+            "{err}"
+        );
+    }
 }
 
 #[test]
@@ -97,12 +212,11 @@ fn one_x_and_thousand_x_reach_the_same_ground_state() {
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
 fn non_representable_models_are_refused() {
     let sub_milli = IsingGraph::new(vec![0.0005, 0.0], vec![1.0], vec![(0, 1)]);
-    let weighted = IsingGraph::new(vec![1.0, 0.0], vec![2.0], vec![(0, 1)]);
     let wide_gibbs = IsingGraph::new(vec![128.0, 0.0], vec![1.0], vec![(0, 1)]);
     for (kind, g) in [
         (KernelKind::Sa, &sub_milli),
         (KernelKind::Gibbs, &sub_milli),
-        (KernelKind::Msa, &weighted),
+        (KernelKind::Msa, &sub_milli),
         (KernelKind::Gibbs, &wide_gibbs),
     ] {
         let err = sample_ising(device(kind), g, &params(), kind).unwrap_err();
@@ -117,6 +231,12 @@ fn non_representable_models_are_refused() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
 fn stream_separates_one_x_and_thousand_x_schedules() {
+    for kind in [KernelKind::Sa, KernelKind::Msa] {
+        assert_stream_separates_scales(kind);
+    }
+}
+
+fn assert_stream_separates_scales(kind: KernelKind) {
     use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
     use quip_solver_cuda::nvml_gov::UtilGovernor;
     use quip_solver_cuda::streaming::run_stream;
@@ -143,16 +263,9 @@ fn stream_separates_one_x_and_thousand_x_schedules() {
     }
     drop(job_tx);
     let driver = std::thread::spawn(move || {
-        let device = device(KernelKind::Sa);
+        let device = device(kind);
         let gov = UtilGovernor::start(&device.pci_bus_id, 90, false);
-        run_stream(
-            device,
-            KernelKind::Sa,
-            job_rx,
-            res_tx,
-            CancelToken::default(),
-            &gov,
-        );
+        run_stream(device, kind, job_rx, res_tx, CancelToken::default(), &gov);
     });
     let mut seen = [false; 2];
     while let Some(result) = res_rx.blocking_recv() {
@@ -299,4 +412,15 @@ fn dense_quarter_unit_qubo_on_the_wide_path() {
     let h = (0..n).map(|i| vals[(i * 5 + 1) % 6]).collect();
     let g = IsingGraph::new(h, j, edges);
     assert_finds_ground_state(KernelKind::Sa, &g);
+    for lane in [MsaLane::I32, MsaLane::F32] {
+        let (reads, _) = bench_one(
+            device(KernelKind::Msa),
+            &g,
+            &params(),
+            KernelKind::Msa,
+            Some(lane),
+        )
+        .expect("weighted dense QUBO");
+        assert_ground_state(KernelKind::Msa, &g, &reads);
+    }
 }
