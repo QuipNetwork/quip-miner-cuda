@@ -76,8 +76,15 @@ pub const GIBBS_LIMITS: ModelLimits = ModelLimits {
 const MSA_MAX_DEGREE_U32: u32 = capacity::MSA_MAX_DEGREE as u32;
 
 /// MSA's model limits. `kernels/msa.cu` unrolls [`capacity::MSA_MAX_DEGREE`]
-/// neighbours and anneals on the signs of the couplings and biases alone, so
-/// its field is at most one unit per neighbour plus one for the bias.
+/// neighbours. The field limit is the largest field a ±1 model of that degree
+/// has, one unit per neighbour plus one for the bias.
+///
+/// The limits are checked on the model as received, but the kernel anneals on
+/// the signs of the couplings and biases alone. A model inside these limits
+/// with a coefficient above one unit runs as its sign model, and only the
+/// energies are rescored on the model as received. [`ModelLimits`] cannot
+/// state a ±1-only contract yet (QUI-1832), and refusing such models is
+/// tracked in QUI-1641.
 pub const MSA_LIMITS: ModelLimits = ModelLimits {
     max_degree: Some(MSA_MAX_DEGREE_U32),
     max_local_field_milli: Some((MSA_MAX_DEGREE_U32 + 1) * UNIT_MILLI),
