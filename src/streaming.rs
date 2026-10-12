@@ -122,13 +122,20 @@ fn to_kernel_i32(name: &str, value: usize) -> Result<i32, SampleError> {
     })
 }
 
-/// Low 32 bits of a host seed, for the kernel's `unsigned int` seed argument.
+/// The kernel's `unsigned int` seed argument, mixed from all 64 bits of a
+/// host seed.
 ///
-/// Deliberate narrowing: the device RNG is 32-bit, so the high half has
-/// nowhere to go. This is a width change, not a lost bound.
-#[allow(clippy::cast_possible_truncation)]
-fn seed_low_u32(seed: u64) -> u32 {
-    seed as u32
+/// The device RNG state is 32-bit, so the seed must be narrowed. Taking the
+/// low half made seeds that differ only in their high 32 bits run identical
+/// trajectories. The `SplitMix64` finalizer spreads every input bit over the
+/// high word it returns, so any change to the seed changes the kernel seed,
+/// short of a 2^-32 collision.
+fn kernel_seed(seed: u64) -> u32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    u32::try_from(z >> 32).unwrap_or(u32::MAX)
 }
 
 /// Per-algorithm constants dictated by the verbatim kernel's fixed-size
@@ -1133,7 +1140,7 @@ pub fn sample_one(
         SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
-    let seed = seed_low_u32(params.seed).wrapping_add(1);
+    let seed = kernel_seed(params.seed).wrapping_add(1);
     sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
 
     let deadline = Instant::now() + Duration::from_mins(2);
@@ -1274,7 +1281,7 @@ pub fn bench_one(
     // --- Timed launch on the compute stream (one model, then kernel returns). ---
     let k0 = timing_event(device)?;
     let k1 = timing_event(device)?;
-    let seed = seed_low_u32(params.seed).wrapping_add(1);
+    let seed = kernel_seed(params.seed).wrapping_add(1);
     k0.record(&sess.stream_compute)?;
     sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
     k1.record(&sess.stream_compute)?;
@@ -1649,8 +1656,8 @@ fn reject_held(slots: &mut [SlotState], out: &Sender<StreamResult>, reason: &Wir
 /// (`Instant::now().elapsed()` is not — it measures the few nanoseconds
 /// between its own two calls), mixed with the seed job's own `params.seed` so
 /// two sessions starting in the same clock tick still diverge.
-/// Multiply-and-take-the-high-word spreads both inputs across the whole `u32`
-/// rather than exposing raw low bits.
+/// [`kernel_seed`] spreads both inputs across the whole `u32` rather than
+/// exposing raw low bits.
 fn session_seed(job_seed: u64) -> u32 {
     let wall_nanos = u64::try_from(
         SystemTime::now()
@@ -1659,7 +1666,7 @@ fn session_seed(job_seed: u64) -> u32 {
             .as_nanos(),
     )
     .unwrap_or(u64::MAX);
-    seed_low_u32((wall_nanos ^ job_seed).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32)
+    kernel_seed(wall_nanos ^ job_seed)
 }
 
 /// Collect the batch a session launches with: the already-received `seed`
@@ -2398,6 +2405,21 @@ mod tests {
         let (sched, _) =
             build_beta_schedule(&graph(), 5, 1, Some((1.0, 5.0)), BetaSchedule::Linear);
         assert_eq!(sched, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// `--solve` seeds that differ only in their high 32 bits used to give the
+    /// same kernel seed, and so the same samples.
+    #[test]
+    fn the_kernel_seed_depends_on_every_bit_of_the_host_seed() {
+        let base = 0x0000_0000_dead_beef_u64;
+        assert_eq!(kernel_seed(base), kernel_seed(base), "deterministic");
+        for bit in 0..64 {
+            assert_ne!(
+                kernel_seed(base),
+                kernel_seed(base ^ (1 << bit)),
+                "flipping bit {bit} must change the kernel seed"
+            );
+        }
     }
 
     #[test]
