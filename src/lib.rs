@@ -52,21 +52,33 @@ const FEATURES: &[&str] = &["streaming", "governor", LINEAR_SCHEDULE_FEATURE];
 /// whole units (`topology::quantize_i8`), so only whole units are exact.
 const UNIT_MILLI: u32 = 1000;
 
-/// SA's model limits. `kernels/sa.cu` keeps each flip's energy change in a
-/// `signed char`, `-2 * s * (h + Σ J s)`, so the local field must stay within
-/// 63 units or the change wraps.
+/// SA's local field bound, in units. `get_flip_energy_unpacked` in
+/// `kernels/sa.cu` returns each flip's energy change, `-2 * s * (h + Σ J s)`,
+/// as a `signed char`, so twice the field must fit in an `i8` or the change
+/// wraps.
+const SA_MAX_FIELD_UNITS: u32 = 63;
+const _: () = assert!(2 * SA_MAX_FIELD_UNITS <= i8::MAX as u32);
+
+/// SA's model limits: a local field of at most `SA_MAX_FIELD_UNITS` units.
 pub const SA_LIMITS: ModelLimits = ModelLimits {
     max_degree: Some(0),
-    max_local_field_milli: Some(63 * UNIT_MILLI),
+    max_local_field_milli: Some(SA_MAX_FIELD_UNITS * UNIT_MILLI),
     exact_resolution_milli: Some(UNIT_MILLI),
 };
 
-/// Gibbs's model limits. `kernels/gibbs.cu` sums the field in `float`, so only
-/// the `int8` coefficients bound it: a field of at most 127 units keeps every
+/// Gibbs's local field bound, in units. `kernels/gibbs.cu` sums the field in
+/// `float` but stores every coupling and bias as a `signed char`
+/// (`compute_effective_field_shared`). No coefficient is larger than the field
+/// `|h| + Σ |J|` it feeds, so a field that fits in an `i8` keeps every
 /// coefficient inside one.
+const GIBBS_MAX_FIELD_UNITS: u32 = 127;
+const _: () = assert!(GIBBS_MAX_FIELD_UNITS <= i8::MAX as u32);
+
+/// Gibbs's model limits: a local field of at most `GIBBS_MAX_FIELD_UNITS`
+/// units.
 pub const GIBBS_LIMITS: ModelLimits = ModelLimits {
     max_degree: Some(0),
-    max_local_field_milli: Some(127 * UNIT_MILLI),
+    max_local_field_milli: Some(GIBBS_MAX_FIELD_UNITS * UNIT_MILLI),
     exact_resolution_milli: Some(UNIT_MILLI),
 };
 
