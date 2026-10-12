@@ -294,6 +294,84 @@ fn assert_stream_separates_scales(kind: KernelKind) {
     assert_eq!(seen, [true, true], "both scales must produce a result");
 }
 
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn sa_stream_mixes_unit_wide_refused_and_unit_jobs() {
+    assert_stream_mixes_paths_and_refusal(KernelKind::Sa);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn msa_stream_mixes_unit_weighted_refused_and_unit_jobs() {
+    assert_stream_mixes_paths_and_refusal(KernelKind::Msa);
+}
+
+fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
+    use quip_solver_core::{CancelToken, SampleError as WireSampleError, StreamJob, StreamOutcome};
+    use quip_solver_cuda::coefficients::{plan, CoefficientPath};
+    use quip_solver_cuda::nvml_gov::UtilGovernor;
+    use quip_solver_cuda::streaming::run_stream;
+    use tokio::sync::mpsc::channel;
+
+    let unit = IsingGraph::new(vec![0.0, 0.0], vec![1.0], vec![(0, 1)]);
+    // Field 65 exceeds SA's int8 delta bound and MSA's unit coefficients.
+    let wide = IsingGraph::new(vec![64.0, 0.0], vec![1.0], vec![(0, 1)]);
+    let refused = IsingGraph::new(vec![1e-19, 0.0], vec![1.0], vec![(0, 1)]);
+    let dev = device(kind);
+    let node_budget = match kind {
+        KernelKind::Sa => dev.sa_wide_max_nodes,
+        KernelKind::Msa => dev.max_nodes,
+        KernelKind::Gibbs => unreachable!("this test covers SA and MSA"),
+    };
+    assert_eq!(
+        plan(kind, &unit, node_budget).unwrap().path,
+        CoefficientPath::Int8
+    );
+    assert_eq!(
+        plan(kind, &wide, node_budget).unwrap().path,
+        CoefficientPath::Wide
+    );
+
+    let graphs = [unit.clone(), wide, refused, unit];
+    let (job_tx, job_rx) = channel::<StreamJob>(16);
+    let (res_tx, mut res_rx) = channel(16);
+    for (id, graph) in graphs.iter().enumerate() {
+        job_tx
+            .try_send(StreamJob {
+                job_id: vec![u8::try_from(id).unwrap()],
+                graph: graph.clone(),
+                params: params(),
+                watermark: None,
+            })
+            .unwrap();
+    }
+    drop(job_tx);
+    let driver = std::thread::spawn(move || {
+        let gov = UtilGovernor::start(&dev.pci_bus_id, 100, false);
+        run_stream(dev, kind, job_rx, res_tx, CancelToken::default(), &gov);
+    });
+    let mut seen = [false; 4];
+    while let Some(result) = res_rx.blocking_recv() {
+        let id = usize::from(result.job_id[0]);
+        assert!(!seen[id], "duplicate result for job {id}");
+        seen[id] = true;
+        let StreamOutcome::Completed(reads) = result.outcome else {
+            panic!("job {id} was cancelled");
+        };
+        if id == 2 {
+            assert_eq!(reads.unwrap_err(), WireSampleError::Capacity);
+        } else {
+            let reads = reads.expect("accepted jobs in flight must complete");
+            assert_eq!(reads.len(), params().num_reads);
+            assert_ground_state(kind, &graphs[id], &reads);
+        }
+    }
+    driver.join().expect("stream driver exits after draining");
+    assert_eq!(seen, [true; 4], "one outcome for every job");
+}
+
 /// `K_n` with J in {-1, +1} from a fixed pattern and h = 0.
 fn complete_pm1(n: usize) -> IsingGraph {
     let mut edges = Vec::new();
