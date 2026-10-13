@@ -675,6 +675,7 @@ fn run_model(
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        params.schedule,
         plan.beta_factor(),
     );
     let cfg = CellConfig {

@@ -27,7 +27,8 @@ use crate::topology::{fill_coefficients, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg};
 use quip_protocol::scoring::energy_milli;
-use quip_solver_core::beta::{default_ising_beta_range, geometric_beta_schedule};
+use quip_solver_core::beta::default_ising_beta_range;
+use quip_solver_core::BetaSchedule;
 use quip_solver_core::SampleError as WireSampleError;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, SamplerResult, StreamJob, StreamOutcome, StreamResult,
@@ -217,7 +218,8 @@ fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
     out
 }
 
-/// Geometric beta schedule cast to f32 for kernel upload, plus sweeps-per-beta.
+/// Beta schedule of the kind `schedule` names, cast to f32 for kernel upload,
+/// plus sweeps-per-beta.
 // The kernel's beta buffer is `float`, so the schedule is deliberately narrowed
 // on upload. Betas here run O(0.01)-O(10), far inside f32's range, and every
 // kernel-side use of them is f32 arithmetic regardless.
@@ -227,6 +229,7 @@ pub(crate) fn build_beta_schedule(
     num_sweeps: usize,
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
+    schedule: BetaSchedule,
     beta_factor: f64,
 ) -> (Vec<f32>, usize) {
     let _span = trace_span!("beta_build", num_sweeps).entered();
@@ -236,7 +239,8 @@ pub(crate) fn build_beta_schedule(
     // `beta_factor` turns a beta for the model in units into one for the
     // kernel's integer delta (see `coefficients::CoefficientPlan`). It is
     // exactly 1.0 for a mining job, so the uploaded schedule is unchanged.
-    let sched: Vec<f32> = geometric_beta_schedule(hot, cold, num_betas)
+    let sched: Vec<f32> = schedule
+        .build(hot, cold, num_betas)
         .iter()
         .map(|&b| (b * beta_factor) as f32)
         .collect();
@@ -1390,7 +1394,7 @@ impl Drop for SelfFeedingSession<'_> {
 /// Structural + sampling-config identity a self-feeding session is built
 /// for. A job can reuse the running session iff it matches: same graph
 /// (topology, so the CSR/coloring/edge positions stay valid) and same
-/// beta-schedule shape (so the shared beta buffer stays valid). `num_reads`
+/// beta-schedule shape and kind (so the shared beta buffer stays valid). `num_reads`
 /// only needs to fit under the session's established per-slot capacity.
 #[derive(Clone)]
 struct SessionKey {
@@ -1403,6 +1407,8 @@ struct SessionKey {
     /// the seed's coefficients produced. Keyed resolved, because two jobs
     /// that both send `None` get different defaults when their fields differ.
     beta_range: (f64, f64),
+    /// Shape of the ladder between the two ends of `beta_range`.
+    schedule: BetaSchedule,
     /// Path and scale every job in the session runs at. A job at another
     /// scale needs another schedule, and a job on another path another
     /// kernel.
@@ -1448,6 +1454,7 @@ impl SessionKey {
                 .params
                 .beta_range
                 .unwrap_or_else(|| default_ising_beta_range(&job.graph)),
+            schedule: job.params.schedule,
             plan: SessionArithmetic {
                 coefficients: plan,
                 msa_lane,
@@ -1478,6 +1485,7 @@ impl SessionKey {
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
             && self.plan == plan.arithmetic
             && self.beta_range == self.beta_range_for(job, plan.unit_mining)
+            && self.schedule == job.params.schedule
             && job.params.num_reads.max(1) <= self.reads_per_nonce
     }
 
@@ -1610,6 +1618,7 @@ pub fn sample_one(
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        params.schedule,
         plan.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(graph);
@@ -1754,6 +1763,7 @@ pub fn bench_one(
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        params.schedule,
         plan.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(graph);
@@ -2517,6 +2527,7 @@ fn run_session(
         seed.params.num_sweeps,
         seed.params.sweeps_per_beta,
         Some(key.beta_range),
+        seed.params.schedule,
         key.plan.coefficients.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(&seed.graph);
@@ -2922,6 +2933,22 @@ mod tests {
         assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
+    /// A linear job must not reuse a geometric session's beta buffer.
+    #[test]
+    fn session_key_rejects_a_different_schedule_kind() {
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
+        let mut other = job(2);
+        other.params.schedule = BetaSchedule::Linear;
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
+    }
+
+    #[test]
+    fn a_linear_schedule_is_evenly_spaced() {
+        let (sched, _) =
+            build_beta_schedule(&graph(), 5, 1, Some((1.0, 5.0)), BetaSchedule::Linear, 1.0);
+        assert_eq!(sched, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
     #[test]
     fn session_key_rejects_more_reads_than_the_session_allocated() {
         let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
@@ -3066,9 +3093,16 @@ mod tests {
     #[test]
     fn mining_schedule_is_bit_identical_after_scaling() {
         let g = graph();
-        let (base, _) = build_beta_schedule(&g, 1024, 4, None, 1.0);
+        let (base, _) = build_beta_schedule(&g, 1024, 4, None, BetaSchedule::Geometric, 1.0);
         let plan = coefficients::plan(KernelKind::Sa, &g, 0).unwrap();
-        let (scaled, _) = build_beta_schedule(&g, 1024, 4, None, plan.beta_factor());
+        let (scaled, _) = build_beta_schedule(
+            &g,
+            1024,
+            4,
+            None,
+            BetaSchedule::Geometric,
+            plan.beta_factor(),
+        );
         let bits = |v: &[f32]| v.iter().map(|b| b.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&base), bits(&scaled));
     }
@@ -3081,8 +3115,14 @@ mod tests {
         let plan = coefficients::plan(KernelKind::Sa, &g, 0).unwrap();
         assert_eq!(plan.scale_milli, 250);
         let (hot, cold) = (0.13_f64, 9.7_f64);
-        let (schedule, sweeps_per) =
-            build_beta_schedule(&g, 68, 4, Some((hot, cold)), plan.beta_factor());
+        let (schedule, sweeps_per) = build_beta_schedule(
+            &g,
+            68,
+            4,
+            Some((hot, cold)),
+            BetaSchedule::Geometric,
+            plan.beta_factor(),
+        );
         assert_eq!(sweeps_per, 4);
         assert_eq!(schedule.len(), 17);
         for (i, actual) in (0_u32..17).zip(schedule) {
@@ -3095,7 +3135,14 @@ mod tests {
 
     #[test]
     fn beta_schedule_length_is_sweeps_over_sweeps_per_beta() {
-        let (sched, sweeps_per) = build_beta_schedule(&graph(), 100, 10, Some((0.1, 10.0)), 1.0);
+        let (sched, sweeps_per) = build_beta_schedule(
+            &graph(),
+            100,
+            10,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sweeps_per, 10);
         assert_eq!(sched.len(), 10);
     }
@@ -3103,7 +3150,14 @@ mod tests {
     #[test]
     fn beta_schedule_floors_sweeps_per_beta_at_one() {
         // A zero would divide by zero; the floor turns it into one beta per sweep.
-        let (sched, sweeps_per) = build_beta_schedule(&graph(), 64, 0, Some((0.1, 10.0)), 1.0);
+        let (sched, sweeps_per) = build_beta_schedule(
+            &graph(),
+            64,
+            0,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sweeps_per, 1);
         assert_eq!(sched.len(), 64);
     }
@@ -3112,15 +3166,36 @@ mod tests {
     fn beta_schedule_always_has_at_least_one_beta() {
         // Zero sweeps, or fewer sweeps than sweeps_per_beta, must not yield an
         // empty schedule — the kernel would have nothing to anneal against.
-        let (sched, _) = build_beta_schedule(&graph(), 0, 1, Some((0.1, 10.0)), 1.0);
+        let (sched, _) = build_beta_schedule(
+            &graph(),
+            0,
+            1,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sched.len(), 1);
-        let (sched, _) = build_beta_schedule(&graph(), 4, 64, Some((0.1, 10.0)), 1.0);
+        let (sched, _) = build_beta_schedule(
+            &graph(),
+            4,
+            64,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sched.len(), 1);
     }
 
     #[test]
     fn beta_schedule_runs_hot_to_cold() {
-        let (sched, _) = build_beta_schedule(&graph(), 40, 10, Some((0.1, 10.0)), 1.0);
+        let (sched, _) = build_beta_schedule(
+            &graph(),
+            40,
+            10,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sched.len(), 4);
         // Beta rises as temperature falls, so the schedule is increasing.
         for pair in sched.windows(2) {
