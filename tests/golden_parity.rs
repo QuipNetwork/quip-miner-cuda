@@ -1,5 +1,6 @@
 //! Consensus parity: host `energy_milli` matches golden vectors, and live GPU
-//! samples score bit-exactly to consensus `energy_milli`.
+//! samples score bit-exactly to consensus `energy_milli`. Live reads are also
+//! a pure function of the whole 64-bit seed.
 //!
 //! Host/golden tests always run. Live sampling tests are `#[ignore]` so default
 //! `cargo test` on headless CI reports them as ignored, not silently passed
@@ -178,4 +179,47 @@ fn msa_finds_ground_state_on_ferro_with_fields() {
         "msa failed to find the ferro ground state under fields: {:?}",
         results.iter().map(|r| r.energy_milli).collect::<Vec<_>>()
     );
+}
+
+/// The same seed gives the same reads on every kernel, and a seed that differs
+/// only in bit 63 gives different ones. The kernels' RNG state is 32-bit, and
+/// keeping the seed's low half made the second pair identical (QUI-1627).
+///
+/// The anneal is hot and short, so each of the 64 spins in a read is close to
+/// a fair coin: the two seeds' 16 reads agreeing by chance is about 2^-1024.
+/// The ring's couplings are ±1 and its degree is 2, inside msa's limits.
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
+fn reads_repeat_for_a_seed_and_change_with_its_high_bit() {
+    let n = 64;
+    let edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+    let j: Vec<f64> = (0..n)
+        .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+        .collect();
+    let graph = IsingGraph::new(vec![0.0; n], j, edges);
+    let params = |seed: u64| SampleParams {
+        num_reads: 16,
+        num_sweeps: 4,
+        beta_range: Some((0.01, 0.02)),
+        seed,
+        ..Default::default()
+    };
+    let seed = 0x0123_4567_89ab_cdef_u64;
+
+    for kernel in [KernelKind::Sa, KernelKind::Msa, KernelKind::Gibbs] {
+        let dev = device(kernel);
+        let first = sample_ising(dev, &graph, &params(seed), kernel).expect("sample");
+        let again = sample_ising(dev, &graph, &params(seed), kernel).expect("sample");
+        let flipped = sample_ising(dev, &graph, &params(seed ^ (1 << 63)), kernel).expect("sample");
+        assert_eq!(first.len(), 16);
+        assert_eq!(
+            first, again,
+            "{kernel:?}: the same seed gave different reads"
+        );
+        assert_ne!(
+            first, flipped,
+            "{kernel:?}: seeds differing only in bit 63 gave the same reads"
+        );
+    }
 }
