@@ -125,11 +125,9 @@ async fn quip_cuda_gibbs_passes_conformance() {
 #[serial]
 #[ignore = "requires CUDA GPU; run with cargo test -- --ignored"]
 async fn quip_cuda_gibbs_passes_solve_conformance() {
-    assert_passes_solve_gate(
-        "quip-cuda-gibbs",
-        &["field-limit-inside", "field-limit-outside"],
-    )
-    .await;
+    // Gibbs states no field limit (it refuses per job), so the gate skips the
+    // field-limit cases.
+    assert_passes_solve_gate("quip-cuda-gibbs", &[]).await;
 }
 
 /// Each kernel lists `linear-schedule` and states its model limits, without a
@@ -139,9 +137,9 @@ async fn quip_cuda_gibbs_passes_solve_conformance() {
 fn capabilities_advertise_the_schedule_feature_and_limits() {
     ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
     for (bin, degree, field) in [
-        ("quip-cuda-sa", 0, 63_000),
-        ("quip-cuda-msa", 20, 21_000),
-        ("quip-cuda-gibbs", 0, 127_000),
+        ("quip-cuda-sa", 0, Some(536_870_910)),
+        ("quip-cuda-msa", 20, Some(16_777_215)),
+        ("quip-cuda-gibbs", 0, None),
     ] {
         let out = Command::new(profile_bin(bin))
             .arg("--capabilities")
@@ -155,8 +153,8 @@ fn capabilities_advertise_the_schedule_feature_and_limits() {
             "{bin}: {caps}"
         );
         assert_eq!(caps["maxDegree"], degree, "{bin}: {caps}");
-        assert_eq!(caps["maxLocalFieldMilli"], field, "{bin}: {caps}");
-        assert_eq!(caps["exactResolutionMilli"], 1000, "{bin}: {caps}");
+        assert_eq!(caps["maxLocalFieldMilli"].as_u64(), field, "{bin}: {caps}");
+        assert_eq!(caps["exactResolutionMilli"], 1, "{bin}: {caps}");
     }
 }
 

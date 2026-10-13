@@ -34,7 +34,7 @@ fn bench_one_scores_and_reports_positive_kernel_time() {
         sweeps_per_beta: 4,
         ..SampleParams::default()
     };
-    let (reads, timings) = bench_one(device(), &graph, &params, KernelKind::Sa).unwrap();
+    let (reads, timings) = bench_one(device(), &graph, &params, KernelKind::Sa, None).unwrap();
     assert_eq!(reads.len(), 8);
     for r in &reads {
         assert_eq!(
@@ -61,8 +61,8 @@ fn bench_one_kernel_time_grows_with_sweeps() {
     };
     let lo = params(1024);
     let hi = params(8192);
-    let (_, t_lo) = bench_one(device(), &graph, &lo, KernelKind::Sa).unwrap();
-    let (_, t_hi) = bench_one(device(), &graph, &hi, KernelKind::Sa).unwrap();
+    let (_, t_lo) = bench_one(device(), &graph, &lo, KernelKind::Sa, None).unwrap();
+    let (_, t_hi) = bench_one(device(), &graph, &hi, KernelKind::Sa, None).unwrap();
     // 8x the sweeps must cost meaningfully more device time (allow scheduler noise).
     assert!(
         t_hi.kernel_ns > t_lo.kernel_ns,
@@ -87,8 +87,8 @@ fn bench_one_upload_and_download_are_true_transfer_time_not_host_enqueue() {
         sweeps_per_beta: 4,
         ..SampleParams::default()
     };
-    let (_, t_small) = bench_one(device(), &small, &params, KernelKind::Sa).unwrap();
-    let (_, t_large) = bench_one(device(), &large, &params, KernelKind::Sa).unwrap();
+    let (_, t_small) = bench_one(device(), &small, &params, KernelKind::Sa, None).unwrap();
+    let (_, t_large) = bench_one(device(), &large, &params, KernelKind::Sa, None).unwrap();
     assert!(t_small.upload_ns > 0);
     assert!(t_large.upload_ns > 0);
     assert!(t_large.upload_ns >= t_small.upload_ns);
@@ -105,7 +105,7 @@ fn bench_one_gibbs_scores_and_reports_positive_kernel_time() {
         sweeps_per_beta: 4,
         ..SampleParams::default()
     };
-    let (reads, timings) = bench_one(device(), &graph, &params, KernelKind::Gibbs).unwrap();
+    let (reads, timings) = bench_one(device(), &graph, &params, KernelKind::Gibbs, None).unwrap();
     assert_eq!(reads.len(), 8);
     for r in &reads {
         assert_eq!(
@@ -130,7 +130,7 @@ fn bench_one_msa_scores_and_reports_positive_kernel_time() {
         seed: 7,
         ..Default::default()
     };
-    let (reads, timings) = bench_one(device(), &graph, &params, KernelKind::Msa).unwrap();
+    let (reads, timings) = bench_one(device(), &graph, &params, KernelKind::Msa, None).unwrap();
     assert_eq!(reads.len(), 8);
     assert!(timings.kernel_ns > 0);
 }

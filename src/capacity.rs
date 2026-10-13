@@ -22,6 +22,9 @@ pub const LOCAL_MEM_BYTES_PER_THREAD: usize = 512 * 1024;
 /// `streaming::build_algo_state`.
 pub const SA_THREADS_PER_NONCE: usize = 256;
 
+/// Bytes per node per thread of the wide SA `delta_energy` workspace (`int`).
+pub const SA_WIDE_DELTA_BYTES: usize = 4;
+
 /// Fraction of free device memory the capacity derivation will spend, as
 /// numerator over denominator.
 ///
@@ -109,6 +112,42 @@ pub fn sa_budget(limits: &DeviceLimits) -> usize {
     // 9 frame bytes per 8 nodes, inverted against the per-thread cap.
     let by_local_cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
     by_memory.min(by_local_cap)
+}
+
+/// Device memory the wide SA path consumes at `nodes`: the local frame compiled
+/// at `frame_nodes`, an i32 delta workspace, and the `-ln(u)` table.
+#[must_use]
+pub fn sa_wide_working_set_bytes(nodes: usize, frame_nodes: usize, limits: &DeviceLimits) -> usize {
+    let local = sa_frame_bytes(frame_nodes)
+        .saturating_mul(limits.sm_count)
+        .saturating_mul(limits.threads_per_sm);
+    let workspace = nodes
+        .saturating_mul(SA_WIDE_DELTA_BYTES)
+        .saturating_mul(limits.sm_count)
+        .saturating_mul(SA_THREADS_PER_NONCE);
+    let table = crate::accept_table::NEGLOG_LEN * std::mem::size_of::<i64>();
+    local.saturating_add(workspace).saturating_add(table)
+}
+
+/// Largest node count whose wide SA working set fits this device with the
+/// compiled `frame_nodes` frame, at most `frame_nodes`. Returns zero if none fit.
+#[must_use]
+pub fn sa_wide_budget(frame_nodes: usize, limits: &DeviceLimits) -> usize {
+    let fixed = sa_wide_working_set_bytes(0, frame_nodes, limits);
+    let per_node = limits
+        .sm_count
+        .saturating_mul(SA_THREADS_PER_NONCE)
+        .saturating_mul(SA_WIDE_DELTA_BYTES);
+    let usable = limits.usable_bytes();
+    let by_memory = usable
+        .saturating_sub(fixed)
+        .checked_div(per_node)
+        .unwrap_or(frame_nodes);
+    let mut nodes = by_memory.min(frame_nodes);
+    while nodes > 0 && sa_wide_working_set_bytes(nodes, frame_nodes, limits) > usable {
+        nodes -= 1;
+    }
+    nodes
 }
 
 /// Shipped `shared_state` size in `kernels/gibbs.cu`, and the floor.
@@ -334,6 +373,43 @@ pub fn resolve(
 mod tests {
     use super::*;
     use crate::kernel::KernelKind;
+
+    #[test]
+    fn wide_budget_fits_the_compiled_frame_at_16_gib() {
+        let limits = a4000(16 << 30);
+        let frame_nodes = sa_budget(&limits);
+        let wide = sa_wide_budget(frame_nodes, &limits);
+        assert_eq!(wide, 36_069);
+        assert!(sa_wide_working_set_bytes(wide, frame_nodes, &limits) <= limits.usable_bytes());
+        assert!(
+            sa_wide_working_set_bytes(wide + 1, frame_nodes, &limits) > limits.usable_bytes()
+                || wide == frame_nodes
+        );
+    }
+
+    #[test]
+    fn wide_budget_fits_at_8_gib_without_a_rounding_gap() {
+        let limits = a4000(8 << 30);
+        let frame_nodes = sa_budget(&limits);
+        let wide = sa_wide_budget(frame_nodes, &limits);
+        assert_eq!(wide, 18_029);
+        assert!(sa_wide_working_set_bytes(wide, frame_nodes, &limits) <= limits.usable_bytes());
+        assert!(sa_wide_working_set_bytes(wide + 1, frame_nodes, &limits) > limits.usable_bytes());
+    }
+
+    #[test]
+    fn wide_budget_covers_the_mining_frame() {
+        let limits = a4000(16 << 30);
+        assert_eq!(sa_wide_budget(4577, &limits), 4577);
+        assert!(sa_wide_working_set_bytes(4577, 4577, &limits) <= limits.usable_bytes());
+    }
+
+    #[test]
+    fn wide_budget_is_zero_when_the_frame_does_not_fit() {
+        let limits = a4000(128 << 20);
+        assert!(sa_wide_working_set_bytes(0, 4577, &limits) > limits.usable_bytes());
+        assert_eq!(sa_wide_budget(4577, &limits), 0);
+    }
 
     /// A4000 reports 49152 bytes of shared memory per block. `s_chunk` and
     /// `s_arrival` take 8 of them, so 49144 nodes is the Gibbs ceiling.

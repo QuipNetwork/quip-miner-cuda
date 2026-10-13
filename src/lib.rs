@@ -14,8 +14,10 @@
 //! its internal annealing accept/reject decisions. The coordinator session
 //! loop lives in `quip-solver-core`.
 
+pub mod accept_table;
 pub mod bench;
 pub mod capacity;
+pub mod coefficients;
 pub mod corpus;
 pub mod cuda_device;
 pub mod driver_budget;
@@ -38,70 +40,21 @@ use quip_solver_core::config::{config_override, warn_unknown_fields};
 use quip_solver_core::quip_proto::v1::Backend;
 use quip_solver_core::{
     BackendIdentity, CancelToken, ModelLimits, SampleError, Sampler, StreamJob, StreamResult,
-    LINEAR_SCHEDULE_FEATURE,
+    EXACT_COEFFICIENTS_FEATURE, LINEAR_SCHEDULE_FEATURE,
 };
 use std::collections::BTreeMap;
 
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 
 /// Features every kernel advertises: a real `sample_stream` override, the NVML
-/// governor, and a host-built ladder that honours `SampleParams::schedule`.
-const FEATURES: &[&str] = &["streaming", "governor", LINEAR_SCHEDULE_FEATURE];
-
-/// One unit, in milli. Every kernel truncates each coefficient to an `int8` of
-/// whole units (`topology::quantize_i8`), so only whole units are exact.
-const UNIT_MILLI: u32 = 1000;
-
-/// SA's local field bound, in units. `get_flip_energy_unpacked` in
-/// `kernels/sa.cu` returns each flip's energy change, `-2 * s * (h + Σ J s)`,
-/// as a `signed char`, so twice the field must fit in an `i8` or the change
-/// wraps.
-const SA_MAX_FIELD_UNITS: u32 = 63;
-const _: () = assert!(2 * SA_MAX_FIELD_UNITS <= i8::MAX as u32);
-
-/// SA's model limits: a local field of at most `SA_MAX_FIELD_UNITS` units.
-pub const SA_LIMITS: ModelLimits = ModelLimits {
-    max_degree: Some(0),
-    max_local_field_milli: Some(SA_MAX_FIELD_UNITS * UNIT_MILLI),
-    exact_resolution_milli: Some(UNIT_MILLI),
-};
-
-/// Gibbs's local field bound, in units. `kernels/gibbs.cu` sums the field in
-/// `float` but stores every coupling and bias as a `signed char`
-/// (`compute_effective_field_shared`). No coefficient is larger than the field
-/// `|h| + Σ |J|` it feeds, so a field that fits in an `i8` keeps every
-/// coefficient inside one.
-const GIBBS_MAX_FIELD_UNITS: u32 = 127;
-const _: () = assert!(GIBBS_MAX_FIELD_UNITS <= i8::MAX as u32);
-
-/// Gibbs's model limits: a local field of at most `GIBBS_MAX_FIELD_UNITS`
-/// units.
-pub const GIBBS_LIMITS: ModelLimits = ModelLimits {
-    max_degree: Some(0),
-    max_local_field_milli: Some(GIBBS_MAX_FIELD_UNITS * UNIT_MILLI),
-    exact_resolution_milli: Some(UNIT_MILLI),
-};
-
-/// [`capacity::MSA_MAX_DEGREE`] as the wire type.
-// The degree budget is 20, far inside u32, so this is a width change.
-#[allow(clippy::cast_possible_truncation)]
-const MSA_MAX_DEGREE_U32: u32 = capacity::MSA_MAX_DEGREE as u32;
-
-/// MSA's model limits. `kernels/msa.cu` unrolls [`capacity::MSA_MAX_DEGREE`]
-/// neighbours. The field limit is the largest field a ±1 model of that degree
-/// has, one unit per neighbour plus one for the bias.
-///
-/// The limits are checked on the model as received, but the kernel anneals on
-/// the signs of the couplings and biases alone. A model inside these limits
-/// with a coefficient above one unit runs as its sign model, and only the
-/// energies are rescored on the model as received. [`ModelLimits`] cannot
-/// state a ±1-only contract yet (QUI-1832), and refusing such models is
-/// tracked in QUI-1641.
-pub const MSA_LIMITS: ModelLimits = ModelLimits {
-    max_degree: Some(MSA_MAX_DEGREE_U32),
-    max_local_field_milli: Some((MSA_MAX_DEGREE_U32 + 1) * UNIT_MILLI),
-    exact_resolution_milli: Some(UNIT_MILLI),
-};
+/// governor, exact coefficient uploads, and a host-built ladder that honours
+/// `SampleParams::schedule`.
+const FEATURES: &[&str] = &[
+    "streaming",
+    "governor",
+    EXACT_COEFFICIENTS_FEATURE,
+    LINEAR_SCHEDULE_FEATURE,
+];
 
 /// CUDA backend config, parsed from the verbatim `config.toml` subsection in
 /// `Configure.backend_toml`. Unrecognized keys land in `unknown`;
@@ -150,7 +103,18 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         max_edges: DEFAULT_MAX_EDGES,
         features: FEATURES,
         adapt: CUDA_ADAPT,
-        limits: SA_LIMITS,
+        // SA has no degree bound (`Some(0)` is unbounded).
+        limits: ModelLimits {
+            max_degree: Some(0),
+            // The wide path holds a local field up to WIDE_MAX_FIELD milli. Advertise
+            // one milli less because quip-solver-core 0.0.3's --solve conversion
+            // (encoding::float_milli) does not round: 536870.91 units does not multiply
+            // to a whole milli in f64, while 536870.909 does.
+            max_local_field_milli: Some(
+                u32::try_from(coefficients::WIDE_MAX_FIELD - 1).unwrap_or(u32::MAX),
+            ),
+            exact_resolution_milli: Some(1),
+        },
     }
 }
 
@@ -200,7 +164,16 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
         max_edges: DEFAULT_MAX_EDGES,
         features: FEATURES,
         adapt: cuda_msa_adapt(max_reads),
-        limits: MSA_LIMITS,
+        // Unit models run the unit-weight kernel (by sign, 64 lanes per word).
+        // Other models run the weighted kernel at the model's own scale, up to a
+        // local field of 2^24 - 1 milli at scale 1, the worst case.
+        limits: ModelLimits {
+            max_degree: Some(u32::try_from(capacity::MSA_MAX_DEGREE).unwrap_or(u32::MAX)),
+            max_local_field_milli: Some(
+                u32::try_from(coefficients::MSA_WEIGHTED_MAX_FIELD).unwrap_or(u32::MAX),
+            ),
+            exact_resolution_milli: Some(1),
+        },
     }
 }
 
@@ -216,7 +189,13 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
         max_edges: DEFAULT_MAX_EDGES,
         features: FEATURES,
         adapt: CUDA_ADAPT,
-        limits: GIBBS_LIMITS,
+        // The int8 bound is per coefficient at the model's own scale, which no
+        // binary-wide field limit expresses: the binary refuses per job.
+        limits: ModelLimits {
+            max_degree: Some(0),
+            max_local_field_milli: None,
+            exact_resolution_milli: Some(1),
+        },
     }
 }
 

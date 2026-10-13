@@ -21,9 +21,10 @@
 // field h_i in {-1, 0, +1} is one more bond to a spin pinned at +1.
 //
 // Preconditions the host enforces (streaming::build_msa_state): every spin
-// has at most MSA_MAX_DEG neighbours. Couplings and fields are used by sign,
-// so |J| > 1 or |h| > 1 degrade the anneal but never the host-side scoring,
-// exactly as the int8 quantisation in sa.cu does.
+// has at most MSA_MAX_DEG neighbours. The unit build reads couplings and
+// fields by sign, and the host sends it unit models only. Weighted builds
+// read them at full width, and the host bounds the local field at 2^24 - 1
+// scale units.
 //
 // Spins are updated one colour class at a time (the host's greedy colouring,
 // as gibbs.cu uses), so no two spins updated together interact. Each thread
@@ -79,6 +80,24 @@
 // Neighbours prefetched and counted per spin: Zephyr's degree bound. The
 // host refuses a denser topology (capacity::MSA_MAX_DEGREE mirrors this).
 #define MSA_MAX_DEG   20
+
+// Coefficient width. The default build is the unit-weight kernel every
+// mining job runs, and its preprocessed source is byte-for-byte today's.
+// -DQUIP_MSA_WEIGHTED builds the weighted kernel (QUI-1641, after the CPU
+// design in QUI-1398): i32 coefficients and a per-lane local field. Exactly
+// one lane arithmetic is chosen: QUIP_MSA_LANE_I32 (integer-only Metropolis
+// against the host's -ln(u) table, the same on every GPU) or
+// QUIP_MSA_LANE_F32 (an __expf test).
+#ifdef QUIP_MSA_WEIGHTED
+typedef int msa_coef_t;
+#if defined(QUIP_MSA_LANE_I32) == defined(QUIP_MSA_LANE_F32)
+#error "a weighted msa build needs exactly one of QUIP_MSA_LANE_I32 and QUIP_MSA_LANE_F32"
+#endif
+#define NEGLOG_MASK 65535
+static_assert(sizeof(msa_coef_t) == 4, "weighted msa uses i32 coefficients");
+#else
+typedef signed char msa_coef_t;
+#endif
 
 typedef unsigned long long u64;
 
@@ -191,8 +210,8 @@ __global__ void cuda_msa_self_feeding(
     int num_colors,
 
     // Per-slot flat buffers (slot_idx = nonce_id * 3 + slot_id)
-    const signed char* __restrict__ slot_J_vals,
-    const signed char* __restrict__ slot_h_vals,
+    const msa_coef_t* __restrict__ slot_J_vals,
+    const msa_coef_t* __restrict__ slot_h_vals,
     signed char* slot_samples,
     int* slot_energies,
 
@@ -212,6 +231,11 @@ __global__ void cuda_msa_self_feeding(
     int max_packed_size,
     unsigned int base_seed,
     int words
+#ifdef QUIP_MSA_LANE_I32
+    , const long long* __restrict__ beta_fixed
+    , const int* __restrict__ delta_cut
+    , const long long* __restrict__ neglog_table
+#endif
 ) {
     extern __shared__ u64 smem[];
     u64* state = smem;                                        // N * words
@@ -273,8 +297,8 @@ __global__ void cuda_msa_self_feeding(
     // === Model loop: process slots until none READY ===
     while (true) {
         int slot_idx = nonce_id * 3 + active_slot;
-        const signed char* my_J = &slot_J_vals[(long long)slot_idx * nnz];
-        const signed char* my_h = &slot_h_vals[(long long)slot_idx * N];
+        const msa_coef_t* my_J = &slot_J_vals[(long long)slot_idx * nnz];
+        const msa_coef_t* my_h = &slot_h_vals[(long long)slot_idx * N];
         long long sample_base = (long long)slot_idx * num_reads * max_packed_size;
         long long energy_base = (long long)slot_idx * num_reads;
 
@@ -312,6 +336,7 @@ __global__ void cuda_msa_self_feeding(
             // Acceptance cuts for this rung: cut[m] = exp(-2 beta m) scaled
             // to the u64 range, non-increasing in m.
             float beta = __ldg(&beta_schedule[beta_idx]);
+#ifndef QUIP_MSA_WEIGHTED
             if (tid <= MSA_MAX_FIELD) {
                 double p = exp(-2.0 * (double)beta * (double)tid);
                 cut[tid] = (p >= 1.0) ? ~0ull : (u64)(p * 18446744073709551616.0);
@@ -332,6 +357,12 @@ __global__ void cuda_msa_self_feeding(
                 row[i] = (unsigned char)m;
             }
             __syncthreads();
+
+#endif
+#ifdef QUIP_MSA_LANE_I32
+            const long long rung_beta = __ldg(&beta_fixed[beta_idx]);
+            const int rung_cut = __ldg(&delta_cut[beta_idx]);
+#endif
 
             for (int sweep = 0; sweep < sweeps_per_beta; ++sweep) {
                 // Random cyclic shift of the row per sweep, uniform across
@@ -361,6 +392,42 @@ __global__ void cuda_msa_self_feeding(
                             jj[q] = ok ? (int)__ldg(&my_J[p]) : 0;
                         }
 
+#ifdef QUIP_MSA_WEIGHTED
+                        u64 bi = state[var * words + w];
+                        u64 sw[MSA_MAX_DEG];
+                        #pragma unroll
+                        for (int q = 0; q < MSA_MAX_DEG; ++q) {
+                            sw[q] = state[nb[q] * words + w];
+                        }
+                        const u64 draw = splitmix64(
+                            slot_seed ^ ((u64)beta_idx << 40)
+                            ^ ((u64)sweep << 20) ^ (u64)var);
+#ifdef QUIP_MSA_LANE_I32
+                        const long long bound = __ldg(&neglog_table[draw & NEGLOG_MASK]);
+#else
+                        // 23 bits keep k + 0.5f exact,
+                        // so u never reaches 1.0f.
+                        const float u = ((float)(draw >> 41) + 0.5f) * 1.1920929e-7f;
+#endif
+                        u64 accept = 0ull;
+                        for (int lane = 0; lane < 64; ++lane) {
+                            int field = h;
+                            #pragma unroll
+                            for (int q = 0; q < MSA_MAX_DEG; ++q) {
+                                // Spin bit 1 is -1. Missing neighbours have J = 0.
+                                field += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
+                            }
+                            const int de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
+#ifdef QUIP_MSA_LANE_I32
+                            const bool ok = de <= 0
+                                || (de <= rung_cut && (long long)de * rung_beta < bound);
+#else
+                            const bool ok = de <= 0 || u < __expf(-beta * (float)de);
+#endif
+                            accept |= (u64)ok << lane;
+                        }
+                        state[var * words + w] = bi ^ accept;
+#else
                         // Satisfied-bond bits per neighbour, plus the field
                         // as a ghost bond to a spin pinned at +1.
                         u64 bi = state[var * words + w];
@@ -384,6 +451,7 @@ __global__ void cuda_msa_self_feeding(
                         int limit = (d + m) >> 1;
                         u64 accept = (limit >= d) ? ~0ull : le_constant(planes, limit);
                         state[var * words + w] = bi ^ accept;
+#endif
                     }
                     __syncthreads();
                 }
