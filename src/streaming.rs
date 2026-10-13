@@ -15,15 +15,17 @@
 //! (bounded wait), and launches with however many nonces that filled — still
 //! correct, just not guaranteed to hit full width on a very short run.
 
+use crate::accept_table::{neglog_table, wide_rungs};
 use crate::capacity;
-use crate::cuda_device::CudaDevice;
+use crate::coefficients::{self, CoefficientPath, CoefficientPlan};
+use crate::cuda_device::{CudaDevice, MsaLane, DEFAULT_MSA_LANE};
 use crate::driver_budget::{Bucket, DriverBudget};
 use crate::kernel::KernelKind;
 use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
-use crate::topology::{fill_h_j, SelfFeedingTopology};
+use crate::topology::{fill_coefficients, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
-use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg};
 use quip_protocol::scoring::energy_milli;
 use quip_solver_core::beta::default_ising_beta_range;
 use quip_solver_core::BetaSchedule;
@@ -237,15 +239,19 @@ pub(crate) fn build_beta_schedule(
     sweeps_per_beta: usize,
     beta_range: Option<(f64, f64)>,
     schedule: BetaSchedule,
+    beta_factor: f64,
 ) -> (Vec<f32>, usize) {
     let _span = trace_span!("beta_build", num_sweeps).entered();
     let sweeps_per = sweeps_per_beta.max(1);
     let num_betas = (num_sweeps / sweeps_per).max(1);
     let (hot, cold) = beta_range.unwrap_or_else(|| default_ising_beta_range(graph));
+    // `beta_factor` turns a beta for the model in units into one for the
+    // kernel's integer delta (see `coefficients::CoefficientPlan`). It is
+    // exactly 1.0 for a mining job, so the uploaded schedule is unchanged.
     let sched: Vec<f32> = schedule
         .build(hot, cold, num_betas)
         .iter()
-        .map(|&b| b as f32)
+        .map(|&b| (b * beta_factor) as f32)
         .collect();
     (sched, sweeps_per)
 }
@@ -330,6 +336,7 @@ struct SelfFeedingSession<'a> {
     device: &'a CudaDevice,
     kernel: KernelKind,
     topology: SelfFeedingTopology,
+    plan: CoefficientPlan,
     active_nonces: usize,
     reads_per_nonce: usize,
     max_packed_size: usize,
@@ -340,8 +347,7 @@ struct SelfFeedingSession<'a> {
 
     d_row_ptr: CudaSlice<i32>,
     d_col_ind: CudaSlice<i32>,
-    d_j: CudaSlice<i8>,
-    d_h: CudaSlice<i8>,
+    coefs: SlotCoefficients,
     d_samples: CudaSlice<i8>,
     d_energies: CudaSlice<i32>,
     d_ctrl: CudaSlice<i32>,
@@ -349,11 +355,57 @@ struct SelfFeedingSession<'a> {
 
     algo_state: AlgoState,
 
-    // Host staging, reused across uploads to avoid a realloc per model.
-    stage_j: Vec<i8>,
-    stage_h: Vec<i8>,
-
     launched: bool,
+}
+
+/// Slot buffers and reusable host staging, selected by coefficient width.
+enum SlotCoefficients {
+    Int8 {
+        d_j: CudaSlice<i8>,
+        d_h: CudaSlice<i8>,
+        stage_j: Vec<i8>,
+        stage_h: Vec<i8>,
+    },
+    Wide {
+        d_j: CudaSlice<i32>,
+        d_h: CudaSlice<i32>,
+        stage_j: Vec<i32>,
+        stage_h: Vec<i32>,
+    },
+}
+
+/// Stage and upload one slot's coefficients at the selected element width.
+fn upload_slot_coefficients<T>(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+    scale_milli: u64,
+    stream: &Arc<CudaStream>,
+    slot_idx: usize,
+    (d_j, d_h): (&mut CudaSlice<T>, &mut CudaSlice<T>),
+    (stage_j, stage_h): (&mut [T], &mut [T]),
+) -> Result<(), SampleError>
+where
+    T: DeviceRepr + Copy + Default + TryFrom<i64>,
+{
+    let nnz_alloc = topology.nnz.max(1);
+    let n_alloc = topology.n.max(1);
+    let j_start = slot_idx * nnz_alloc;
+    let h_start = slot_idx * n_alloc;
+    stage_j.fill(T::default());
+    stage_h.fill(T::default());
+    let (j, h) =
+        fill_coefficients::<T>(topology, graph, scale_milli).map_err(SampleError::Unsupported)?;
+    stage_j[..j.len()].copy_from_slice(&j);
+    stage_h[..h.len()].copy_from_slice(&h);
+    stream.memcpy_htod(
+        &stage_j[..nnz_alloc],
+        &mut d_j.slice_mut(j_start..j_start + nnz_alloc),
+    )?;
+    stream.memcpy_htod(
+        &stage_h[..n_alloc],
+        &mut d_h.slice_mut(h_start..h_start + n_alloc),
+    )?;
+    Ok(())
 }
 
 /// The session's sizes in the kernel's `int` ABI, converted once in `build`
@@ -368,22 +420,69 @@ struct KernelDims {
     reads_per_nonce: i32,
 }
 
+/// Shared colouring buffers and spin layout for both MSA paths.
+struct MsaState {
+    d_color_starts: CudaSlice<i32>,
+    d_color_counts: CudaSlice<i32>,
+    d_color_nodes: CudaSlice<i32>,
+    num_colors: i32,
+    words: i32,
+    shared_bytes: u32,
+}
+
+impl SlotCoefficients {
+    fn allocate(
+        stream: &Arc<CudaStream>,
+        path: CoefficientPath,
+        total_slots: usize,
+        nnz_alloc: usize,
+        n: usize,
+    ) -> Result<Self, SampleError> {
+        Ok(match path {
+            CoefficientPath::Int8 => SlotCoefficients::Int8 {
+                d_j: stream.alloc_zeros::<i8>(total_slots * nnz_alloc)?,
+                d_h: stream.alloc_zeros::<i8>(total_slots * n.max(1))?,
+                stage_j: vec![0i8; nnz_alloc],
+                stage_h: vec![0i8; n.max(1)],
+            },
+            CoefficientPath::Wide => SlotCoefficients::Wide {
+                d_j: stream.alloc_zeros::<i32>(total_slots * nnz_alloc)?,
+                d_h: stream.alloc_zeros::<i32>(total_slots * n.max(1))?,
+                stage_j: vec![0i32; nnz_alloc],
+                stage_h: vec![0i32; n.max(1)],
+            },
+        })
+    }
+}
+
+/// Arithmetic choices fixed for the lifetime of a session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionArithmetic {
+    coefficients: CoefficientPlan,
+    msa_lane: MsaLane,
+}
+
 /// Kernel-specific buffers, kept out of `Option`s: which variant is
 /// populated always matches `SelfFeedingSession::kernel` by construction,
 /// so `launch()` destructures it directly instead of unwrapping an `Option`
 /// known-Some-by-invariant.
 enum AlgoState {
-    /// Multi-spin kernel: colour classes plus its shared-memory footprint.
-    Msa {
-        d_color_starts: CudaSlice<i32>,
-        d_color_counts: CudaSlice<i32>,
-        d_color_nodes: CudaSlice<i32>,
-        num_colors: i32,
-        words: i32,
-        shared_bytes: u32,
+    Msa(MsaState),
+    MsaWeighted {
+        lane: MsaLane,
+        msa: MsaState,
+        d_beta_fixed: Option<CudaSlice<i64>>,
+        d_delta_cut: Option<CudaSlice<i32>>,
+        d_neglog: Option<CudaSlice<i64>>,
     },
     Sa {
         d_delta_energy: CudaSlice<i8>,
+    },
+    SaWide {
+        d_delta_energy: CudaSlice<i32>,
+        d_beta_fixed: CudaSlice<i64>,
+        d_delta_cut: CudaSlice<i32>,
+        d_neglog: CudaSlice<i64>,
     },
     Gibbs {
         d_block_starts: CudaSlice<i32>,
@@ -395,19 +494,28 @@ enum AlgoState {
     },
 }
 
+impl AlgoState {
+    fn shared_mem_bytes(&self) -> u32 {
+        match self {
+            Self::Msa(msa) | Self::MsaWeighted { msa, .. } => msa.shared_bytes,
+            Self::Sa { .. } | Self::SaWide { .. } | Self::Gibbs { .. } => 0,
+        }
+    }
+}
+
 /// Device buffers for the multi-spin kernel: the colour classes plus the
 /// dynamic shared-memory footprint the launch asks for.
 ///
 /// The kernel unrolls a fixed neighbour budget (`MSA_MAX_DEG` in
 /// `kernels/msa.cu`). A denser topology cannot run on it and is refused per
-/// job as `Unsupported`, which the wire maps to `Capacity`: permanent for
-/// this graph, harmless to the session.
+/// job as `Unsupported`. This maps to `Capacity` on the wire: permanent
+/// for this graph, harmless to the session.
 fn build_msa_state(
     device: &CudaDevice,
     stream: &Arc<CudaStream>,
     topology: &SelfFeedingTopology,
     reads_per_nonce: usize,
-) -> Result<AlgoState, SampleError> {
+) -> Result<MsaState, SampleError> {
     let max_deg = topology.max_degree();
     if max_deg > capacity::MSA_MAX_DEGREE {
         return Err(SampleError::Unsupported(format!(
@@ -460,13 +568,61 @@ fn build_msa_state(
             "msa shared memory {shared} bytes does not fit the launch ABI"
         ))
     })?;
-    Ok(AlgoState::Msa {
+    Ok(MsaState {
         d_color_starts: stream.clone_htod(&starts)?,
         d_color_counts: stream.clone_htod(&counts)?,
         d_color_nodes: stream.clone_htod(&nodes)?,
         num_colors: topology.colors.num_colors,
         words: to_kernel_i32("words", words)?,
         shared_bytes,
+    })
+}
+
+/// Reuse the MSA layout and allocate acceptance tables only for the integer lane.
+fn build_msa_weighted_state(
+    device: &CudaDevice,
+    stream: &Arc<CudaStream>,
+    topology: &SelfFeedingTopology,
+    reads_per_nonce: usize,
+    max_num_betas: usize,
+    lane: MsaLane,
+) -> Result<AlgoState, SampleError> {
+    if device.msa_weighted.is_none() {
+        return Err(SampleError::Unsupported(
+            "weighted MSA requires an MSA device open".into(),
+        ));
+    }
+    let msa = build_msa_state(device, stream, topology, reads_per_nonce)?;
+    let (d_beta_fixed, d_delta_cut, d_neglog) = match lane {
+        MsaLane::I32 => (
+            Some(stream.alloc_zeros::<i64>(max_num_betas.max(1))?),
+            Some(stream.alloc_zeros::<i32>(max_num_betas.max(1))?),
+            Some(stream.clone_htod(&neglog_table())?),
+        ),
+        MsaLane::F32 => (None, None, None),
+    };
+    Ok(AlgoState::MsaWeighted {
+        lane,
+        msa,
+        d_beta_fixed,
+        d_delta_cut,
+        d_neglog,
+    })
+}
+
+/// Allocate the wide SA workspace and its fixed-point acceptance buffers.
+fn build_sa_wide_state(
+    stream: &Arc<CudaStream>,
+    n: usize,
+    num_nonces: usize,
+    max_num_betas: usize,
+) -> Result<AlgoState, SampleError> {
+    let total_threads = num_nonces * 256;
+    Ok(AlgoState::SaWide {
+        d_delta_energy: stream.alloc_zeros::<i32>(total_threads * n.max(1))?,
+        d_beta_fixed: stream.alloc_zeros::<i64>(max_num_betas.max(1))?,
+        d_delta_cut: stream.alloc_zeros::<i32>(max_num_betas.max(1))?,
+        d_neglog: stream.clone_htod(&neglog_table())?,
     })
 }
 
@@ -487,7 +643,9 @@ fn build_algo_state(
 ) -> Result<AlgoState, SampleError> {
     let limits = algo_limits(kernel, device.msa_replica_words);
     match kernel {
-        KernelKind::Msa => build_msa_state(device, stream, topology, reads_per_nonce),
+        KernelKind::Msa => {
+            build_msa_state(device, stream, topology, reads_per_nonce).map(AlgoState::Msa)
+        }
         KernelKind::Sa => {
             let total_threads = num_nonces * 256;
             Ok(AlgoState::Sa {
@@ -535,8 +693,11 @@ impl<'a> SelfFeedingSession<'a> {
         num_nonces: usize,
         reads_per_nonce: usize,
         max_num_betas: usize,
+        arithmetic: SessionArithmetic,
     ) -> Result<Self, SampleError> {
         let _span = trace_span!("problem_setup", n = topology.n, nnz = topology.nnz).entered();
+        let plan = arithmetic.coefficients;
+        let msa_lane = arithmetic.msa_lane;
         let n = topology.n;
         // Defense in depth: the backend identity's `max_nodes` already rejects
         // an oversized job in `job.rs` before it reaches the sampler. This
@@ -547,6 +708,15 @@ impl<'a> SelfFeedingSession<'a> {
             return Err(SampleError::GraphTooLarge {
                 n,
                 limit: device.max_nodes,
+            });
+        }
+        if kernel == KernelKind::Sa
+            && plan.path == CoefficientPath::Wide
+            && n > device.sa_wide_max_nodes
+        {
+            return Err(SampleError::GraphTooLarge {
+                n,
+                limit: device.sa_wide_max_nodes,
             });
         }
         let nnz_alloc = topology.nnz.max(1);
@@ -577,8 +747,8 @@ impl<'a> SelfFeedingSession<'a> {
         let d_row_ptr = stream_compute.clone_htod(&row_ptr)?;
         let d_col_ind = stream_compute.clone_htod(&col_ind)?;
 
-        let d_j = stream_compute.alloc_zeros::<i8>(total_slots * nnz_alloc)?;
-        let d_h = stream_compute.alloc_zeros::<i8>(total_slots * n.max(1))?;
+        let coefs =
+            SlotCoefficients::allocate(&stream_compute, plan.path, total_slots, nnz_alloc, n)?;
         let d_samples =
             stream_compute.alloc_zeros::<i8>(total_slots * reads_per_nonce * max_packed_size)?;
         let d_energies =
@@ -586,14 +756,27 @@ impl<'a> SelfFeedingSession<'a> {
         let d_ctrl = stream_compute.alloc_zeros::<i32>(num_nonces * CTRL_STRIDE)?;
         let d_beta = stream_compute.alloc_zeros::<f32>(max_num_betas.max(1))?;
 
-        let algo_state = build_algo_state(
-            device,
-            &stream_compute,
-            kernel,
-            &topology,
-            num_nonces,
-            reads_per_nonce,
-        )?;
+        let algo_state = if kernel == KernelKind::Sa && plan.path == CoefficientPath::Wide {
+            build_sa_wide_state(&stream_compute, n, num_nonces, max_num_betas)?
+        } else if kernel == KernelKind::Msa && plan.path == CoefficientPath::Wide {
+            build_msa_weighted_state(
+                device,
+                &stream_compute,
+                &topology,
+                reads_per_nonce,
+                max_num_betas,
+                msa_lane,
+            )?
+        } else {
+            build_algo_state(
+                device,
+                &stream_compute,
+                kernel,
+                &topology,
+                num_nonces,
+                reads_per_nonce,
+            )?
+        };
 
         // Every device buffer above is zero-initialized by an `alloc_zeros`
         // memset enqueued on `stream_compute`. Per-slot `h`/`J`/ctrl uploads
@@ -616,6 +799,7 @@ impl<'a> SelfFeedingSession<'a> {
             device,
             kernel,
             topology,
+            plan,
             active_nonces: 0,
             reads_per_nonce,
             max_packed_size,
@@ -624,15 +808,12 @@ impl<'a> SelfFeedingSession<'a> {
             stream_transfer,
             d_row_ptr,
             d_col_ind,
-            d_j,
-            d_h,
+            coefs,
             d_samples,
             d_energies,
             d_ctrl,
             d_beta,
             algo_state,
-            stage_j: vec![0i8; nnz_alloc],
-            stage_h: vec![0i8; n.max(1)],
             launched: false,
         })
     }
@@ -644,6 +825,24 @@ impl<'a> SelfFeedingSession<'a> {
         }
         self.stream_transfer
             .memcpy_htod(sched, &mut self.d_beta.slice_mut(0..sched.len()))?;
+        if let AlgoState::SaWide {
+            d_beta_fixed,
+            d_delta_cut,
+            ..
+        }
+        | AlgoState::MsaWeighted {
+            lane: MsaLane::I32,
+            d_beta_fixed: Some(d_beta_fixed),
+            d_delta_cut: Some(d_delta_cut),
+            ..
+        } = &mut self.algo_state
+        {
+            let (beta_fixed, delta_cut) = wide_rungs(sched);
+            self.stream_transfer
+                .memcpy_htod(&beta_fixed, &mut d_beta_fixed.slice_mut(0..sched.len()))?;
+            self.stream_transfer
+                .memcpy_htod(&delta_cut, &mut d_delta_cut.slice_mut(0..sched.len()))?;
+        }
         Ok(())
     }
 
@@ -658,7 +857,6 @@ impl<'a> SelfFeedingSession<'a> {
     ) -> Result<(), SampleError> {
         let _span = trace_span!("upload", kind = "slot", nonce_id, slot_id).entered();
         let slot_idx = nonce_id * usize::from(SLOTS_PER_NONCE) + slot_id;
-        let nnz = self.topology.nnz;
         let n = self.topology.n;
 
         // `stage_h` is sized from `self.topology.n`, but the `h` produced
@@ -674,24 +872,36 @@ impl<'a> SelfFeedingSession<'a> {
             )));
         }
 
-        self.stage_j[..nnz.max(1)].fill(0);
-        self.stage_h[..n.max(1)].fill(0);
-        let (j, h) = fill_h_j(&self.topology, graph);
-        self.stage_j[..j.len()].copy_from_slice(&j);
-        self.stage_h[..h.len()].copy_from_slice(&h);
-
-        let nnz_alloc = self.topology.nnz.max(1);
-        let n_alloc = self.topology.n.max(1);
-        let j_start = slot_idx * nnz_alloc;
-        let h_start = slot_idx * n_alloc;
-        self.stream_transfer.memcpy_htod(
-            &self.stage_j[..nnz_alloc],
-            &mut self.d_j.slice_mut(j_start..j_start + nnz_alloc),
-        )?;
-        self.stream_transfer.memcpy_htod(
-            &self.stage_h[..n_alloc],
-            &mut self.d_h.slice_mut(h_start..h_start + n_alloc),
-        )?;
+        match &mut self.coefs {
+            SlotCoefficients::Int8 {
+                d_j,
+                d_h,
+                stage_j,
+                stage_h,
+            } => upload_slot_coefficients(
+                &self.topology,
+                graph,
+                self.plan.scale_milli,
+                &self.stream_transfer,
+                slot_idx,
+                (d_j, d_h),
+                (stage_j, stage_h),
+            )?,
+            SlotCoefficients::Wide {
+                d_j,
+                d_h,
+                stage_j,
+                stage_h,
+            } => upload_slot_coefficients(
+                &self.topology,
+                graph,
+                self.plan.scale_milli,
+                &self.stream_transfer,
+                slot_idx,
+                (d_j, d_h),
+                (stage_j, stage_h),
+            )?,
+        }
 
         // Zero this slot's output region so a stale prior model's samples
         // can't leak through if the kernel writes fewer bytes than expected.
@@ -745,16 +955,21 @@ impl<'a> SelfFeedingSession<'a> {
         sweeps_per_beta: i32,
         seed: u32,
     ) -> Result<(), SampleError> {
-        let AlgoState::Msa {
+        let AlgoState::Msa(msa) = &self.algo_state else {
+            return Err(SampleError::Driver("launch_msa without msa state".into()));
+        };
+        let MsaState {
             d_color_starts,
             d_color_counts,
             d_color_nodes,
             num_colors,
             words,
             ..
-        } = &self.algo_state
-        else {
-            return Err(SampleError::Driver("launch_msa without msa state".into()));
+        } = msa;
+        let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
+            return Err(SampleError::Driver(
+                "launch_msa without int8 coefficients".into(),
+            ));
         };
         let dims = &self.dims;
         let mut b = self.stream_compute.launch_builder(&self.device.msa);
@@ -764,8 +979,8 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(d_color_counts);
         b.arg(d_color_nodes);
         b.arg(num_colors);
-        b.arg(&self.d_j);
-        b.arg(&self.d_h);
+        b.arg(d_j);
+        b.arg(d_h);
         b.arg(&self.d_samples);
         b.arg(&self.d_energies);
         b.arg(&self.d_beta);
@@ -783,6 +998,151 @@ impl<'a> SelfFeedingSession<'a> {
         // `kernels/msa.cu` in order, type and count; every buffer is sized by
         // `build` from the same `dims` the kernel receives, and the colour
         // buffers are bounded by `num_colors` / `dims.n`.
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    fn launch_msa_weighted(
+        &self,
+        cfg: LaunchConfig,
+        num_betas: i32,
+        sweeps_per_beta: i32,
+        seed: u32,
+    ) -> Result<(), SampleError> {
+        let AlgoState::MsaWeighted {
+            lane,
+            msa,
+            d_beta_fixed,
+            d_delta_cut,
+            d_neglog,
+        } = &self.algo_state
+        else {
+            return Err(SampleError::Driver(
+                "launch_msa_weighted without weighted MSA state".into(),
+            ));
+        };
+        let kernels = self.device.msa_weighted.as_ref().ok_or_else(|| {
+            SampleError::Unsupported("weighted MSA requires an MSA device open".into())
+        })?;
+        let function = match lane {
+            MsaLane::I32 => &kernels.i32,
+            MsaLane::F32 => &kernels.f32,
+        };
+        let MsaState {
+            d_color_starts,
+            d_color_counts,
+            d_color_nodes,
+            num_colors,
+            words,
+            ..
+        } = msa;
+        let SlotCoefficients::Wide { d_j, d_h, .. } = &self.coefs else {
+            return Err(SampleError::Driver(
+                "launch_msa_weighted without wide coefficients".into(),
+            ));
+        };
+        let dims = &self.dims;
+        let mut b = self.stream_compute.launch_builder(function);
+        b.arg(&self.d_row_ptr);
+        b.arg(&self.d_col_ind);
+        b.arg(d_color_starts);
+        b.arg(d_color_counts);
+        b.arg(d_color_nodes);
+        b.arg(num_colors);
+        b.arg(d_j);
+        b.arg(d_h);
+        b.arg(&self.d_samples);
+        b.arg(&self.d_energies);
+        b.arg(&self.d_beta);
+        b.arg(&num_betas);
+        b.arg(&sweeps_per_beta);
+        b.arg(&self.d_ctrl);
+        b.arg(&dims.num_nonces);
+        b.arg(&dims.reads_per_nonce);
+        b.arg(&dims.n);
+        b.arg(&dims.nnz);
+        b.arg(&dims.max_packed);
+        b.arg(&seed);
+        b.arg(words);
+        if *lane == MsaLane::I32 {
+            let (Some(beta_fixed), Some(delta_cut), Some(neglog)) =
+                (d_beta_fixed, d_delta_cut, d_neglog)
+            else {
+                return Err(SampleError::Driver(
+                    "integer MSA acceptance buffers are missing".into(),
+                ));
+            };
+            b.arg(beta_fixed);
+            b.arg(delta_cut);
+            b.arg(neglog);
+        }
+        // SAFETY: the 24 arguments for I32, or 21 for F32, mirror
+        // `cuda_msa_self_feeding` compiled with QUIP_MSA_WEIGHTED and its lane
+        // define, in order, type and count. J and h are i32. `build` sizes
+        // every slot and colouring buffer from these same dimensions, and
+        // checks both the degree and shared spin-state budget. The three I32
+        // buffers hold num_betas, num_betas and NEGLOG_LEN entries. `Drop`
+        // signals exit and synchronizes the compute stream before freeing them.
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    fn launch_sa_wide(
+        &self,
+        cfg: LaunchConfig,
+        num_betas: i32,
+        sweeps_per_beta: i32,
+        seed: u32,
+    ) -> Result<(), SampleError> {
+        let AlgoState::SaWide {
+            d_delta_energy,
+            d_beta_fixed,
+            d_delta_cut,
+            d_neglog,
+        } = &self.algo_state
+        else {
+            return Err(SampleError::Driver(
+                "launch_sa_wide without wide SA state".into(),
+            ));
+        };
+        let dims = &self.dims;
+        let SlotCoefficients::Wide { d_j, d_h, .. } = &self.coefs else {
+            return Err(SampleError::Driver(
+                "launch_sa_wide without wide coefficients".into(),
+            ));
+        };
+        let mut b = self.stream_compute.launch_builder(&self.device.sa_wide);
+        b.arg(&self.d_row_ptr);
+        b.arg(&self.d_col_ind);
+        b.arg(d_j);
+        b.arg(d_h);
+        b.arg(&self.d_samples);
+        b.arg(&self.d_energies);
+        b.arg(&self.d_beta);
+        b.arg(&num_betas);
+        b.arg(&sweeps_per_beta);
+        b.arg(&self.d_ctrl);
+        b.arg(&dims.num_nonces);
+        b.arg(&dims.reads_per_nonce);
+        b.arg(&dims.n);
+        b.arg(&dims.nnz);
+        b.arg(&dims.max_packed);
+        b.arg(&seed);
+        b.arg(d_delta_energy);
+        b.arg(&dims.n);
+        b.arg(d_beta_fixed);
+        b.arg(d_delta_cut);
+        b.arg(d_neglog);
+        // SAFETY: the 21 `b.arg` calls mirror `cuda_sa_self_feeding`
+        // in `kernels/sa.cu` built with `QUIP_SA_WIDE`, in order,
+        // type and count. J, h and delta use i32. The slot buffers
+        // and workspace are sized from these same `dims`, as in the
+        // SA arm. The three trailing buffers hold `num_betas`,
+        // `num_betas` and `NEGLOG_LEN` entries. `build` rejects
+        // n above both device.max_nodes and device.sa_wide_max_nodes,
+        // bounding the compiled frame and wide workspace. `Drop`
+        // signals exit and synchronizes `stream_compute` before
+        // any buffer is freed.
         unsafe { b.launch(cfg) }?;
         Ok(())
     }
@@ -806,10 +1166,7 @@ impl<'a> SelfFeedingSession<'a> {
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
             block_dim: (limits.threads_per_block, 1, 1),
-            shared_mem_bytes: match &self.algo_state {
-                AlgoState::Msa { shared_bytes, .. } => *shared_bytes,
-                AlgoState::Sa { .. } | AlgoState::Gibbs { .. } => 0,
-            },
+            shared_mem_bytes: self.algo_state.shared_mem_bytes(),
         };
         let num_betas = to_kernel_i32("num_betas", num_betas)?;
         let sweeps_per_beta = to_kernel_i32("sweeps_per_beta", sweeps_per_beta)?;
@@ -840,15 +1197,23 @@ impl<'a> SelfFeedingSession<'a> {
         // cudarc's read/write distinction is inert here — the kernel's own
         // volatile ctrl protocol is the actual synchronization.
         match &self.algo_state {
-            AlgoState::Msa { .. } => {
+            AlgoState::Msa(_) => {
                 self.launch_msa(cfg, num_betas, sweeps_per_beta, seed)?;
             }
+            AlgoState::MsaWeighted { .. } => {
+                self.launch_msa_weighted(cfg, num_betas, sweeps_per_beta, seed)?;
+            }
             AlgoState::Sa { d_delta_energy } => {
+                let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
+                    return Err(SampleError::Driver(
+                        "launch_sa without int8 coefficients".into(),
+                    ));
+                };
                 let mut b = self.stream_compute.launch_builder(&self.device.sa);
                 b.arg(&self.d_row_ptr);
                 b.arg(&self.d_col_ind);
-                b.arg(&self.d_j);
-                b.arg(&self.d_h);
+                b.arg(d_j);
+                b.arg(d_h);
                 b.arg(&self.d_samples);
                 b.arg(&self.d_energies);
                 b.arg(&self.d_beta);
@@ -880,6 +1245,9 @@ impl<'a> SelfFeedingSession<'a> {
                 // `stream_compute` before any `CudaSlice` field is freed.
                 unsafe { b.launch(cfg) }?;
             }
+            AlgoState::SaWide { .. } => {
+                self.launch_sa_wide(cfg, num_betas, sweeps_per_beta, seed)?;
+            }
             AlgoState::Gibbs {
                 d_block_starts,
                 d_block_counts,
@@ -888,6 +1256,11 @@ impl<'a> SelfFeedingSession<'a> {
                 chunks_per_model,
                 reads_per_chunk,
             } => {
+                let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
+                    return Err(SampleError::Driver(
+                        "launch_gibbs without int8 coefficients".into(),
+                    ));
+                };
                 let mut b = self.stream_compute.launch_builder(&self.device.gibbs);
                 b.arg(&self.d_row_ptr);
                 b.arg(&self.d_col_ind);
@@ -898,8 +1271,8 @@ impl<'a> SelfFeedingSession<'a> {
                 b.arg(&self.d_beta);
                 b.arg(&num_betas);
                 b.arg(&sweeps_per_beta);
-                b.arg(&self.d_j);
-                b.arg(&self.d_h);
+                b.arg(d_j);
+                b.arg(d_h);
                 b.arg(&self.d_samples);
                 b.arg(&self.d_energies);
                 b.arg(&self.d_ctrl);
@@ -1003,7 +1376,8 @@ impl Drop for SelfFeedingSession<'_> {
         // ignorable. If we return without establishing that the kernel has
         // stopped, the `CudaSlice` fields are freed immediately afterwards
         // and a still-running persistent kernel keeps writing into
-        // `d_samples`/`d_ctrl`/`d_energies` — a use-after-free on the device,
+        // `d_samples`/`d_ctrl`/`d_energies`/the int8 or wide delta workspace
+        // — a use-after-free on the device,
         // the exact scenario `CudaDevice::open`'s safety note rules out.
         // Leaking device memory is sound and aborting is sound; freeing
         // memory that is still in use is not. So escalate instead of giving
@@ -1038,32 +1412,149 @@ struct SessionKey {
     reads_per_nonce: usize,
     num_sweeps: usize,
     sweeps_per_beta: usize,
-    beta_range: Option<(f64, f64)>,
+    /// The range the schedule was built from: the job's own, or the default
+    /// the seed's coefficients produced. Keyed resolved, because two jobs
+    /// that both send `None` get different defaults when their fields differ.
+    beta_range: (f64, f64),
+    /// Shape of the ladder between the two ends of `beta_range`.
     schedule: BetaSchedule,
+    /// Path and scale every job in the session runs at. A job at another
+    /// scale needs another schedule, and a job on another path another
+    /// kernel.
+    plan: SessionArithmetic,
+    kernel: KernelKind,
+    wide_max_nodes: usize,
+    /// Unit-coupling field contribution, fixed by this session's topology.
+    unit_degree: Vec<usize>,
+    unit_connected: usize,
+}
+
+/// Arithmetic and literal-unit status validated for one admitted job.
+#[derive(Clone, Copy)]
+struct JobPlan {
+    arithmetic: SessionArithmetic,
+    unit_mining: bool,
 }
 
 impl SessionKey {
-    fn seed(job: &StreamJob, reads_per_nonce: usize) -> Self {
-        Self {
+    fn seed(
+        job: &StreamJob,
+        reads_per_nonce: usize,
+        kernel: KernelKind,
+        wide_max_nodes: usize,
+        msa_lane: MsaLane,
+    ) -> Result<Self, String> {
+        let plan = coefficients::plan(kernel, &job.graph, wide_max_nodes)?;
+        let n = job.graph.h.len();
+        let mut unit_degree = vec![0; n];
+        for &(u, v) in job.graph.edges.iter() {
+            if u < n && v < n {
+                unit_degree[u] += 1;
+                unit_degree[v] += 1;
+            }
+        }
+        Ok(Self {
             n: job.graph.h.len(),
             edges: job.graph.edges.clone(),
             reads_per_nonce,
             num_sweeps: job.params.num_sweeps,
             sweeps_per_beta: job.params.sweeps_per_beta.max(1),
-            beta_range: job.params.beta_range,
+            beta_range: job
+                .params
+                .beta_range
+                .unwrap_or_else(|| default_ising_beta_range(&job.graph)),
             schedule: job.params.schedule,
-        }
+            plan: SessionArithmetic {
+                coefficients: plan,
+                msa_lane,
+            },
+            kernel,
+            wide_max_nodes,
+            unit_connected: unit_degree.iter().filter(|&&degree| degree > 0).count(),
+            unit_degree,
+        })
     }
 
-    fn matches(&self, job: &StreamJob) -> bool {
+    fn plan_for(&self, job: &StreamJob) -> Result<JobPlan, String> {
+        coefficients::plan_with_unit(self.kernel, &job.graph, self.wide_max_nodes).map(
+            |(coefficients, unit_mining)| JobPlan {
+                arithmetic: SessionArithmetic {
+                    coefficients,
+                    msa_lane: self.plan.msa_lane,
+                },
+                unit_mining,
+            },
+        )
+    }
+
+    fn matches(&self, job: &StreamJob, plan: JobPlan) -> bool {
         self.n == job.graph.h.len()
             && self.edges == job.graph.edges
             && self.num_sweeps == job.params.num_sweeps
             && self.sweeps_per_beta == job.params.sweeps_per_beta.max(1)
-            && self.beta_range == job.params.beta_range
+            && self.plan == plan.arithmetic
+            && self.beta_range == self.beta_range_for(job, plan.unit_mining)
             && self.schedule == job.params.schedule
             && job.params.num_reads.max(1) <= self.reads_per_nonce
     }
+
+    #[allow(clippy::cast_precision_loss)] // Device-sized degrees and gap counts are below 2^53.
+    fn beta_range_for(&self, job: &StreamJob, unit_mining: bool) -> (f64, f64) {
+        job.params.beta_range.unwrap_or_else(|| {
+            if !unit_mining {
+                return default_ising_beta_range(&job.graph);
+            }
+            // Called after matching N/edges. All nonzero gaps are exactly one.
+            // Device-sized integer degrees and gap counts are exact in f64.
+            let mut max_field = 0;
+            let mut gaps = self.unit_connected;
+            for (&h, &degree) in job.graph.h.iter().zip(&self.unit_degree) {
+                let has_field = h != 0.0;
+                max_field = max_field.max(degree + usize::from(has_field));
+                if degree == 0 && has_field {
+                    gaps += 1;
+                }
+            }
+            if gaps == 0 {
+                return (0.1, 1.0);
+            }
+            let hot = std::f64::consts::LN_2 / (2.0 * max_field as f64);
+            let cold = (gaps as f64 / 0.01).ln() / 2.0;
+            (hot, cold.max(hot))
+        })
+    }
+}
+
+/// Node budget of the wide path on this device. Zero for kernels without it.
+pub(crate) fn wide_max_nodes(device: &CudaDevice, kernel: KernelKind) -> usize {
+    match kernel {
+        KernelKind::Sa => device.sa_wide_max_nodes,
+        KernelKind::Msa => device.max_nodes,
+        KernelKind::Gibbs => 0,
+    }
+}
+
+/// Plan a bench job, forcing weighted MSA at its GCD scale when a lane is given.
+pub(crate) fn bench_plan(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    kernel: KernelKind,
+    msa_lane: Option<MsaLane>,
+) -> Result<CoefficientPlan, SampleError> {
+    if msa_lane.is_some() && kernel != KernelKind::Msa {
+        return Err(SampleError::Unsupported(
+            "--msa-path requires the MSA kernel".into(),
+        ));
+    }
+    let mut plan = coefficients::plan(kernel, graph, wide_max_nodes(device, kernel))
+        .map_err(SampleError::Unsupported)?;
+    if msa_lane.is_some() {
+        // A unit model's nonzero coefficients are +/-1000 milli, so its GCD
+        // is already 1000, as is the all-zero fallback. Other models' plans
+        // already carry their own GCD scale.
+        plan.path = CoefficientPath::Wide;
+    }
+    Ok(plan)
 }
 
 /// Run one job through a dedicated single-nonce self-feeding session:
@@ -1116,6 +1607,8 @@ pub fn sample_one(
     params: &SampleParams,
     kernel: KernelKind,
 ) -> Result<Vec<SamplerResult>, SampleError> {
+    let plan = coefficients::plan(kernel, graph, wide_max_nodes(device, kernel))
+        .map_err(SampleError::Unsupported)?;
     let n = graph.num_nodes();
     if n == 0 {
         let reads = params.num_reads.max(1);
@@ -1135,11 +1628,22 @@ pub fn sample_one(
         params.sweeps_per_beta,
         params.beta_range,
         params.schedule,
+        plan.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(graph);
 
-    let mut sess =
-        SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
+    let mut sess = SelfFeedingSession::build(
+        device,
+        kernel,
+        topology,
+        1,
+        reads_per_nonce,
+        beta.len(),
+        SessionArithmetic {
+            coefficients: plan,
+            msa_lane: DEFAULT_MSA_LANE,
+        },
+    )?;
     sess.upload_beta_schedule(&beta)?;
     sess.upload_slot(0, 0, graph)?;
     let seed = kernel_seed(params.seed);
@@ -1231,6 +1735,9 @@ fn poll_until_complete(
 /// making the launch a discrete instance `nsys`/`ncu` attribute cleanly.
 /// Reuses the `.cu` kernels unchanged — no device code is added.
 ///
+/// `msa_lane == None` plans normally and uses the default weighted lane.
+/// `Some(lane)` forces weighted MSA, even for unit models, at the GCD scale.
+///
 /// # Errors
 ///
 /// Same set as [`sample_one`]: [`SampleError::GraphTooLarge`] for an oversized
@@ -1244,7 +1751,9 @@ pub fn bench_one(
     graph: &IsingGraph,
     params: &SampleParams,
     kernel: KernelKind,
+    msa_lane: Option<MsaLane>,
 ) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
+    let plan = bench_plan(device, graph, kernel, msa_lane)?;
     let n = graph.num_nodes();
     if n == 0 {
         let reads = params.num_reads.max(1);
@@ -1264,10 +1773,21 @@ pub fn bench_one(
         params.sweeps_per_beta,
         params.beta_range,
         params.schedule,
+        plan.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(graph);
-    let mut sess =
-        SelfFeedingSession::build(device, kernel, topology, 1, reads_per_nonce, beta.len())?;
+    let mut sess = SelfFeedingSession::build(
+        device,
+        kernel,
+        topology,
+        1,
+        reads_per_nonce,
+        beta.len(),
+        SessionArithmetic {
+            coefficients: plan,
+            msa_lane: msa_lane.unwrap_or(DEFAULT_MSA_LANE),
+        },
+    )?;
 
     // --- Timed upload (beta + slot 0 + exit flag) on the transfer stream. ---
     let up0 = timing_event(device)?;
@@ -1442,14 +1962,20 @@ pub fn stream_width(device: &CudaDevice, kernel: KernelKind) -> usize {
 enum Pull {
     Job(StreamJob),
     Mismatch(StreamJob),
+    /// No path holds this job exactly. The caller rejects it as Capacity and
+    /// keeps the session: one refused job must not cost the jobs in flight.
+    Refused(StreamJob, String),
     Empty,
     Closed,
 }
 
 fn try_pull(jobs: &mut Receiver<StreamJob>, key: &SessionKey) -> Pull {
     match jobs.try_recv() {
-        Ok(j) if key.matches(&j) => Pull::Job(j),
-        Ok(j) => Pull::Mismatch(j),
+        Ok(j) => match key.plan_for(&j) {
+            Err(why) => Pull::Refused(j, why),
+            Ok(plan) if key.matches(&j, plan) => Pull::Job(j),
+            Ok(_) => Pull::Mismatch(j),
+        },
         Err(TryRecvError::Empty) => Pull::Empty,
         Err(TryRecvError::Disconnected) => Pull::Closed,
     }
@@ -1696,6 +2222,10 @@ fn drain_cold_start(feed: &mut Feed<'_>, seed: StreamJob, width: usize) -> (Vec<
                     last_arrival = Instant::now();
                 }
             }
+            Pull::Refused(job, why) => {
+                eprintln!("quip-solver-cuda: refusing job: {why}");
+                send_reject(feed.out, job, WireSampleError::Capacity);
+            }
             Pull::Mismatch(j) => return (cold, Halt::Mismatch(j)),
             Pull::Empty => {
                 if last_arrival.elapsed() > idle_timeout {
@@ -1735,6 +2265,10 @@ fn refill_slots(
                         continue;
                     }
                     slot.admit(free, j);
+                }
+                Pull::Refused(job, why) => {
+                    eprintln!("quip-solver-cuda: refusing job: {why}");
+                    send_reject(feed.out, job, WireSampleError::Capacity);
                 }
                 Pull::Mismatch(j) => return Halt::Mismatch(j),
                 Pull::Empty => break,
@@ -1961,6 +2495,22 @@ fn run_session(
     cancel: &CancelToken,
     ctx: &mut DriverContext<'_>,
 ) -> Option<StreamJob> {
+    let limits = algo_limits(kernel, device.msa_replica_words);
+    let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
+    let key = match SessionKey::seed(
+        &seed,
+        reads_per_nonce,
+        kernel,
+        wide_max_nodes(device, kernel),
+        DEFAULT_MSA_LANE,
+    ) {
+        Ok(key) => key,
+        Err(why) => {
+            eprintln!("quip-solver-cuda: refusing job: {why}");
+            send_reject(out, seed, WireSampleError::Capacity);
+            return jobs.blocking_recv();
+        }
+    };
     if seed.graph.num_nodes() == 0 {
         // Degenerate empty-graph job: no kernel needed, answer directly.
         if !answer_empty_graph(out, seed) {
@@ -1980,16 +2530,14 @@ fn run_session(
     }
 
     let width = stream_width(device, kernel);
-    let limits = algo_limits(kernel, device.msa_replica_words);
-    let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
     let job_seed = seed.params.seed;
-    let key = SessionKey::seed(&seed, reads_per_nonce);
     let (beta, sweeps_per_beta) = build_beta_schedule(
         &seed.graph,
         seed.params.num_sweeps,
         seed.params.sweeps_per_beta,
-        seed.params.beta_range,
+        Some(key.beta_range),
         seed.params.schedule,
+        key.plan.coefficients.beta_factor(),
     );
     let topology = SelfFeedingTopology::build(&seed.graph);
     let mut feed = Feed {
@@ -2006,6 +2554,7 @@ fn run_session(
         width,
         reads_per_nonce,
         beta.len(),
+        key.plan,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -2349,63 +2898,63 @@ mod tests {
     #[test]
     fn session_key_matches_an_identical_job() {
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8);
-        assert!(key.matches(&seed));
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
+        assert!(key.matches(&seed, key.plan_for(&seed).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_node_count() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.graph.h.push(0.5);
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_different_edges() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.graph.edges = vec![(0, 1), (1, 2), (2, 3), (0, 2)].into();
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_sweep_count() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.num_sweeps += 1;
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_sweeps_per_beta() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.sweeps_per_beta = 4;
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn session_key_rejects_a_different_beta_range() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.beta_range = Some((0.1, 10.0));
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     /// A linear job must not reuse a geometric session's beta buffer.
     #[test]
     fn session_key_rejects_a_different_schedule_kind() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.schedule = BetaSchedule::Linear;
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
     fn a_linear_schedule_is_evenly_spaced() {
         let (sched, _) =
-            build_beta_schedule(&graph(), 5, 1, Some((1.0, 5.0)), BetaSchedule::Linear);
+            build_beta_schedule(&graph(), 5, 1, Some((1.0, 5.0)), BetaSchedule::Linear, 1.0);
         assert_eq!(sched, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
     }
 
@@ -2426,12 +2975,15 @@ mod tests {
 
     #[test]
     fn session_key_rejects_more_reads_than_the_session_allocated() {
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.num_reads = 8;
-        assert!(key.matches(&other), "exactly the capacity still fits");
+        assert!(
+            key.matches(&other, key.plan_for(&other).unwrap()),
+            "exactly the capacity still fits"
+        );
         other.params.num_reads = 9;
-        assert!(!key.matches(&other));
+        assert!(!key.matches(&other, key.plan_for(&other).unwrap()));
     }
 
     #[test]
@@ -2439,10 +2991,170 @@ mod tests {
         // Both sides apply `.max(1)`, so 0 and 1 are the same session.
         let mut seed = job(1);
         seed.params.sweeps_per_beta = 0;
-        let key = SessionKey::seed(&seed, 8);
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.sweeps_per_beta = 1;
-        assert!(key.matches(&other));
+        assert!(key.matches(&other, key.plan_for(&other).unwrap()));
+    }
+
+    #[test]
+    fn session_key_separates_weighted_msa_lanes() {
+        let mut seed = job(1);
+        seed.graph.h[0] = 0.25;
+        let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 5000, MsaLane::I32).unwrap();
+        let integer = key.plan_for(&seed).unwrap();
+        assert_eq!(integer.arithmetic.coefficients.path, CoefficientPath::Wide);
+        assert!(key.matches(&seed, integer));
+        let float = JobPlan {
+            arithmetic: SessionArithmetic {
+                msa_lane: MsaLane::F32,
+                ..integer.arithmetic
+            },
+            ..integer
+        };
+        assert!(!key.matches(&seed, float));
+    }
+
+    #[test]
+    fn session_key_separates_scales_on_one_topology() {
+        let one_x = job(1);
+        let mut thousand_x = job(2);
+        thousand_x.graph.h.iter_mut().for_each(|v| *v *= 1000.0);
+        thousand_x.graph.j.iter_mut().for_each(|v| *v *= 1000.0);
+        let key = SessionKey::seed(&one_x, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
+        let plan = key.plan_for(&thousand_x).unwrap();
+        assert_eq!(plan.arithmetic.coefficients.scale_milli, 1_000_000);
+        assert!(
+            !key.matches(&thousand_x, plan),
+            "a 1000x job must not reuse the 1x schedule"
+        );
+    }
+
+    #[test]
+    fn session_key_separates_default_beta_ranges() {
+        // Same scale (1000) and topology, different field: the default range differs.
+        let seed = job(1);
+        let mut other = job(2);
+        other.graph.h = vec![3.0, -3.0, 0.0, 3.0];
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
+        let plan = key.plan_for(&other).unwrap();
+        assert_eq!(plan.arithmetic.coefficients.scale_milli, 1000);
+        assert!(!key.matches(&other, plan));
+    }
+
+    #[test]
+    fn unit_session_beta_matches_sdk_for_fields_and_isolated_nodes() {
+        let mut seed = job(1);
+        seed.graph = IsingGraph::new(
+            vec![0.0; 5],
+            vec![1.0; 4],
+            vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+        );
+        let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 5000, DEFAULT_MSA_LANE).unwrap();
+        for fields in 0..243 {
+            let mut code = fields;
+            for h in &mut seed.graph.h {
+                *h = [-1.0, 0.0, 1.0][code % 3];
+                code /= 3;
+            }
+            for signs in 0..16 {
+                for (edge, j) in seed.graph.j.iter_mut().enumerate() {
+                    *j = if signs >> edge & 1 == 0 { -1.0 } else { 1.0 };
+                }
+                let expected = default_ising_beta_range(&seed.graph);
+                let actual = key.beta_range_for(&seed, key.plan_for(&seed).unwrap().unit_mining);
+                assert_eq!(
+                    (actual.0.to_bits(), actual.1.to_bits()),
+                    (expected.0.to_bits(), expected.1.to_bits())
+                );
+                assert_eq!(
+                    key.matches(&seed, key.plan_for(&seed).unwrap()),
+                    key.beta_range == expected
+                );
+            }
+        }
+        seed.params.beta_range = Some((0.125, 9.5));
+        assert_eq!(
+            key.beta_range_for(&seed, key.plan_for(&seed).unwrap().unit_mining),
+            (0.125, 9.5)
+        );
+    }
+
+    #[test]
+    fn unit_session_beta_keeps_sdk_fallbacks() {
+        for graph in [
+            IsingGraph::new(vec![], vec![], vec![]),
+            IsingGraph::new(vec![0.0, -0.0], vec![], vec![]),
+            IsingGraph::new(vec![1.0, 0.0], vec![], vec![(0, 1)]),
+            IsingGraph::new(vec![1.0, 0.0], vec![0.0], vec![(0, 1)]),
+            IsingGraph::new(vec![1.0 + f64::EPSILON, 0.0], vec![1.0], vec![(0, 1)]),
+            IsingGraph::new(vec![0.25, -0.75], vec![0.5], vec![(0, 1)]),
+        ] {
+            let mut seed = job(1);
+            seed.graph = graph;
+            let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 5000, DEFAULT_MSA_LANE).unwrap();
+            let actual = key.beta_range_for(&seed, key.plan_for(&seed).unwrap().unit_mining);
+            let expected = default_ising_beta_range(&seed.graph);
+            assert_eq!(
+                (actual.0.to_bits(), actual.1.to_bits()),
+                (expected.0.to_bits(), expected.1.to_bits())
+            );
+        }
+    }
+
+    #[test]
+    fn try_pull_refuses_without_ending_the_session() {
+        let (tx, mut rx) = channel::<StreamJob>(4);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
+        let mut bad = job(2);
+        bad.graph.h[0] = 0.0005; // sub-milli
+        tx.try_send(bad).unwrap();
+        tx.try_send(job(3)).unwrap();
+        assert!(matches!(try_pull(&mut rx, &key), Pull::Refused(j, _) if j.job_id == vec![2]));
+        assert!(matches!(try_pull(&mut rx, &key), Pull::Job(j) if j.job_id == vec![3]));
+    }
+
+    #[test]
+    fn mining_schedule_is_bit_identical_after_scaling() {
+        let g = graph();
+        let (base, _) = build_beta_schedule(&g, 1024, 4, None, BetaSchedule::Geometric, 1.0);
+        let plan = coefficients::plan(KernelKind::Sa, &g, 0).unwrap();
+        let (scaled, _) = build_beta_schedule(
+            &g,
+            1024,
+            4,
+            None,
+            BetaSchedule::Geometric,
+            plan.beta_factor(),
+        );
+        let bits = |v: &[f32]| v.iter().map(|b| b.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&base), bits(&scaled));
+    }
+
+    #[test]
+    fn explicit_beta_schedule_applies_non_unit_plan_factor() {
+        let mut g = graph();
+        g.h.iter_mut().for_each(|v| *v *= 0.25);
+        g.j.iter_mut().for_each(|v| *v *= 0.25);
+        let plan = coefficients::plan(KernelKind::Sa, &g, 0).unwrap();
+        assert_eq!(plan.scale_milli, 250);
+        let (hot, cold) = (0.13_f64, 9.7_f64);
+        let (schedule, sweeps_per) = build_beta_schedule(
+            &g,
+            68,
+            4,
+            Some((hot, cold)),
+            BetaSchedule::Geometric,
+            plan.beta_factor(),
+        );
+        assert_eq!(sweeps_per, 4);
+        assert_eq!(schedule.len(), 17);
+        for (i, actual) in (0_u32..17).zip(schedule) {
+            let fraction = f64::from(i) / 16.0;
+            let f64_beta = (hot.ln() + fraction * (cold.ln() - hot.ln())).exp();
+            let expected = (f64_beta * 0.25) as f32;
+            assert_eq!(actual.to_bits(), expected.to_bits(), "beta entry {i}");
+        }
     }
 
     #[test]
@@ -2453,6 +3165,7 @@ mod tests {
             10,
             Some((0.1, 10.0)),
             BetaSchedule::Geometric,
+            1.0,
         );
         assert_eq!(sweeps_per, 10);
         assert_eq!(sched.len(), 10);
@@ -2461,8 +3174,14 @@ mod tests {
     #[test]
     fn beta_schedule_floors_sweeps_per_beta_at_one() {
         // A zero would divide by zero; the floor turns it into one beta per sweep.
-        let (sched, sweeps_per) =
-            build_beta_schedule(&graph(), 64, 0, Some((0.1, 10.0)), BetaSchedule::Geometric);
+        let (sched, sweeps_per) = build_beta_schedule(
+            &graph(),
+            64,
+            0,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sweeps_per, 1);
         assert_eq!(sched.len(), 64);
     }
@@ -2471,18 +3190,36 @@ mod tests {
     fn beta_schedule_always_has_at_least_one_beta() {
         // Zero sweeps, or fewer sweeps than sweeps_per_beta, must not yield an
         // empty schedule — the kernel would have nothing to anneal against.
-        let (sched, _) =
-            build_beta_schedule(&graph(), 0, 1, Some((0.1, 10.0)), BetaSchedule::Geometric);
+        let (sched, _) = build_beta_schedule(
+            &graph(),
+            0,
+            1,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sched.len(), 1);
-        let (sched, _) =
-            build_beta_schedule(&graph(), 4, 64, Some((0.1, 10.0)), BetaSchedule::Geometric);
+        let (sched, _) = build_beta_schedule(
+            &graph(),
+            4,
+            64,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sched.len(), 1);
     }
 
     #[test]
     fn beta_schedule_runs_hot_to_cold() {
-        let (sched, _) =
-            build_beta_schedule(&graph(), 40, 10, Some((0.1, 10.0)), BetaSchedule::Geometric);
+        let (sched, _) = build_beta_schedule(
+            &graph(),
+            40,
+            10,
+            Some((0.1, 10.0)),
+            BetaSchedule::Geometric,
+            1.0,
+        );
         assert_eq!(sched.len(), 4);
         // Beta rises as temperature falls, so the schedule is increasing.
         for pair in sched.windows(2) {
@@ -2581,7 +3318,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8);
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         job_tx.try_send(job(2)).expect("queue a second job");
         drop(job_tx);
 
@@ -2604,7 +3341,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8);
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         let mut other = job(2);
         other.params.num_sweeps += 1;
         job_tx.try_send(other).expect("queue a mismatched job");
@@ -2630,7 +3367,7 @@ mod tests {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
         let seed = job(1);
-        let key = SessionKey::seed(&seed, 8);
+        let key = SessionKey::seed(&seed, 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         job_tx.try_send(job(2)).expect("queue a second job");
         job_tx.try_send(job(3)).expect("queue a third job");
 
@@ -2653,7 +3390,7 @@ mod tests {
     fn next_seed_carries_a_job_over_and_ends_on_a_closed_channel() {
         let (job_tx, mut job_rx) = channel::<StreamJob>(4);
         let (res_tx, _res_rx) = channel::<StreamResult>(4);
-        let key = SessionKey::seed(&job(1), 8);
+        let key = SessionKey::seed(&job(1), 8, KernelKind::Sa, 0, DEFAULT_MSA_LANE).unwrap();
         drop(job_tx);
         let cancel = CancelToken::default();
         let mut feed = Feed {

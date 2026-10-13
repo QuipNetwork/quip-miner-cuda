@@ -25,7 +25,7 @@ fn second_open_uses_cached_ptx() {
     let _cold_dev = CudaDevice::open(0).expect("first open");
     let cold = t0.elapsed();
 
-    // One PTX file per kernel (sa + msa + gibbs) must exist after the first open.
+    // One PTX file per kernel (sa + sa-wide + msa + gibbs) after the first open.
     let ptx: Vec<_> = std::fs::read_dir(&dir)
         .expect("cache dir")
         .filter_map(Result::ok)
@@ -33,8 +33,8 @@ fn second_open_uses_cached_ptx() {
         .collect();
     assert_eq!(
         ptx.len(),
-        3,
-        "expected sa + msa + gibbs cached PTX, got {ptx:?}"
+        4,
+        "expected sa + sa-wide + msa + gibbs cached PTX, got {ptx:?}"
     );
 
     // Warm open: same process, same dir — loads the cached PTX, no NVRTC.

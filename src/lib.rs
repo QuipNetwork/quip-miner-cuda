@@ -14,8 +14,10 @@
 //! its internal annealing accept/reject decisions. The coordinator session
 //! loop lives in `quip-solver-core`.
 
+pub mod accept_table;
 pub mod bench;
 pub mod capacity;
+pub mod coefficients;
 pub mod corpus;
 pub mod cuda_device;
 pub mod driver_budget;
@@ -38,6 +40,7 @@ use quip_solver_core::config::{config_override, warn_unknown_fields};
 use quip_solver_core::quip_proto::v1::Backend;
 use quip_solver_core::{
     BackendIdentity, CancelToken, ModelLimits, SampleError, Sampler, StreamJob, StreamResult,
+    EXACT_COEFFICIENTS_FEATURE,
 };
 use std::collections::BTreeMap;
 
@@ -88,11 +91,21 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: KernelKind::Sa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // A real `sample_stream` override and the NVML governor — the two
-        // capability names `BackendIdentity::features` documents.
-        features: &["streaming", "governor"],
+        // Streaming, the NVML governor, and exact coefficient uploads.
+        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
         adapt: CUDA_ADAPT,
-        limits: ModelLimits::UNSTATED,
+        // SA has no degree bound (`Some(0)` is unbounded).
+        limits: ModelLimits {
+            max_degree: Some(0),
+            // The wide path holds a local field up to WIDE_MAX_FIELD milli. Advertise
+            // one milli less because quip-solver-core 0.0.3's --solve conversion
+            // (encoding::float_milli) does not round: 536870.91 units does not multiply
+            // to a whole milli in f64, while 536870.909 does.
+            max_local_field_milli: Some(
+                u32::try_from(coefficients::WIDE_MAX_FIELD - 1).unwrap_or(u32::MAX),
+            ),
+            exact_resolution_milli: Some(1),
+        },
     }
 }
 
@@ -140,10 +153,19 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
         algorithm: KernelKind::Msa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Same capability set as `cuda_sa_identity`: streaming + governor.
-        features: &["streaming", "governor"],
+        // Same capability set as `cuda_sa_identity`.
+        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
         adapt: cuda_msa_adapt(max_reads),
-        limits: ModelLimits::UNSTATED,
+        // Unit models run the unit-weight kernel (by sign, 64 lanes per word).
+        // Other models run the weighted kernel at the model's own scale, up to a
+        // local field of 2^24 - 1 milli at scale 1, the worst case.
+        limits: ModelLimits {
+            max_degree: Some(u32::try_from(capacity::MSA_MAX_DEGREE).unwrap_or(u32::MAX)),
+            max_local_field_milli: Some(
+                u32::try_from(coefficients::MSA_WEIGHTED_MAX_FIELD).unwrap_or(u32::MAX),
+            ),
+            exact_resolution_milli: Some(1),
+        },
     }
 }
 
@@ -157,10 +179,16 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: KernelKind::Gibbs.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Same capability set as `cuda_sa_identity`: streaming + governor.
-        features: &["streaming", "governor"],
+        // Same capability set as `cuda_sa_identity`.
+        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
         adapt: CUDA_ADAPT,
-        limits: ModelLimits::UNSTATED,
+        // The int8 bound is per coefficient at the model's own scale, which no
+        // binary-wide field limit expresses: the binary refuses per job.
+        limits: ModelLimits {
+            max_degree: Some(0),
+            max_local_field_milli: None,
+            exact_resolution_milli: Some(1),
+        },
     }
 }
 
