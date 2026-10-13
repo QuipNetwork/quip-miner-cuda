@@ -1,4 +1,4 @@
-# quip-solver-cuda
+# `quip-solver-cuda`
 
 CUDA Ising miners for the [quip.network](https://gitlab.com/quip.network) v0.3
 mining protocol: simulated annealing (`quip-cuda-sa`), multi-spin coded
@@ -7,21 +7,22 @@ shipped as separate binaries. **amd64 only.**
 
 Each process binds one CUDA device (`--device N`) and drives it directly.
 The coordinator takes N from the `[cuda.N]` config section and passes it as
-`--device N`; the miner warns at startup when its `cuda-N` label and `--device`
+`--device N`. The miner warns at startup when its `cuda-N` label and `--device`
 disagree, and the label never overrides the flag.
 Kernels (`kernels/sa.cu`, `kernels/msa.cu`, `kernels/gibbs.cu`) are JIT-compiled via NVRTC at
-runtime through `cudarc`'s dynamic-loading feature, so **building this crate
-does not require the CUDA toolkit** — only a CUDA GPU and driver are needed to
-*run* the binaries.
+runtime through `cudarc`'s `dynamic-loading` feature. **Building this crate
+does not require the CUDA toolkit.** Running the binaries needs a CUDA GPU
+and driver.
 
-Supported GPUs: compute capability 7.0 (Volta) through 12.1 (consumer
-Blackwell). The floor comes from the kernels (`__nanosleep` is sm_70+); the
-ceiling from NVRTC 12.9 (`cuda-12090` in `Cargo.toml`). Kernels are compiled
-for each device's detected capability, clamped into that range; capabilities
-the toolkit lacks (for example 8.8) get the next lower architecture and load
-through the driver's forward-compatible PTX JIT. `SUPPORTED_ARCHS` in
+Supported GPUs have compute capability 7.0 (Volta) through 12.1 (consumer
+Blackwell). The floor comes from the kernels (`__nanosleep` is sm_70+).
+The ceiling comes from NVRTC 12.9 (`cuda-12090` in `Cargo.toml`).
+The miner compiles kernels for each device's detected capability, clamped into
+that range. A capability that the toolkit lacks, such as 8.8, gets the next
+lower architecture and loads through the driver's forward-compatible PTX JIT.
+`SUPPORTED_ARCHS` in
 `src/cuda_device.rs` is the contract and `tests/arch_coverage.rs` enforces it
-(`make test-archs`). Energies are scored with the canonical
+(`make test-archs`). The host scores energies with the canonical
 `quip_protocol::scoring::energy_milli` so results match consensus.
 `quip-cuda-msa` sizes its spin state against the opt-in shared memory per
 block. A device with at least 96 KB holds two replica words per spin and serves
@@ -36,8 +37,37 @@ declares the read count it can serve when it starts.
 | `quip-cuda-msa` | multi-spin coded simulated annealing, 64 reads per word |
 | `quip-cuda-gibbs` | heat-bath Gibbs |
 
-Prebuilt `amd64` binaries are attached to each
-[Release](https://gitlab.com/quip.network/quip-solver-cuda/-/releases).
+Each [release](https://gitlab.com/quip.network/quip-solver-cuda/-/releases)
+provides prebuilt `amd64` binaries.
+
+## Model limits
+
+All three binaries list `exact-coefficients` in `--capabilities`.
+They refuse any model that they cannot represent exactly, with a capacity error.
+The model scale is the greatest common divisor, or `GCD`, of its nonzero coefficients in milli units.
+At each spin, add `|h|` and all `|J|` on its edges.
+The local field bound is the largest of these sums.
+
+- **SA:** solves every whole-milli model up to a local field of 536,870,911 milli.
+  SA uses the int8 kernel when `max_i(|h_i| + sum_j |J_ij|) / GCD_step <= 63`.
+  This bound keeps the flip delta within int8 because `2 * field <= 127`.
+  Other models use the fixed-point wide kernel.
+  A complete graph with unit couplings and zero fields has field 63 at 64 nodes and uses int8.
+  At 65 nodes, its field is 64 and it uses wide.
+  Its accept decision uses integers only, so the same seed gives the same decision on every GPU.
+  The SA identity advertises 536,870,910 milli because `quip-solver-core` 0.0.3 `--solve` does not round coefficients (QUI-1813).
+  The wide kernel cannot accept a move whose Metropolis probability is below about 7.6e-6.
+- **Gibbs:** accepts models whose absolute coefficients are at most 127 times the model's GCD step.
+  Gibbs refuses models that need a wide path.
+- **MSA:** accepts models of degree at most 20.
+  Models with `h` in {-1, 0, 1} and `J` in {-1, 1} use the unit-weight kernel.
+  Other models use the weighted kernel at the model's GCD step.
+  Its local field bound is 16,777,215 times that step, or 16,777,215 milli at scale 1.
+  The default weighted lane is I32. F32 is also available.
+  See the [weighted lane measurements](docs/benchmarks/2026-10-msa-weighted-lanes.md).
+
+The unit mining paths pass the timing and energy checks against `main` at `8826ca3` on the RTX A4000.
+See the [base and branch comparison](docs/benchmarks/2026-10-exact-coefficients-corpus.md) for per-binary results and evidence.
 
 ## Build
 
@@ -45,11 +75,11 @@ Prebuilt `amd64` binaries are attached to each
 cargo build --release
 ```
 
-`cudarc` uses dynamic-loading, so the build links against no CUDA libraries;
-the CUDA driver is loaded and kernels are compiled at process start.
+`cudarc` uses `dynamic-loading`, so the build links against no CUDA libraries.
+The miner loads the CUDA driver and compiles kernels at process start.
 
-The solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) is
-published to crates.io from [quip.network/quip-solver-core](https://gitlab.com/quip.network/quip-solver-core).
+[quip.network/quip-solver-core](https://gitlab.com/quip.network/quip-solver-core)
+publishes the solver contract (`quip-proto`, `quip-protocol`, `quip-solver-core`) to crates.io.
 
 ## Running
 
@@ -61,7 +91,7 @@ Requires a CUDA-capable GPU and driver at runtime.
 quip-cuda-sa --quip-coordinator unix:///run/quip/coord.sock --device 0
 ```
 
-**Driver / fixed-input (run in isolation, no chain).** Use the coordinator's
+**Driver / fixed-input (run in isolation).** Use the coordinator's
 `drive` harness pointed at the binary — `--source random` for golden-drawn
 problems, `--source list <jsonl>` for a fixed replay:
 
@@ -85,20 +115,22 @@ in `quip-solver-cpu`'s `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer,
 *Optimised simulated annealing for Ising spin glasses*, Comput. Phys. Commun.
 192, 2015). 64 replicas share one 64-bit word per spin. A job of 128 reads is
 two words. The Metropolis test is an integer comparison against a per-rung
-threshold table. Spins update one colour class at a time, with the same greedy
-colouring the Gibbs kernel uses. One block anneals one problem in shared
+threshold table. Spins update one color class at a time, with the same greedy
+coloring the Gibbs kernel uses. One block anneals one problem in shared
 memory. The device computes no energies. The host rescores every sample with
 `energy_milli`, so results are consensus-scored like the other kernels.
 
-The kernel uses couplings and fields by sign. Consensus problems have `J` in
-{-1, 1} and `h` in {-1, 0, 1}, which it represents exactly. Other values
-degrade the anneal but never the scoring. A spin with more than 20 neighbours
-cannot run on this kernel. Such a job is rejected as `TooLarge`.
+The unit kernel uses couplings and fields by sign. Consensus problems have
+`J` in {-1, 1} and `h` in {-1, 0, 1}, which it represents exactly.
+Other supported whole-milli models use the weighted kernel at their own scale.
+The miner refuses any model that exceeds the coefficient or local field bounds.
+A spin with more than 20 neighbors cannot run on either MSA kernel.
+The miner rejects such a job as `TooLarge`.
 
-Node capacity comes from the device. The spin state is dynamic shared memory,
+Node capacity comes from the device. The spin state uses `dynamic shared memory`,
 so the ceiling is the opt-in shared memory per block less 8720 bytes, divided
 by 8 times the replica words. At two words that is 5791 spins on a 99 KB part
-and 5599 on Volta. `--max-nodes` above the ceiling is an error at open, never a
+and 5599 on Volta. `--max-nodes` greater than the ceiling is an error at open, never a
 silent clamp.
 
 Replica words fall back from two to one when the device cannot hold the
@@ -110,19 +142,19 @@ device holds.
 
 Two host-side changes came with it and apply to `quip-cuda-sa` too:
 
-* **Abort on cancel.** When the coordinator cancels a round, in-flight models
+* **Stop on cancel.** When the coordinator cancels a round, in-flight models
   stop at the next rung instead of running to completion. The new round
   starts within milliseconds rather than after a full batch.
-* **Parallel scoring.** Downloaded samples are rescored on `QUIP_SCORE_THREADS`
-  host threads (default 4). With one thread the sampler capped a fast kernel at
+* **Parallel scoring.** The host rescores downloaded samples on `QUIP_SCORE_THREADS`
+  threads (default 4). With one thread the sampler capped a fast kernel at
   about 20 jobs per second and left the GPU idle between batches.
 
-## Yielding to other GPU users
+## Sharing the graphics processor
 
 `--yielding` lets the miner share a GPU. The NVML governor measures the load
 from other processes and compares it against `--utilization`. It does not use
-device-wide utilization for this decision, because that figure counts the
-miner's own kernels. A busy miner holds device-wide utilization near 100
+device-wide `utilization` for this decision, because that figure counts the
+miner's own kernels. A busy miner holds device-wide `utilization` near 100
 percent, so a governor that read it would throttle against itself.
 
 When another process passes the ceiling, the miner ends its current session and
@@ -131,7 +163,7 @@ holds its SMs until teardown, so a pause inside a session yields nothing.
 
 Per-process attribution needs both NVML support and a process ID that matches.
 Inside a container, or on WSL2, the governor falls back to device-wide
-utilization and logs which method it uses. The fallback applies only while
+`utilization` and logs which method it uses. The fallback applies only while
 another process holds a context. A miner alone on a GPU never throttles.
 
 ## Session recovery
@@ -162,7 +194,7 @@ The stream driver can account for its own wall clock, one window at a time.
 Use it to find where driver time goes when throughput falls.
 
 Accounting is off by default. The table lists the environment variables.
-`QUIP_SCORE_THREADS` applies to every binary, with or without accounting.
+`QUIP_SCORE_THREADS` applies to every binary whether accounting is on or off.
 
 | Variable | Effect |
 | -- | -- |
@@ -189,7 +221,7 @@ driver measures.
 ### Soak test
 
 `tests/driver_budget_soak.rs` drives the streaming loop for a set duration. It
-records `att/s` next to board power, core clock, and temperature from NVML:
+records `att/s` alongside the NVML readings for board power, core clock, and temperature:
 
 ```sh
 QUIP_DRIVER_BUDGET=1 QUIP_DRIVER_BUDGET_WINDOW=300 \
@@ -218,8 +250,8 @@ correct result. Each skipped test prints a `SKIP` line.
 Conformance/golden and handshake tests drive the binary in isolation via
 `quip-solver-conformance`'s driver and check energies against its bundled
 golden vectors.
-Tests that need a live CUDA device are marked `#[ignore]`, so a machine without a
-GPU reports them as ignored rather than passed. Run them with `--include-ignored`
+Tests that need a live CUDA device carry `#[ignore]`, so a machine without a
+GPU reports them as ignored. Run them with `--include-ignored`
 on a CUDA host.
 
 ## License

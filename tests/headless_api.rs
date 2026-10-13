@@ -11,7 +11,7 @@ use quip_solver_cuda::capacity::{
     GIBBS_DEFAULT_NODES, MSA_DEFAULT_NODES, MSA_MAX_READS, MSA_REPLICA_WORDS, SA_DEFAULT_NODES,
 };
 use quip_solver_cuda::streaming::max_reads;
-use quip_solver_cuda::topology::{fill_h_j, SelfFeedingTopology};
+use quip_solver_cuda::topology::{fill_coefficients, SelfFeedingTopology};
 use quip_solver_cuda::{
     cuda_gibbs_identity, cuda_msa_identity, cuda_sa_identity, IsingGraph, KernelKind,
 };
@@ -83,20 +83,20 @@ fn msa_identity_declares_the_one_word_read_cap() {
     assert_eq!(turing.adapt.max_sweeps, full.adapt.max_sweeps);
 }
 
-/// Exercise `SelfFeedingTopology::build` + `fill_h_j` via the public API only.
+/// Exercise `SelfFeedingTopology::build` + `fill_coefficients` via the public API only.
 ///
-/// Topology struct fields may be `pub(crate)`; assertions use `fill_h_j` return
+/// Topology struct fields may be `pub(crate)`; assertions use `fill_coefficients` return
 /// values (and their lengths, which encode `n` / `nnz`) rather than field access.
 #[test]
-fn topology_build_and_fill_h_j_on_small_ring() {
-    // 4-node ring, consensus-range h/J (lossless int8 quantize).
+fn topology_build_and_fill_coefficients_on_small_ring() {
+    // 4-node ring, consensus-range h/J (exact int8 coefficients).
     let graph = IsingGraph::new(
         vec![1.0, -1.0, 0.0, 1.0],
         vec![1.0, -1.0, 1.0, -1.0],
         vec![(0, 1), (1, 2), (2, 3), (3, 0)],
     );
     let topo = SelfFeedingTopology::build(&graph);
-    let (j_csr, h_i8) = fill_h_j(&topo, &graph);
+    let (j_csr, h_i8) = fill_coefficients::<i8>(&topo, &graph, 1000).unwrap();
 
     assert_eq!(h_i8, vec![1i8, -1, 0, 1]);
     assert_eq!(h_i8.len(), 4, "h length tracks node count");
@@ -105,7 +105,7 @@ fn topology_build_and_fill_h_j_on_small_ring() {
     assert_eq!(
         j_csr.iter().filter(|&&v| v != 0).count(),
         8,
-        "every directed half carries a quantized J"
+        "every directed half carries an exact J"
     );
     // Multiset of |J| values: each undirected edge contributes two ±1 entries.
     let positives = j_csr.iter().filter(|&&v| v == 1).count();
