@@ -23,6 +23,15 @@ fn ring(n: usize) -> IsingGraph {
     IsingGraph::new(h, j, edges)
 }
 
+/// `n` nodes, each coupled with J = +1 to the next `k` around the ring. Every
+/// local field is `2k`, so `k` up to 31 stays on SA's int8 path.
+fn circulant(n: usize, k: usize) -> IsingGraph {
+    let edges: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| (1..=k).map(move |d| (i, (i + d) % n)))
+        .collect();
+    IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges)
+}
+
 #[test]
 #[ignore = "requires a CUDA device"]
 #[serial]
@@ -79,19 +88,37 @@ fn bench_one_upload_and_download_are_true_transfer_time_not_host_enqueue() {
     // `synchronize()`, so they measure real device transfer time, not the
     // near-instant host enqueue of `memcpy_htod`/`clone_dtoh`. A larger graph
     // should therefore show a larger (not merely nonzero) transfer time.
+    //
+    // A 16-node and a 2048-node ring both upload a few KB at most, so their
+    // gap sat inside per-copy latency and failed under a busy shared runner.
+    // The large graph uploads about 250 KB of J instead, and each side keeps
+    // its fastest run: contention only adds time, so the minimum is the one
+    // closest to the true transfer cost.
+    const RUNS: usize = 5;
     let small = ring(16);
-    let large = ring(2048);
+    let large = circulant(4096, 31);
     let params = SampleParams {
         num_reads: 8,
         num_sweeps: 256,
         sweeps_per_beta: 4,
         ..SampleParams::default()
     };
-    let (_, t_small) = bench_one(device(), &small, &params, KernelKind::Sa, None).unwrap();
-    let (_, t_large) = bench_one(device(), &large, &params, KernelKind::Sa, None).unwrap();
-    assert!(t_small.upload_ns > 0);
-    assert!(t_large.upload_ns > 0);
-    assert!(t_large.upload_ns >= t_small.upload_ns);
+    let fastest_upload = |graph: &IsingGraph| {
+        (0..RUNS)
+            .map(|_| {
+                let (_, t) = bench_one(device(), graph, &params, KernelKind::Sa, None).unwrap();
+                assert!(t.upload_ns > 0);
+                t.upload_ns
+            })
+            .min()
+            .unwrap()
+    };
+    let small_ns = fastest_upload(&small);
+    let large_ns = fastest_upload(&large);
+    assert!(
+        large_ns > small_ns,
+        "fastest upload: {large_ns} ns for the large graph, {small_ns} ns for the small one"
+    );
 }
 
 #[test]
