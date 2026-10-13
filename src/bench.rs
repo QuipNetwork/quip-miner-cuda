@@ -39,12 +39,13 @@
 //! ```
 
 use crate::corpus;
-use crate::cuda_device::CudaDevice;
+use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
-use crate::schema::{BenchRecord, Part, Scope, Source};
-use crate::streaming::{bench_one, DeviceTimings};
+use crate::schema::{BenchRecord, Metric, Part, Scope, Source};
+use crate::streaming::{bench_one, bench_plan, DeviceTimings};
 use crate::{IsingGraph, KernelKind, SampleParams};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
+use quip_protocol::chacha8::ChaCha8Rng;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write as _;
@@ -70,9 +71,37 @@ pub enum BenchAction {
     Fold(FoldArgs),
 }
 
+/// MSA path selected for an isolated benchmark.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsaPath {
+    /// Plan normally, using the default lane for weighted jobs.
+    Auto,
+    /// Force the weighted integer lane, including for unit models.
+    WeightedI32,
+    /// Force the weighted floating-point lane, including for unit models.
+    WeightedF32,
+}
+
+impl MsaPath {
+    fn lane(self) -> Option<MsaLane> {
+        match self {
+            Self::Auto => None,
+            Self::WeightedI32 => Some(MsaLane::I32),
+            Self::WeightedF32 => Some(MsaLane::F32),
+        }
+    }
+}
+
 /// Arguments for `bench run`.
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
+    /// MSA path (default: auto). Accepted only by the MSA kernel.
+    #[arg(long, value_enum)]
+    pub msa_path: Option<MsaPath>,
+    /// Maximum integer weight. 1 preserves the graph; larger values redraw
+    /// fields in -K..=K and coupling magnitudes in 1..=K, preserving signs.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    pub weights: u32,
     /// Reads per model, at most the kernel's cap (256 for sa and gibbs, 128 for msa).
     #[arg(long, default_value_t = 8)]
     pub reads: u64,
@@ -84,7 +113,7 @@ pub struct RunArgs {
     /// Sweeps per beta rung.
     #[arg(long, default_value_t = 4)]
     pub sweeps_per_beta: u64,
-    /// Node count of the synthetic ring problem (`h=0`, `j=1`, ring edges).
+    /// Node count of the synthetic ring (zero fields and unit couplings by default).
     /// Ignored when `--source` is given (the real corpus topology's node
     /// count is used instead). Useful on its own for micro checks.
     #[arg(long, default_value_t = 64)]
@@ -115,7 +144,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub flame: Option<PathBuf>,
     /// Metadata passthrough for `BenchRecord.nonce` (synthetic problems have
-    /// no real nonce).
+    /// no real nonce). A 64-hex value also seeds `--weights`.
     #[arg(long)]
     pub nonce: Option<String>,
     /// Metadata passthrough for `BenchRecord.topology_hash`.
@@ -338,8 +367,13 @@ impl BenchModel {
 /// Build the bench grid's models: a `--source` corpus (redrawn per nonce
 /// against `--topology`) when given, else the single synthetic ring problem.
 fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
+    if args.weights == 0 {
+        return Err(BenchError::Args("--weights must be at least 1".into()));
+    }
     let Some(source) = &args.source else {
-        return Ok(vec![BenchModel::synthetic(args)]);
+        let mut model = BenchModel::synthetic(args);
+        reweight_model(&mut model, args.weights);
+        return Ok(vec![model]);
     };
     // clap's `requires` makes this infallible from the CLI, but stay
     // defensive against direct `RunArgs` construction (e.g. from tests).
@@ -353,12 +387,59 @@ fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
         .map_err(|e| BenchError::Corpus(e.to_string()))?;
     Ok(records
         .into_iter()
-        .map(|(record, graph)| BenchModel {
-            graph,
-            nonce: record.nonce,
-            topology_hash: record.topology_hash,
+        .map(|(record, graph)| {
+            let mut model = BenchModel {
+                graph,
+                nonce: record.nonce,
+                topology_hash: record.topology_hash,
+            };
+            reweight_model(&mut model, args.weights);
+            model
         })
         .collect())
+}
+
+/// Use the corpus nonce as the `ChaCha8` seed, or the default all-zero seed
+/// for a synthetic model without a 64-hex nonce. Draw fields before couplings,
+/// using the protocol draw's word-modulo-range convention.
+fn reweight_model(model: &mut BenchModel, weights: u32) {
+    if weights == 1 {
+        return;
+    }
+    let bytes: Option<Vec<u8>> = model
+        .nonce
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
+            u8::try_from(high * 16 + low).ok()
+        })
+        .collect();
+    let seed = bytes
+        .filter(|_| model.nonce.len() == 64)
+        .and_then(|bytes| bytes.try_into().ok())
+        .unwrap_or([0; 32]);
+    let mut rng = ChaCha8Rng::from_seed(seed);
+    let field_range = 2 * u64::from(weights) + 1;
+    for h in &mut model.graph.h {
+        let mut word = u64::from(rng.next_u32());
+        if field_range > u64::from(u32::MAX) {
+            word |= u64::from(rng.next_u32()) << 32;
+        }
+        // The draw is at most 2*u32::MAX, which is exact in f64.
+        #[allow(clippy::cast_precision_loss)]
+        let draw = (word % field_range) as f64;
+        *h = draw - f64::from(weights);
+    }
+    for j in &mut model.graph.j {
+        let magnitude = f64::from(rng.next_u32() % weights + 1);
+        *j = if *j == 0.0 {
+            0.0
+        } else {
+            j.signum() * magnitude
+        };
+    }
 }
 
 fn backend_name(kernel: KernelKind) -> &'static str {
@@ -367,6 +448,17 @@ fn backend_name(kernel: KernelKind) -> &'static str {
         KernelKind::Msa => "cuda-msa",
         KernelKind::Gibbs => "cuda-gibbs",
     }
+}
+
+fn best_energy_metric(reads: &[crate::SamplerResult]) -> Option<Metric> {
+    let best = reads.iter().map(|read| read.energy_milli).min()?;
+    #[allow(clippy::cast_precision_loss)] // benchmark energies stay well below 2^53 milli units
+    Some(Metric::new(
+        "best_energy",
+        best as f64 / 1000.0,
+        "energy",
+        Source::CounterDerived,
+    ))
 }
 
 /// Per-span open timestamp, stashed in the span's extensions.
@@ -472,6 +564,11 @@ fn run_run(
     max_nodes: usize,
     args: &RunArgs,
 ) -> Result<(), BenchError> {
+    if args.msa_path.is_some() && kernel != KernelKind::Msa {
+        return Err(BenchError::Args(
+            "--msa-path requires the MSA kernel".into(),
+        ));
+    }
     std::fs::create_dir_all(&args.out).map_err(|e| BenchError::Io(e.to_string()))?;
     let sweeps: Vec<u64> = if args.sweeps.is_empty() {
         vec![1024]
@@ -570,11 +667,15 @@ fn run_model(
         sweeps_per_beta: usize::try_from(args.sweeps_per_beta).unwrap_or(1),
         ..SampleParams::default()
     };
+    let msa_lane = args.msa_path.and_then(MsaPath::lane);
+    let plan = bench_plan(ctx.device, graph, ctx.kernel, msa_lane)
+        .map_err(|e| BenchError::Device(e.to_string()))?;
     let (beta, sweeps_per_beta) = crate::streaming::build_beta_schedule(
         graph,
         params.num_sweeps,
         params.sweeps_per_beta,
         params.beta_range,
+        plan.beta_factor(),
     );
     let cfg = CellConfig {
         reads: args.reads,
@@ -588,7 +689,7 @@ fn run_model(
     for i in 0..(args.warmup + args.repeats) {
         take_cell(&ctx.totals); // clear stale totals before the measured call
         let model_start = Instant::now();
-        let (_reads, dev) = bench_one(ctx.device, graph, &params, ctx.kernel)
+        let (reads, dev) = bench_one(ctx.device, graph, &params, ctx.kernel, msa_lane)
             .map_err(|e| BenchError::Device(e.to_string()))?;
         let model_total_ns = u64::try_from(model_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let spans = take_cell(&ctx.totals);
@@ -601,7 +702,7 @@ fn run_model(
             energy_score_ns: spans.get("energy_score").copied().unwrap_or(0),
             jit_ns: jit_ns.take(),
         };
-        let record = assemble_record(
+        let mut record = assemble_record(
             ctx.backend,
             &ctx.device_name,
             &model.nonce,
@@ -611,6 +712,7 @@ fn run_model(
             &host,
             model_total_ns,
         );
+        record.metrics.extend(best_energy_metric(&reads));
         let line = serde_json::to_string(&record).map_err(|e| BenchError::Io(e.to_string()))?;
         writeln!(file, "{line}").map_err(|e| BenchError::Io(e.to_string()))?;
     }
@@ -692,6 +794,207 @@ mod tests {
     use std::sync::Arc;
     use tracing::info_span;
     use tracing_subscriber::prelude::*;
+
+    #[derive(clap::Parser, Debug)]
+    struct RunCli {
+        #[command(flatten)]
+        args: super::RunArgs,
+    }
+
+    #[test]
+    fn weights_one_preserves_synthetic_graph() {
+        use clap::Parser as _;
+        let args = RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "1"])
+            .unwrap()
+            .args;
+        let models = super::load_models(&args).unwrap();
+        let original = super::ring_graph(args.nodes);
+        assert_eq!(models[0].graph.h, original.h);
+        assert_eq!(models[0].graph.j, original.j);
+        assert_eq!(models[0].graph.edges, original.edges);
+    }
+
+    #[test]
+    fn weights_are_bounded_and_deterministic_per_nonce() {
+        use clap::Parser as _;
+        let args = RunCli::try_parse_from([
+            "bench",
+            "--out",
+            "unused",
+            "--weights",
+            "5",
+            "--nonce",
+            "b4179357b751254ed0e68b5e969dcb50e73fd8c56be192b79d286ff2722d6a72",
+        ])
+        .unwrap()
+        .args;
+        let first = super::load_models(&args).unwrap().remove(0).graph;
+        let second = super::load_models(&args).unwrap().remove(0).graph;
+        assert_eq!(first.h, second.h);
+        assert_eq!(first.j, second.j);
+        assert_eq!(first.edges, second.edges);
+        assert!(first
+            .h
+            .iter()
+            .all(|h| (-5.0..=5.0).contains(h) && h.fract() == 0.0));
+        assert!(first
+            .j
+            .iter()
+            .all(|j| (1.0..=5.0).contains(j) && j.fract() == 0.0));
+        assert!(first.h.iter().any(|h| *h != 0.0));
+        assert!(first.j.iter().any(|j| *j > 1.0));
+        let mut other = args;
+        other.nonce = Some("00".repeat(32));
+        let other = super::load_models(&other).unwrap().remove(0).graph;
+        assert_ne!(first.h, other.h);
+    }
+
+    #[test]
+    fn weights_cli_defaults_and_rejects_zero() {
+        use clap::Parser as _;
+        assert!(RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "0"]).is_err());
+        let default = RunCli::try_parse_from(["bench", "--out", "unused"])
+            .unwrap()
+            .args;
+        let explicit = RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "1"])
+            .unwrap()
+            .args;
+        assert_eq!(default.weights, 1);
+        let mut invalid = default.clone();
+        invalid.weights = 0;
+        assert!(matches!(
+            super::load_models(&invalid),
+            Err(super::BenchError::Args(_))
+        ));
+        assert_eq!(
+            super::load_models(&default).unwrap()[0].graph.h,
+            super::load_models(&explicit).unwrap()[0].graph.h
+        );
+    }
+
+    #[test]
+    fn weights_large_range_draws_fields_of_both_signs() {
+        use clap::Parser as _;
+        let args = RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "4294967295"])
+            .unwrap()
+            .args;
+        let graph = super::load_models(&args).unwrap().remove(0).graph;
+        assert!(graph.h.iter().any(|h| *h > 0.0));
+        assert!(graph.h.iter().any(|h| *h < 0.0));
+        assert!(graph.h.iter().all(|h| h.abs() <= f64::from(u32::MAX)));
+    }
+
+    #[test]
+    fn weights_preserve_corpus_signs_and_identity() {
+        use clap::Parser as _;
+        let dir = std::env::temp_dir().join(format!("bench-weights-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let topology = dir.join("topology.json");
+        let source = dir.join("corpus.jsonl");
+        std::fs::write(&topology, r#"{"nodes":[0,1,2,3],"edges":[[0,1],[1,2],[2,3],[0,3]],"allowed_h_milli":[-1000,0,1000],"allowed_j_milli":[-1000,1000]}"#).unwrap();
+        std::fs::write(
+            &source,
+            "{\"nonce\":\"b4179357b751254ed0e68b5e969dcb50e73fd8c56be192b79d286ff2722d6a72\"}\n",
+        )
+        .unwrap();
+        let mut args = RunCli::try_parse_from([
+            "bench",
+            "--out",
+            "unused",
+            "--source",
+            source.to_str().unwrap(),
+            "--topology",
+            topology.to_str().unwrap(),
+            "--weights",
+            "1",
+        ])
+        .unwrap()
+        .args;
+        let original = super::load_models(&args).unwrap().remove(0);
+        assert_eq!(original.graph.h, vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(original.graph.j, vec![1.0, -1.0, -1.0, 1.0]);
+        args.weights = 5;
+        let weighted = super::load_models(&args).unwrap().remove(0);
+        assert_eq!(weighted.graph.edges, original.graph.edges);
+        assert_eq!(weighted.nonce, original.nonce);
+        assert_eq!(weighted.topology_hash, original.topology_hash);
+        for (&j, &original_j) in weighted.graph.j.iter().zip(&original.graph.j) {
+            assert_eq!(j.is_sign_positive(), original_j.is_sign_positive());
+            assert!((1.0..=5.0).contains(&j.abs()));
+        }
+        assert!(weighted.graph.h.iter().all(|h| (-5.0..=5.0).contains(h)));
+        let repeated = super::load_models(&args).unwrap().remove(0);
+        assert_eq!(weighted.graph.h, repeated.graph.h);
+        assert_eq!(weighted.graph.j, repeated.graph.j);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn best_energy_metric_uses_lowest_read_in_energy_units() {
+        let reads: Vec<_> = [2000, -3500, -1000]
+            .into_iter()
+            .map(|energy_milli| crate::SamplerResult {
+                spins: vec![1],
+                energy_milli,
+            })
+            .collect();
+        let metric = super::best_energy_metric(&reads).unwrap();
+        assert_eq!(metric.name, "best_energy");
+        assert_eq!(metric.value.to_bits(), (-3.5_f64).to_bits());
+        assert_eq!(metric.unit, "energy");
+        assert_eq!(metric.source, crate::schema::Source::CounterDerived);
+        assert!(super::best_energy_metric(&[]).is_none());
+    }
+
+    #[test]
+    fn msa_path_cli_parses_all_lanes() {
+        use clap::Parser as _;
+        for path in ["auto", "weighted-i32", "weighted-f32"] {
+            let parsed = RunCli::try_parse_from(["bench", "--out", "unused", "--msa-path", path]);
+            assert!(parsed.is_ok(), "{path}: {parsed:?}");
+            let selected = parsed.unwrap().args.msa_path.unwrap();
+            let expected = match path {
+                "weighted-i32" => Some(crate::cuda_device::MsaLane::I32),
+                "weighted-f32" => Some(crate::cuda_device::MsaLane::F32),
+                _ => None,
+            };
+            assert_eq!(selected.lane(), expected);
+        }
+        assert!(
+            RunCli::try_parse_from(["bench", "--out", "unused", "--msa-path", "invalid"]).is_err()
+        );
+        assert_eq!(
+            RunCli::try_parse_from(["bench", "--out", "unused"])
+                .unwrap()
+                .args
+                .msa_path,
+            None
+        );
+    }
+
+    #[test]
+    fn msa_path_flag_rejected_for_other_kernels() {
+        use clap::Parser as _;
+        for path in ["auto", "weighted-i32", "weighted-f32"] {
+            let args = RunCli::try_parse_from(["bench", "--out", "unused", "--msa-path", path])
+                .unwrap()
+                .args;
+            for kernel in [KernelKind::Sa, KernelKind::Gibbs] {
+                let err = super::run_bench(
+                    usize::MAX,
+                    kernel,
+                    0,
+                    &super::BenchAction::Run(args.clone()),
+                )
+                .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("--msa-path requires the MSA kernel"),
+                    "{err}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn assemble_record_maps_timings_to_contract_parts() {

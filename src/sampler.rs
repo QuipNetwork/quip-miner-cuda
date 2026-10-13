@@ -2,11 +2,12 @@
 //!
 //! `sample_ising` drives the self-feeding kernel (see [`crate::streaming`])
 //! through a dedicated one-nonce session: same kernels, same host-side
-//! quantization/coloring as the streaming path, just without the 3-slot
+//! coefficient uploads/coloring as the streaming path, just without the 3-slot
 //! rotation across multiple concurrent models. Energies are always scored
 //! host-side with [`quip_protocol::scoring::energy_milli`] for consensus;
-//! the kernel's own (int8-quantized) energy tracking only drives its
-//! internal accept/reject decisions during annealing.
+//! coefficients upload exactly at the coefficient plan's scale. The kernel's
+//! energy tracking drives its internal accept/reject decisions during annealing.
+//! A job that no path holds exactly is refused as [`SampleError::Unsupported`].
 
 use crate::cuda_device::CudaDevice;
 use crate::kernel::KernelKind;
@@ -114,8 +115,8 @@ impl From<SampleError> for quip_solver_core::SampleError {
 ///
 /// - [`SampleError::GraphTooLarge`] if `graph` has more nodes than the chosen
 ///   kernel's fixed-size state supports. Permanent — retrying cannot help.
-/// - [`SampleError::Unsupported`] if the msa kernel cannot run this topology
-///   (a spin with more than 20 neighbours). Permanent.
+/// - [`SampleError::Unsupported`] if no path holds the coefficients exactly,
+///   or the msa topology has a spin with more than 20 neighbours. Permanent.
 /// - [`SampleError::KernelTimeout`] if the persistent kernel never marks the
 ///   slot complete before the driver's deadline.
 /// - [`SampleError::Cuda`] if opening the device or compiling its kernels failed.
