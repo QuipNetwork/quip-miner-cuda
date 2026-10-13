@@ -40,11 +40,21 @@ use quip_solver_core::config::{config_override, warn_unknown_fields};
 use quip_solver_core::quip_proto::v1::Backend;
 use quip_solver_core::{
     BackendIdentity, CancelToken, ModelLimits, SampleError, Sampler, StreamJob, StreamResult,
-    EXACT_COEFFICIENTS_FEATURE,
+    EXACT_COEFFICIENTS_FEATURE, LINEAR_SCHEDULE_FEATURE,
 };
 use std::collections::BTreeMap;
 
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
+
+/// Features every kernel advertises: a real `sample_stream` override, the NVML
+/// governor, exact coefficient uploads, and a host-built ladder that honours
+/// `SampleParams::schedule`.
+const FEATURES: &[&str] = &[
+    "streaming",
+    "governor",
+    EXACT_COEFFICIENTS_FEATURE,
+    LINEAR_SCHEDULE_FEATURE,
+];
 
 /// CUDA backend config, parsed from the verbatim `config.toml` subsection in
 /// `Configure.backend_toml`. Unrecognized keys land in `unknown`;
@@ -91,8 +101,7 @@ pub fn cuda_sa_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: KernelKind::Sa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Streaming, the NVML governor, and exact coefficient uploads.
-        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
+        features: FEATURES,
         adapt: CUDA_ADAPT,
         // SA has no degree bound (`Some(0)` is unbounded).
         limits: ModelLimits {
@@ -153,8 +162,7 @@ pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
         algorithm: KernelKind::Msa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Same capability set as `cuda_sa_identity`.
-        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
+        features: FEATURES,
         adapt: cuda_msa_adapt(max_reads),
         // Unit models run the unit-weight kernel (by sign, 64 lanes per word).
         // Other models run the weighted kernel at the model's own scale, up to a
@@ -179,8 +187,7 @@ pub fn cuda_gibbs_identity(max_nodes: usize) -> BackendIdentity {
         algorithm: KernelKind::Gibbs.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
         max_edges: DEFAULT_MAX_EDGES,
-        // Same capability set as `cuda_sa_identity`.
-        features: &["streaming", "governor", EXACT_COEFFICIENTS_FEATURE],
+        features: FEATURES,
         adapt: CUDA_ADAPT,
         // The int8 bound is per coefficient at the model's own scale, which no
         // binary-wide field limit expresses: the binary refuses per job.
