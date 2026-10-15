@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "quip-solver-cuda"
-version = "0.3.4"
+version = "0.3.5-rc1"
 dependencies = [
  "clap",
  "cudarc",
