@@ -13,55 +13,110 @@
 //! [`reference_energy`] are the protocol-side references used by
 //! `tests/screen_gpu.rs` to check the device.
 
-use crate::cuda_device::{select_arch, CudaDevice};
+use crate::cuda_device::{compile_for_arch, device_arch, driver_version, CudaDevice, CudaError};
+use crate::jit_cache;
 use crate::stream_pool::SessionStreams;
 use crate::streaming::build_beta_schedule;
 use crate::topology::SelfFeedingTopology;
 use crate::IsingGraph;
 use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
-use quip_solver_core::BetaSchedule;
+use quip_solver_core::{BetaSchedule, TopologyView};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const SCREEN_SRC: &str = include_str!("../kernels/screen.cu");
 /// Largest node degree the kernel handles (`SCR_MAX_DEG`).
 pub const MAX_DEGREE: usize = 20;
 const ROW: usize = 8192;
 const CUT_ENTRIES: usize = 64;
+const STATIC_SHARED_BYTES: usize = 128;
 
-/// Why a screen could not be built or run.
+/// A reason to use ordinary MSA instead of the sign-only screen.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum NotScreenable {
+    /// The screen requires exactly one allowed field, zero.
+    #[error("screen fields must be [0]")]
+    Fields,
+    /// The screen requires both unit couplings, in either order.
+    #[error("screen couplings must be [-1000, 1000] or [1000, -1000]")]
+    Couplings,
+    /// Packed node indices reserve 0xffff as a sentinel.
+    #[error("screen node count {0} must be below 65535")]
+    NodeCount(usize),
+    /// Packed edge indices reserve 0xffff as a sentinel.
+    #[error("screen edge count {0} must be below 65535")]
+    EdgeCount(usize),
+    /// An endpoint is outside the topology or an edge is a self-loop.
+    #[error("screen edge ({u}, {v}) is invalid")]
+    Edge {
+        /// First dense endpoint.
+        u: usize,
+        /// Second dense endpoint.
+        v: usize,
+    },
+    /// The padded adjacency row cannot hold this node's incident edges.
+    #[error("screen node {node} has more than 20 incident edges")]
+    Degree {
+        /// Dense node index.
+        node: usize,
+    },
+    /// Dynamic and static shared memory together exceed the opt-in limit.
+    #[error("screen needs {need} B shared memory per block; device allows {have} B")]
+    SharedMemory {
+        /// Total bytes required.
+        need: usize,
+        /// Device opt-in limit.
+        have: usize,
+    },
+    /// Probe dimensions cannot be represented by the kernel.
+    #[error("screen requires reads_log2 2..=5, positive i32 sweeps, and 32..=1024 threads in multiples of 32")]
+    Shape,
+    /// The device could not report its opt-in shared-memory limit.
+    #[error("screen device budget unavailable: {0}")]
+    Device(String),
+}
+
+/// Failures while opening or running a screen, separate from lease reporting.
 #[derive(Debug, thiserror::Error)]
 pub enum ScreenError {
-    /// The topology or its allowed values are outside what the kernel handles.
-    #[error("unsupported topology: {0}")]
-    Topology(String),
-    /// A launch parameter is out of range.
-    #[error("bad parameter: {0}")]
+    /// The caller should fall back to ordinary MSA.
+    #[error(transparent)]
+    NotScreenable(#[from] NotScreenable),
+    /// A debug argument is outside the single-group layout.
+    #[error("bad screen parameter: {0}")]
     Param(String),
-    /// The device cannot hold one group's shared memory.
-    #[error("screen needs {need} B of shared memory per block; device {device} allows {have} B")]
-    SharedMemory {
-        /// Bytes one block needs.
-        need: usize,
-        /// Opt-in bytes per block the device allows.
-        have: usize,
-        /// CUDA device index.
-        device: usize,
-    },
-    /// NVRTC failed to compile the kernel.
-    #[error("NVRTC: {0}")]
-    Compile(String),
+    /// Kernel compilation or module loading failed.
+    #[error(transparent)]
+    Cuda(#[from] CudaError),
     /// A CUDA driver call failed.
     #[error("CUDA driver: {0}")]
     Driver(#[from] cudarc::driver::DriverError),
 }
 
-/// A topology packed for the screen kernel: one padded neighbour row per node
-/// (neighbour and edge index per entry), colour classes, and the endpoints of
-/// every edge.
-pub struct ScreenTopology {
-    n: usize,
+/// Probe budget and block shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenParams {
+    /// Reads per nonce = `1 << reads_log2`, with exponent 2..=5.
+    pub reads_log2: u32,
+    /// Sweeps per probe.
+    pub sweeps: usize,
+    /// Threads per block, a multiple of 32 in 32..=1024.
+    pub threads: u32,
+}
+
+impl Default for ScreenParams {
+    fn default() -> Self {
+        Self {
+            reads_log2: 2,
+            sweeps: 512,
+            threads: 256,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScreenTopology {
     edges: Vec<(usize, usize)>,
     /// `n * MAX_DEGREE` entries `neighbour << 16 | edge`, `u32::MAX` = none.
     adj: Vec<u32>,
@@ -72,140 +127,129 @@ pub struct ScreenTopology {
     edge_u: Vec<i32>,
     edge_v: Vec<i32>,
     neg_bit: i32,
-    /// Unit couplings on this graph. The default beta range depends on |J|
-    /// only, so every instance of the topology shares it.
     unit_graph: IsingGraph,
 }
 
-impl ScreenTopology {
-    /// Pack `edges` over `n` nodes (dense ids, the draw order of the chain's
-    /// topology) with the allowed field and coupling values.
+/// Validated topology, probe parameters, and dynamic shared-memory requirement.
+/// Produced only by [`ScreenDomain::check`].
+#[derive(Debug)]
+pub struct ScreenShape {
+    topo: ScreenTopology,
+    params: ScreenParams,
+    shared: usize,
+}
+
+/// Admission to the screen's exact sign-only domain.
+pub struct ScreenDomain;
+
+impl ScreenDomain {
+    /// Check the topology, probe parameters, and this device's opt-in budget.
+    /// `TopologyView` has dense positions. Its protocol constructor rejects
+    /// duplicate node identifiers before constructing the view.
     ///
     /// # Errors
-    /// [`ScreenError::Topology`] unless every field is 0, the couplings are one
-    /// negative and one positive value, no node exceeds [`MAX_DEGREE`], and
-    /// every edge is inside `0..n` with no self-loops, with fewer than 65,535
-    /// nodes and edges (the packed rows hold 16-bit ids).
-    pub fn new(
-        n: usize,
-        edges: Vec<(usize, usize)>,
-        fields_milli: &[i32],
-        couplings_milli: &[i32],
-    ) -> Result<Self, ScreenError> {
-        if fields_milli != [0] {
-            return Err(ScreenError::Topology(format!(
-                "fields must be {{0}}, got {fields_milli:?}"
-            )));
+    /// Returns the fallback reason without turning it into a wire error.
+    pub fn check(
+        device: &CudaDevice,
+        topology: &TopologyView,
+        params: ScreenParams,
+    ) -> Result<ScreenShape, NotScreenable> {
+        Self::check_with_budget(topology, params, shared_budget(device)?)
+    }
+
+    fn check_with_budget(
+        topology: &TopologyView,
+        params: ScreenParams,
+        budget: usize,
+    ) -> Result<ScreenShape, NotScreenable> {
+        if !(2..=5).contains(&params.reads_log2)
+            || params.sweeps == 0
+            || i32::try_from(params.sweeps).is_err()
+            || params.threads == 0
+            || params.threads > 1024
+            || !params.threads.is_multiple_of(32)
+        {
+            return Err(NotScreenable::Shape);
         }
-        let neg_bit = match couplings_milli {
-            [a, b] if *a < 0 && *b > 0 => 0,
-            [a, b] if *a > 0 && *b < 0 => 1,
-            _ => {
-                return Err(ScreenError::Topology(format!(
-                    "couplings must be one negative and one positive value, got {couplings_milli:?}"
-                )))
-            }
+        if topology.allowed_h_milli != [0] {
+            return Err(NotScreenable::Fields);
+        }
+        let neg_bit = match topology.allowed_j_milli.as_slice() {
+            [-1000, 1000] => 0,
+            [1000, -1000] => 1,
+            _ => return Err(NotScreenable::Couplings),
         };
-        if let Some(&(u, v)) = edges.iter().find(|&&(u, v)| u >= n || v >= n || u == v) {
-            return Err(ScreenError::Topology(format!(
-                "edge ({u}, {v}) with {n} nodes"
-            )));
+        let n = topology.num_nodes;
+        let edges = &topology.edges;
+        if n >= 0xffff {
+            return Err(NotScreenable::NodeCount(n));
         }
-        let to_i32 = |v: usize| {
-            i32::try_from(v).map_err(|_| ScreenError::Topology(format!("{v} does not fit i32")))
-        };
-        if n >= 0xffff || edges.len() >= 0xffff {
-            return Err(ScreenError::Topology(format!(
-                "{n} nodes and {} edges; the packed rows hold 16-bit ids",
-                edges.len()
-            )));
+        if edges.len() >= 0xffff {
+            return Err(NotScreenable::EdgeCount(edges.len()));
         }
-        let unit_graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges.clone());
-        let topo = SelfFeedingTopology::build(&unit_graph);
+        let shared = CUT_ENTRIES * 8 + n * 4 + edges.len().div_ceil(16) * 16 + ROW;
+        check_shared(shared, budget)?;
         let mut adj = vec![u32::MAX; n * MAX_DEGREE];
         let mut degree = vec![0usize; n];
         for (k, &(u, v)) in edges.iter().enumerate() {
+            if u >= n || v >= n || u == v {
+                return Err(NotScreenable::Edge { u, v });
+            }
             for (a, b) in [(u, v), (v, u)] {
                 if degree[a] == MAX_DEGREE {
-                    return Err(ScreenError::Topology(format!(
-                        "node {a} has more than {MAX_DEGREE} neighbours"
-                    )));
+                    return Err(NotScreenable::Degree { node: a });
                 }
-                // Both ids are below 0xffff (checked above), so the casts are exact.
-                let entry = (u32::try_from(b).unwrap_or(u32::MAX) << 16)
-                    | u32::try_from(k).unwrap_or(u32::MAX);
+                // Counts were checked below 0xffff before packing either id.
+                let entry = (u32::try_from(b).unwrap() << 16) | u32::try_from(k).unwrap();
                 adj[a * MAX_DEGREE + degree[a]] = entry;
                 degree[a] += 1;
             }
         }
-        let edge_u = edges
-            .iter()
-            .map(|&(u, _)| to_i32(u))
-            .collect::<Result<_, _>>()?;
-        let edge_v = edges
-            .iter()
-            .map(|&(_, v)| to_i32(v))
-            .collect::<Result<_, _>>()?;
-        Ok(Self {
-            n,
-            adj,
-            color_starts: topo.colors.starts,
-            color_counts: topo.colors.counts,
-            color_nodes: topo.colors.nodes,
-            num_colors: topo.colors.num_colors,
-            edges,
-            edge_u,
-            edge_v,
-            neg_bit,
-            unit_graph,
+        let unit_graph = IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges.clone());
+        let topo = SelfFeedingTopology::build(&unit_graph);
+        Ok(ScreenShape {
+            topo: ScreenTopology {
+                edges: edges.clone(),
+                adj,
+                color_starts: topo.colors.starts,
+                color_counts: topo.colors.counts,
+                color_nodes: topo.colors.nodes,
+                num_colors: topo.colors.num_colors,
+                edge_u: edges
+                    .iter()
+                    .map(|&(u, _)| i32::try_from(u).unwrap())
+                    .collect(),
+                edge_v: edges
+                    .iter()
+                    .map(|&(_, v)| i32::try_from(v).unwrap())
+                    .collect(),
+                neg_bit,
+                unit_graph,
+            },
+            params,
+            shared,
         })
     }
+}
 
-    /// Node count.
-    #[must_use]
-    pub fn nodes(&self) -> usize {
-        self.n
-    }
+fn shared_budget(device: &CudaDevice) -> Result<usize, NotScreenable> {
+    device
+        .ctx
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+        .map_err(|e| NotScreenable::Device(e.to_string()))
+        .and_then(|v| usize::try_from(v).map_err(|e| NotScreenable::Device(e.to_string())))
+}
 
-    /// Edges in draw order.
-    #[must_use]
-    pub fn edges(&self) -> &[(usize, usize)] {
-        &self.edges
-    }
-
-    /// Shared memory one group needs, in bytes.
-    #[must_use]
-    pub fn shared_bytes(&self) -> usize {
-        CUT_ENTRIES * 8 + self.n * 4 + self.edges.len().div_ceil(16) * 16 + ROW
+fn check_shared(dynamic: usize, have: usize) -> Result<(), NotScreenable> {
+    let need = dynamic + STATIC_SHARED_BYTES;
+    if need > have {
+        Err(NotScreenable::SharedMemory { need, have })
+    } else {
+        Ok(())
     }
 }
 
-/// Probe budget and launch shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScreenParams {
-    /// Reads per nonce = `1 << reads_log2`, 2..=5 (4 to 32 reads; a group of
-    /// 32 lanes then holds 8 down to 1 nonces).
-    pub reads_log2: u32,
-    /// Sweeps per probe.
-    pub sweeps: usize,
-    /// Groups per launch = streaming multiprocessors x `waves`.
-    pub waves: usize,
-    /// Threads per block (a multiple of 32, at most 1024).
-    pub threads: u32,
-}
-
-impl Default for ScreenParams {
-    fn default() -> Self {
-        Self {
-            reads_log2: 2,
-            sweeps: 512,
-            waves: 16,
-            threads: 256,
-        }
-    }
-}
-
-/// One loaded probe screen: a compiled kernel and device-resident topology.
+/// One loaded screen using its device's context and a leased stream pair.
 pub struct Screen<'a> {
     stream: Arc<CudaStream>,
     func: CudaFunction,
@@ -216,96 +260,84 @@ pub struct Screen<'a> {
     d_edge_u: CudaSlice<i32>,
     d_edge_v: CudaSlice<i32>,
     d_cut: CudaSlice<u64>,
-    d_keys: CudaSlice<u32>,
-    d_out: CudaSlice<i32>,
     num_colors: i32,
     num_betas: i32,
     sweeps_per_beta: i32,
     neg_bit: i32,
     n: i32,
     nnz: i32,
-    groups: u32,
+    max_groups: usize,
     shared: u32,
     params: ScreenParams,
     // Return the pair only after all device buffers have queued their frees.
     _streams: SessionStreams<'a>,
 }
 
-/// Device output of one launch.
+/// A complete run, or the completed prefix when the stop callback fired.
+#[derive(Debug, PartialEq, Eq)]
 pub struct ScreenRun {
-    /// Best energy (energy units) per input nonce, in input order.
-    pub best: Vec<i32>,
-    /// Energy of every lane of group 0 (lane L is read L / npg of nonce L % npg).
-    pub group0_lanes: Vec<i32>,
-    /// With `debug`: group 0's lane masks per edge and final spin words.
-    pub group0_debug: Option<(Vec<u32>, Vec<u32>)>,
+    /// Exact milli energy per completed input nonce, in input order.
+    pub best: Vec<i64>,
+    /// True when a stop prevented the next batch from starting.
+    pub stopped: bool,
+}
+
+/// Single-group diagnostics for the protocol and threshold regression tests.
+#[doc(hidden)]
+pub struct ScreenDebug {
+    /// Exact minima, excluding padded nonce slots.
+    pub best: Vec<i64>,
+    /// Final unit energy per lane.
+    pub lanes: Vec<i32>,
+    /// Drawn coupling sign masks per edge.
+    pub masks: Vec<u32>,
+    /// Final spin words per node.
+    pub state: Vec<u32>,
+    /// First beta's 64 thresholds copied from shared memory.
+    pub cut: Vec<u64>,
 }
 
 impl<'a> Screen<'a> {
-    /// Compile on an open device and upload the topology and schedule.
-    /// Uses a pair from the device stream pool for the lifetime of the screen.
+    /// Load through the JIT cache and upload a validated topology and schedule.
+    /// The stream pool drains the pair before returning it, including on error.
     ///
     /// # Errors
-    /// Bad parameters, a device without enough shared memory per block, or a
-    /// compile or driver failure.
-    pub fn open(
-        device: &'a CudaDevice,
-        topo: &ScreenTopology,
-        params: ScreenParams,
-    ) -> Result<Self, ScreenError> {
-        if !(2..=5).contains(&params.reads_log2) {
-            return Err(ScreenError::Param("reads_log2 must be 2..=5".into()));
+    /// A different device may refuse the shape's shared memory. Compilation,
+    /// module loading, allocation, and driver failures are returned separately.
+    pub fn open(device: &'a CudaDevice, shape: ScreenShape) -> Result<Self, ScreenError> {
+        let ScreenShape {
+            topo,
+            params,
+            shared: need,
+        } = shape;
+        // A shape can be passed to another device after admission.
+        check_shared(need, shared_budget(device)?)?;
+        let sel = device_arch(&device.ctx);
+        let arch = format!("sm_{sel}");
+        let threads = format!("-DSCR_THREADS={}", params.threads);
+        let defines = [threads.as_str()];
+        let module = jit_cache::load_or_compile(
+            &device.ctx,
+            "screen",
+            SCREEN_SRC,
+            &defines,
+            &arch,
+            driver_version()?,
+            topo.unit_graph.h.len(),
+            || compile_for_arch(SCREEN_SRC, topo.unit_graph.h.len(), sel, &defines),
+        )?;
+        let func = module.load_function("quip_screen_probe")?;
+        let static_shared = usize::try_from(func.shared_size_bytes()?)
+            .map_err(|e| ScreenError::Param(e.to_string()))?;
+        if static_shared > STATIC_SHARED_BYTES {
+            return Err(ScreenError::Param(format!(
+                "screen static shared memory {static_shared} exceeds {STATIC_SHARED_BYTES}"
+            )));
         }
-        if params.threads == 0 || params.threads > 1024 || !params.threads.is_multiple_of(32) {
-            return Err(ScreenError::Param(
-                "threads must be a multiple of 32, at most 1024".into(),
-            ));
-        }
-        if params.sweeps == 0 || params.waves == 0 {
-            return Err(ScreenError::Param(
-                "sweeps and waves must be positive".into(),
-            ));
-        }
-        let ctx = &device.ctx;
-        let cc = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?
-            * 10
-            + ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
-        let sms = usize::try_from(
-            ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
-        )
-        .unwrap_or(1)
-        .max(1);
-        let have = usize::try_from(ctx.attribute(
-            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-        )?)
-        .unwrap_or(0);
-        let need = topo.shared_bytes();
-        // The kernel's static `lane_count[32]` shares the same budget.
-        if need + 128 > have {
-            return Err(ScreenError::SharedMemory {
-                need,
-                have,
-                device: device.device_index,
-            });
-        }
-        let opts = CompileOptions {
-            use_fast_math: Some(true),
-            options: vec![
-                format!("--gpu-architecture=compute_{}", select_arch(cc)),
-                format!("-DSCR_THREADS={}", params.threads),
-            ],
-            ..Default::default()
-        };
-        let ptx = compile_ptx_with_opts(SCREEN_SRC, opts)
-            .map_err(|e| ScreenError::Compile(e.to_string()))?;
-        let func = ctx.load_module(ptx)?.load_function("quip_screen_probe")?;
-        let shared =
-            u32::try_from(need).map_err(|_| ScreenError::Param("shared memory size".into()))?;
         func.set_attribute(
             CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            i32::try_from(need).map_err(|_| ScreenError::Param("shared memory size".into()))?,
+            i32::try_from(need).map_err(|e| ScreenError::Param(e.to_string()))?,
         )?;
-
         let (schedule, sweeps_per_beta) = build_beta_schedule(
             &topo.unit_graph,
             params.sweeps,
@@ -315,14 +347,6 @@ impl<'a> Screen<'a> {
             1.0,
         );
         let cut = cut_table(&schedule);
-        let groups = sms
-            .checked_mul(params.waves)
-            .and_then(|g| u32::try_from(g).ok())
-            .ok_or_else(|| ScreenError::Param("too many groups".into()))?;
-        let npg = 32usize >> params.reads_log2;
-        let to_i32 = |v: usize, what: &str| {
-            i32::try_from(v).map_err(|_| ScreenError::Param(format!("{what} does not fit i32")))
-        };
         let streams = device.stream_pool.take();
         let stream = Arc::clone(&streams.compute);
         Ok(Self {
@@ -333,16 +357,17 @@ impl<'a> Screen<'a> {
             d_edge_u: stream.clone_htod(&topo.edge_u)?,
             d_edge_v: stream.clone_htod(&topo.edge_v)?,
             d_cut: stream.clone_htod(&cut)?,
-            d_keys: stream.alloc_zeros::<u32>(groups as usize * npg * 8)?,
-            d_out: stream.alloc_zeros::<i32>(groups as usize * 32)?,
             num_colors: topo.num_colors,
-            num_betas: to_i32(schedule.len(), "beta count")?,
-            sweeps_per_beta: to_i32(sweeps_per_beta, "sweeps per beta")?,
+            num_betas: i32::try_from(schedule.len())
+                .map_err(|e| ScreenError::Param(e.to_string()))?,
+            sweeps_per_beta: i32::try_from(sweeps_per_beta)
+                .map_err(|e| ScreenError::Param(e.to_string()))?,
             neg_bit: topo.neg_bit,
-            n: to_i32(topo.n, "node count")?,
-            nnz: to_i32(topo.edges.len(), "edge count")?,
-            groups,
-            shared,
+            n: i32::try_from(topo.unit_graph.h.len())
+                .map_err(|e| ScreenError::Param(e.to_string()))?,
+            nnz: i32::try_from(topo.edges.len()).map_err(|e| ScreenError::Param(e.to_string()))?,
+            max_groups: device.max_sms.max(1),
+            shared: u32::try_from(need).map_err(|e| ScreenError::Param(e.to_string()))?,
             params,
             stream,
             func,
@@ -356,58 +381,105 @@ impl<'a> Screen<'a> {
         self.params
     }
 
-    /// Nonces screened per launch.
-    #[must_use]
-    pub fn batch(&self) -> usize {
-        self.groups as usize * (32 >> self.params.reads_log2)
-    }
-
-    /// Screen up to [`Screen::batch`] nonces. Unused slots run on zero keys and
-    /// are ignored.
+    /// Screen arbitrary input lengths, checking `stop` before every launch.
+    /// The first launch is one group. Later launches target 50 ms using twice
+    /// the slowest observed wall time per group, capped at one group per SM.
+    /// One group is the minimum cancellation granularity for this probe shape.
     ///
     /// # Errors
-    /// [`ScreenError::Param`] when `nonces` exceeds the batch, or a driver
-    /// failure.
+    /// Returns allocation or driver failures. Stops are successful partial runs.
     pub fn run(
-        &mut self,
+        &self,
+        nonces: &[[u8; 32]],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<ScreenRun, ScreenError> {
+        let mut best = Vec::new();
+        let mut budget = LaunchBudget::new(self.max_groups);
+        let npg = 32usize >> self.params.reads_log2;
+        while best.len() < nonces.len() {
+            if stop() {
+                return Ok(ScreenRun {
+                    best,
+                    stopped: true,
+                });
+            }
+            let end = nonces.len().min(best.len() + budget.groups() * npg);
+            let batch = &nonces[best.len()..end];
+            let start = Instant::now();
+            let (lanes, _) = self.launch(batch, 7, false)?;
+            budget.observe(batch.len().div_ceil(npg), start.elapsed());
+            best.extend(best_milli(&lanes, batch.len(), self.params.reads_log2));
+        }
+        Ok(ScreenRun {
+            best,
+            stopped: false,
+        })
+    }
+
+    /// Run one group and return its state for protocol verification.
+    ///
+    /// # Errors
+    /// Refuses empty inputs or more than one group's nonces, and returns driver failures.
+    #[doc(hidden)]
+    pub fn run_debug(&self, nonces: &[[u8; 32]], seed: u32) -> Result<ScreenDebug, ScreenError> {
+        if nonces.is_empty() || nonces.len() > (32 >> self.params.reads_log2) {
+            return Err(ScreenError::Param(
+                "debug requires one nonempty group".into(),
+            ));
+        }
+        let (lanes, debug) = self.launch(nonces, seed, true)?;
+        let (masks, state, cut) = debug.unwrap();
+        Ok(ScreenDebug {
+            best: best_milli(&lanes, nonces.len(), self.params.reads_log2),
+            lanes,
+            masks,
+            state,
+            cut,
+        })
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "the optional tuple holds the kernel's three debug buffers in argument order"
+    )]
+    fn launch(
+        &self,
         nonces: &[[u8; 32]],
         seed: u32,
         debug: bool,
-    ) -> Result<ScreenRun, ScreenError> {
-        let batch = self.batch();
-        if nonces.len() > batch {
-            return Err(ScreenError::Param(format!(
-                "{} nonces for a batch of {batch}",
-                nonces.len()
-            )));
-        }
-        let mut keys = vec![0u32; batch * 8];
+    ) -> Result<(Vec<i32>, Option<(Vec<u32>, Vec<u32>, Vec<u64>)>), ScreenError> {
+        let npg = 32usize >> self.params.reads_log2;
+        let groups = nonces.len().div_ceil(npg);
+        let mut keys = vec![0u32; groups * npg * 8];
         for (slot, nonce) in keys.chunks_exact_mut(8).zip(nonces) {
             for (word, bytes) in slot.iter_mut().zip(nonce.chunks_exact(4)) {
                 *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             }
         }
-        self.stream.memcpy_htod(keys.as_slice(), &mut self.d_keys)?;
-        let nnz = usize::try_from(self.nnz).unwrap_or(0);
-        let n = usize::try_from(self.n).unwrap_or(0);
+        // Per-launch buffers keep run(&self) independent of mutable session state.
+        let d_keys = self.stream.clone_htod(&keys)?;
+        let mut d_out = self.stream.alloc_zeros::<i32>(groups * 32)?;
         let mut dbg = if debug {
             Some((
-                self.stream.alloc_zeros::<u32>(nnz)?,
-                self.stream.alloc_zeros::<u32>(n)?,
+                self.stream
+                    .alloc_zeros::<u32>(usize::try_from(self.nnz).unwrap())?,
+                self.stream
+                    .alloc_zeros::<u32>(usize::try_from(self.n).unwrap())?,
+                self.stream.alloc_zeros::<u64>(CUT_ENTRIES)?,
             ))
         } else {
             None
         };
         let null: u64 = 0;
-        let reads_log2 = i32::try_from(self.params.reads_log2).unwrap_or(2);
+        let reads_log2 = i32::try_from(self.params.reads_log2).unwrap();
         let cfg = LaunchConfig {
-            grid_dim: (self.groups, 1, 1),
+            grid_dim: (u32::try_from(groups).unwrap(), 1, 1),
             block_dim: (self.params.threads, 1, 1),
             shared_mem_bytes: self.shared,
         };
         {
             let mut b = self.stream.launch_builder(&self.func);
-            b.arg(&self.d_keys)
+            b.arg(&d_keys)
                 .arg(&reads_log2)
                 .arg(&self.neg_bit)
                 .arg(&self.n)
@@ -423,47 +495,75 @@ impl<'a> Screen<'a> {
                 .arg(&self.num_betas)
                 .arg(&self.sweeps_per_beta)
                 .arg(&seed)
-                .arg(&mut self.d_out);
+                .arg(&mut d_out);
             match dbg.as_mut() {
-                Some((mask, state)) => b.arg(mask).arg(state),
-                None => b.arg(&null).arg(&null),
+                Some((mask, state, cut)) => b.arg(mask).arg(state).arg(cut),
+                None => b.arg(&null).arg(&null).arg(&null),
             };
-            // SAFETY: the argument list matches `quip_screen_probe` in
-            // kernels/screen.cu in order and type: device slices for every
-            // pointer (a 0 u64 for the optional debug pointers, which the
-            // kernel checks), i32/u32 scalars for the rest. Every buffer is
-            // sized from this screen's own `groups`, `npg`, `n` and `nnz`,
-            // which the kernel indexes within, and all of them outlive the
-            // launch because `clone_dtoh` below synchronizes the stream first.
+            // SAFETY: argument types and order match quip_screen_probe. Buffers
+            // cover every launched group, node, edge, and threshold, including
+            // padded nonce slots. Optional debug pointers are checked by the
+            // kernel. Synchronous readback keeps all buffers alive until completion.
             unsafe { b.launch(cfg) }?;
         }
-        let lanes: Vec<i32> = self.stream.clone_dtoh(&self.d_out)?;
-        let npg = 32usize >> self.params.reads_log2;
-        let best = (0..nonces.len())
-            .map(|i| {
-                let base = (i / npg) * 32;
-                lanes[base..base + 32]
-                    .iter()
-                    .skip(i % npg)
-                    .step_by(npg)
-                    .copied()
-                    .min()
-                    .unwrap_or(i32::MAX)
-            })
-            .collect();
-        let group0_debug = match dbg {
-            Some((mask, state)) => Some((
+        let lanes = self.stream.clone_dtoh(&d_out)?;
+        let debug = match dbg {
+            Some((mask, state, cut)) => Some((
                 self.stream.clone_dtoh(&mask)?,
                 self.stream.clone_dtoh(&state)?,
+                self.stream.clone_dtoh(&cut)?,
             )),
             None => None,
         };
-        Ok(ScreenRun {
-            best,
-            group0_lanes: lanes[..32].to_vec(),
-            group0_debug,
-        })
+        Ok((lanes, debug))
     }
+}
+
+struct LaunchBudget {
+    max_groups: usize,
+    nanos_per_group: u128,
+}
+
+impl LaunchBudget {
+    fn new(max_groups: usize) -> Self {
+        Self {
+            max_groups,
+            nanos_per_group: 0,
+        }
+    }
+
+    fn groups(&self) -> usize {
+        if self.nanos_per_group == 0 {
+            return 1;
+        }
+        let groups = 50_000_000 / self.nanos_per_group / 2;
+        usize::try_from(groups)
+            .unwrap_or(self.max_groups)
+            .clamp(1, self.max_groups)
+    }
+
+    fn observe(&mut self, groups: usize, elapsed: Duration) {
+        self.nanos_per_group = self
+            .nanos_per_group
+            .max(elapsed.as_nanos().div_ceil(groups as u128).max(1));
+    }
+}
+
+fn best_milli(lanes: &[i32], count: usize, reads_log2: u32) -> Vec<i64> {
+    let npg = 32usize >> reads_log2;
+    (0..count)
+        .map(|i| {
+            let base = (i / npg) * 32;
+            let best = lanes[base..base + 32]
+                .iter()
+                .skip(i % npg)
+                .step_by(npg)
+                .copied()
+                .min()
+                .unwrap();
+            i64::from(best) * 1000
+        })
+        .collect()
 }
 
 /// Metropolis thresholds per rung, the arithmetic of the msa kernel's table:
@@ -490,16 +590,14 @@ fn cut_table(schedule: &[f32]) -> Vec<u64> {
     cut
 }
 
-/// The protocol's own draw for group 0 of a launch, as lane masks per edge:
-/// bit L is set when nonce `L % npg` has a negative coupling on that edge.
+/// Protocol coupling signs for the first group, in original edge order.
 ///
 /// # Errors
-/// [`ScreenError::Topology`] if the protocol draw rejects the allowed values.
+/// Returns a protocol draw error for invalid allowed tables.
 pub fn reference_masks(
     nonces: &[[u8; 32]],
     reads_log2: u32,
-    topo: &ScreenTopology,
-    allowed_j_milli: &[i32],
+    topo: &TopologyView,
 ) -> Result<Vec<u32>, ScreenError> {
     let npg = 32usize >> reads_log2;
     let mut masks = vec![0u32; topo.edges.len()];
@@ -507,14 +605,9 @@ pub fn reference_masks(
         let Some(nonce) = nonces.get(lane % npg) else {
             continue;
         };
-        let (_, j) = quip_protocol::chacha8::draw_ising_milli(
-            *nonce,
-            topo.n,
-            topo.edges.len(),
-            &[0],
-            allowed_j_milli,
-        )
-        .map_err(|e| ScreenError::Topology(e.to_string()))?;
+        let (_, j) = topo
+            .draw(*nonce)
+            .map_err(|e| ScreenError::Param(e.to_string()))?;
         for (mask, &v) in masks.iter_mut().zip(&j) {
             if v < 0 {
                 *mask |= 1 << lane;
@@ -524,90 +617,229 @@ pub fn reference_masks(
     Ok(masks)
 }
 
-/// Energy (units) of lane `lane`'s spins under `nonce`'s instance, through the
-/// protocol's scoring function. Bit set = spin -1, as in the other kernels.
+/// Exact protocol milli energy of one debug lane's final spins.
 ///
 /// # Errors
-/// [`ScreenError::Topology`] if the protocol draw rejects the allowed values.
+/// Returns a protocol draw error for invalid allowed tables.
 pub fn reference_energy(
     nonce: [u8; 32],
     state: &[u32],
     lane: usize,
-    topo: &ScreenTopology,
-    allowed_j_milli: &[i32],
+    topo: &TopologyView,
 ) -> Result<i64, ScreenError> {
-    let (h, j) = quip_protocol::chacha8::draw_ising_milli(
-        nonce,
-        topo.n,
-        topo.edges.len(),
-        &[0],
-        allowed_j_milli,
-    )
-    .map_err(|e| ScreenError::Topology(e.to_string()))?;
+    let (h, j) = topo
+        .draw(nonce)
+        .map_err(|e| ScreenError::Param(e.to_string()))?;
     let spins: Vec<i8> = state
         .iter()
         .map(|w| if (w >> lane) & 1 == 1 { -1 } else { 1 })
         .collect();
     let h: Vec<f64> = h.iter().map(|&v| f64::from(v) / 1000.0).collect();
     let j: Vec<f64> = j.iter().map(|&v| f64::from(v) / 1000.0).collect();
-    Ok(quip_protocol::scoring::energy_milli(&spins, &h, &j, &topo.edges) / 1000)
+    Ok(quip_protocol::scoring::energy_milli(
+        &spins,
+        &h,
+        &j,
+        &topo.edges,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ring(n: usize) -> Vec<(usize, usize)> {
-        (0..n).map(|i| (i, (i + 1) % n)).collect()
+    fn ring(n: usize) -> TopologyView {
+        TopologyView {
+            num_nodes: n,
+            edges: (0..n).map(|i| (i, (i + 1) % n)).collect(),
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![-1000, 1000],
+        }
+    }
+
+    fn check(topology: &TopologyView) -> Result<ScreenShape, NotScreenable> {
+        ScreenDomain::check_with_budget(topology, ScreenParams::default(), usize::MAX)
     }
 
     #[test]
-    fn every_row_entry_points_back_to_its_edge() {
-        let topo = ScreenTopology::new(6, ring(6), &[0], &[-1000, 1000]).unwrap();
+    fn every_row_entry_points_back_to_its_original_edge() {
+        let mut view = ring(6);
+        view.edges.rotate_left(3);
+        let shape = check(&view).unwrap();
+        assert_eq!(shape.topo.edges, view.edges);
         for v in 0..6 {
-            let row = &topo.adj[v * MAX_DEGREE..(v + 1) * MAX_DEGREE];
+            let row = &shape.topo.adj[v * MAX_DEGREE..(v + 1) * MAX_DEGREE];
             let used: Vec<u32> = row.iter().copied().filter(|&e| e != u32::MAX).collect();
-            assert_eq!(used.len(), 2, "ring node {v} has two neighbours");
+            assert_eq!(used.len(), 2);
             for e in used {
                 let (nb, k) = ((e >> 16) as usize, (e & 0xffff) as usize);
-                let (a, b) = topo.edges[k];
-                assert!(
-                    (a, b) == (v, nb) || (a, b) == (nb, v),
-                    "entry {e:#x} of node {v}"
-                );
+                let (a, b) = view.edges[k];
+                assert!((a, b) == (v, nb) || (a, b) == (nb, v));
             }
         }
     }
 
     #[test]
-    fn coupling_order_sets_the_negative_bit() {
-        assert_eq!(
-            ScreenTopology::new(4, ring(4), &[0], &[-1000, 1000])
-                .unwrap()
-                .neg_bit,
-            0
-        );
-        assert_eq!(
-            ScreenTopology::new(4, ring(4), &[0], &[1000, -1000])
-                .unwrap()
-                .neg_bit,
-            1
-        );
+    fn both_unit_coupling_orders_are_screenable() {
+        for (couplings, neg_bit) in [([-1000, 1000], 0), ([1000, -1000], 1)] {
+            let mut view = ring(4);
+            view.allowed_j_milli = couplings.to_vec();
+            assert_eq!(check(&view).unwrap().topo.neg_bit, neg_bit);
+        }
     }
 
     #[test]
-    fn unsupported_values_and_graphs_are_refused() {
-        assert!(ScreenTopology::new(4, ring(4), &[-1000, 0, 1000], &[-1000, 1000]).is_err());
-        assert!(ScreenTopology::new(4, ring(4), &[0], &[-1000, 0, 1000]).is_err());
-        assert!(ScreenTopology::new(4, vec![(0, 4)], &[0], &[-1000, 1000]).is_err());
-        let star: Vec<(usize, usize)> = (1..=MAX_DEGREE + 1).map(|v| (0, v)).collect();
-        assert!(ScreenTopology::new(MAX_DEGREE + 2, star, &[0], &[-1000, 1000]).is_err());
+    fn non_unit_couplings_are_not_screenable() {
+        for couplings in [
+            vec![-2000, 2000],
+            vec![-1000, 2000],
+            vec![-1000, 0, 1000],
+            vec![],
+            vec![1000, 1000],
+        ] {
+            let mut view = ring(4);
+            view.allowed_j_milli = couplings;
+            assert!(matches!(check(&view), Err(NotScreenable::Couplings)));
+        }
     }
 
     #[test]
-    fn shared_budget_matches_the_kernel_layout() {
-        let topo = ScreenTopology::new(6, ring(6), &[0], &[-1000, 1000]).unwrap();
-        assert_eq!(topo.shared_bytes(), 64 * 8 + 6 * 4 + 16 + 8192);
+    fn only_a_single_zero_field_is_screenable() {
+        for fields in [vec![1], vec![-1000, 0, 1000], vec![], vec![0, 0]] {
+            let mut view = ring(4);
+            view.allowed_h_milli = fields;
+            assert!(matches!(check(&view), Err(NotScreenable::Fields)));
+        }
+    }
+
+    #[test]
+    fn packed_counts_must_be_below_65535() {
+        let mut view = ring(4);
+        view.num_nodes = 65535;
+        assert!(matches!(check(&view), Err(NotScreenable::NodeCount(65535))));
+        view.num_nodes = 65534;
+        assert!(check(&view).is_ok());
+        view.edges = vec![(0, 1); 65535];
+        assert!(matches!(check(&view), Err(NotScreenable::EdgeCount(65535))));
+        // A 65,534-edge ring has degree two, so the edge boundary fits.
+        view.edges = (0..65534).map(|i| (i, (i + 1) % 65534)).collect();
+        assert!(check(&view).is_ok());
+    }
+
+    #[test]
+    fn invalid_endpoints_and_self_loops_are_not_screenable() {
+        for edge in [(0, 4), (4, 0), (2, 2)] {
+            let mut view = ring(4);
+            view.edges = vec![edge];
+            assert!(matches!(check(&view), Err(NotScreenable::Edge { .. })));
+        }
+    }
+
+    #[test]
+    fn degree_twenty_fits_but_twenty_one_does_not() {
+        let mut view = ring(22);
+        view.edges = (1..=20).map(|v| (0, v)).collect();
+        assert!(check(&view).is_ok());
+        view.edges.push((0, 21));
+        assert!(matches!(
+            check(&view),
+            Err(NotScreenable::Degree { node: 0 })
+        ));
+    }
+
+    #[test]
+    fn shared_budget_includes_padding_and_static_memory() {
+        let view = ring(6);
+        // 512 cut + 24 state + 16 padded signs + 8192 row + 128 lane counts.
+        let need = 8872;
+        let params = ScreenParams::default();
+        assert!(ScreenDomain::check_with_budget(&view, params, need).is_ok());
+        assert!(matches!(
+            ScreenDomain::check_with_budget(&view, params, need - 1),
+            Err(NotScreenable::SharedMemory {
+                need: 8872,
+                have: 8871
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_probe_shapes_are_not_screenable() {
+        let params = ScreenParams::default();
+        for shape in [
+            ScreenParams {
+                reads_log2: 1,
+                ..params
+            },
+            ScreenParams {
+                reads_log2: 6,
+                ..params
+            },
+            ScreenParams {
+                sweeps: 0,
+                ..params
+            },
+            ScreenParams {
+                sweeps: usize::MAX,
+                ..params
+            },
+            ScreenParams {
+                threads: 0,
+                ..params
+            },
+            ScreenParams {
+                threads: 33,
+                ..params
+            },
+            ScreenParams {
+                threads: 1056,
+                ..params
+            },
+        ] {
+            assert!(matches!(
+                ScreenDomain::check_with_budget(&ring(4), shape, usize::MAX),
+                Err(NotScreenable::Shape)
+            ));
+        }
+    }
+
+    #[test]
+    fn milli_minima_use_nonce_lane_layout_and_exclude_padding() {
+        for reads_log2 in 2..=5 {
+            let npg = 32usize >> reads_log2;
+            let mut lanes = vec![100; 64];
+            for nonce in 0..=npg {
+                let base = (nonce / npg) * 32;
+                lanes[base + nonce % npg + npg] = -i32::try_from(nonce + 1).unwrap();
+            }
+            // A padded nonce has a deeper result than any real input.
+            if npg > 1 {
+                lanes[33] = i32::MIN;
+            }
+            let got = best_milli(&lanes, npg + 1, reads_log2);
+            let want: Vec<i64> = (1..=npg + 1)
+                .map(|i| -i64::try_from(i).unwrap() * 1000)
+                .collect();
+            assert_eq!(got, want);
+        }
+        assert_eq!(best_milli(&[i32::MIN; 32], 1, 5), vec![-2_147_483_648_000]);
+        assert!(best_milli(&[0; 32], 0, 2).is_empty());
+    }
+
+    #[test]
+    fn launch_budget_starts_small_and_reduces_after_slow_work() {
+        let mut budget = LaunchBudget::new(80);
+        assert_eq!(budget.groups(), 1);
+        budget.observe(1, std::time::Duration::from_millis(1));
+        assert_eq!(budget.groups(), 25);
+        budget.observe(5, std::time::Duration::from_millis(250));
+        assert_eq!(budget.groups(), 1);
+        // Keep the slowest observed cost even after a faster batch.
+        budget.observe(1, std::time::Duration::from_micros(1));
+        assert_eq!(budget.groups(), 1);
+        let mut budget = LaunchBudget::new(2);
+        budget.observe(1, std::time::Duration::from_micros(1));
+        assert_eq!(budget.groups(), 2);
     }
 
     #[test]

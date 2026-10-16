@@ -20,7 +20,7 @@
 // the nonce, the first n_nodes words spent on h (always 0 on the supported
 // topologies), then one word per edge, J negative when (word & 1) == neg_bit.
 // The host checks this bit-for-bit against the protocol draw
-// (`quip-screen verify`).
+// (`tests/screen_gpu.rs`).
 //
 // The Metropolis step is msa.cu's (Isakov et al. 2015): with c the coupling
 // sign bit and b the spin bit, l = c ^ b_i ^ b_j marks a satisfied bond; the
@@ -30,7 +30,7 @@
 // class at a time. There is no field term (h = 0 is a host precondition).
 //
 // Energy per lane is computed on the device: E = nnz - 2 * (satisfied bonds),
-// in energy units. `quip-screen verify` checks it against energy_milli.
+// in energy units. `tests/screen_gpu.rs` checks it against energy_milli.
 //
 // Shared memory per block: 64 u64 thresholds + n u32 spin words + nnz bytes of
 // coupling signs (padded to 16) + SCR_ROW threshold row. 68.5 KB at 4,577 nodes
@@ -144,7 +144,8 @@ __global__ void __launch_bounds__(SCR_THREADS) quip_screen_probe(
     unsigned int base_seed,
     int* __restrict__ out_energy,          // [groups * 32] energy units per lane
     u32* __restrict__ dbg_mask,            // group 0 lane masks [nnz], or null
-    u32* __restrict__ dbg_state            // group 0 spin words [n_nodes], or null
+    u32* __restrict__ dbg_state,           // group 0 spin words [n_nodes], or null
+    u64* __restrict__ dbg_cut              // group 0's first threshold table [64], or null
 ) {
     extern __shared__ u64 scr_smem[];
     u64* cut = scr_smem;
@@ -198,8 +199,13 @@ __global__ void __launch_bounds__(SCR_THREADS) quip_screen_probe(
     __syncthreads();
 
     for (int beta_idx = 0; beta_idx < num_betas; ++beta_idx) {
-        if (tid <= SCR_MAX_FIELD) cut[tid] = __ldg(&cut_table[(size_t)beta_idx * (SCR_MAX_FIELD + 1) + tid]);
+        for (int i = tid; i <= SCR_MAX_FIELD; i += blockDim.x) {
+            cut[i] = __ldg(&cut_table[(size_t)beta_idx * (SCR_MAX_FIELD + 1) + i]);
+        }
         __syncthreads();
+        if (group == 0 && beta_idx == 0 && dbg_cut) {
+            for (int i = tid; i <= SCR_MAX_FIELD; i += blockDim.x) dbg_cut[i] = cut[i];
+        }
         for (int i = tid; i < SCR_ROW; i += blockDim.x) {
             u64 u = scr_xs64(rng);
             int lo = 0, hi = SCR_MAX_FIELD + 1;

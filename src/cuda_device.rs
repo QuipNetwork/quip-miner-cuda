@@ -78,7 +78,7 @@ pub(crate) fn select_arch(cc: i32) -> i32 {
 }
 
 /// Detect the device capability and clamp it to the supported compile targets.
-fn device_arch(ctx: &CudaContext) -> i32 {
+pub(crate) fn device_arch(ctx: &CudaContext) -> i32 {
     let cc = match (
         ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
         ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR),
@@ -90,7 +90,7 @@ fn device_arch(ctx: &CudaContext) -> i32 {
 }
 
 /// `cuDriverGetVersion`, wrapped safely (cudarc exposes only the raw sys fn).
-fn driver_version() -> Result<i32, CudaError> {
+pub(crate) fn driver_version() -> Result<i32, CudaError> {
     let mut v: std::ffi::c_int = 0;
     // SAFETY: `v` is a live, initialized `c_int` owned by this frame, so
     // `from_mut(&mut v)` is a valid, aligned, uniquely-borrowed pointer for the
@@ -131,7 +131,7 @@ impl From<cudarc::driver::DriverError> for CudaError {
 /// fallback pass. The arch-unspecified compile the fallback served no longer
 /// exists: NVRTC 12.9's default target (`sm_52`) predates the kernels'
 /// `__nanosleep` floor, so a portable compile can never succeed.
-fn compile_for_arch(
+pub(crate) fn compile_for_arch(
     src: &str,
     max_nodes: usize,
     arch: i32,
