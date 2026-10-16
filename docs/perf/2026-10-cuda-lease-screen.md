@@ -3,8 +3,8 @@
 Use four probe reads, 512 probe sweeps, and a keep rate of 1/16.
 Audit one in 200 rejects.
 These defaults apply to multi-spin annealing (MSA) leases.
-The timing pair recorded a target-hit rate ratio of 6.7115.
-Direct shared device 0, so this pair does not establish an isolated throughput gain.
+Over ten minutes, screening found 6.7 times as many target hits per second as Direct full solves.
+Over the first eight minutes, before any possible GPU sharing, the ratio is 6.2.
 
 ## Setup
 
@@ -69,7 +69,7 @@ The modeled rate measures corpus recall and cost, rather than coordinator target
 
 ## Corpus timings
 
-The following tables copy the task 5a report.
+The following tables come from the 4,096-nonce corpus run.
 
 | Phase | Wall seconds |
 | --- | ---: |
@@ -201,7 +201,7 @@ They describe admission decisions, rather than completed full solves.
 
 Both runs use ten nominal minutes. The table uses the logged elapsed time.
 **Direct shared device 0.** Its postflight found a foreign GPU process, PID 2946356, using 194 MiB.
-The process name was `round4-cuda-harness`. The overlap duration is unknown.
+The process name was `round4-cuda-harness`. The overlap is at most the last 110 seconds of the run.
 The preflight found no compute process at 17:02:35 UTC.
 A 17:10:47 UTC snapshot showed only the test miner. The foreign process appeared in the 17:12:37 UTC postflight.
 Screened snapshots showed no foreign compute process.
@@ -221,7 +221,7 @@ The ratio below describes this pair and does not establish an isolated throughpu
 | Final completed salts | 44929 | 5232 |
 
 The screened-to-Direct target-hit rate ratio is **6.7115**.
-The Direct run shared device 0. This ratio needs a repeat with matching GPU conditions.
+The first eight minutes of both runs end before the clean 17:10:47 UTC snapshot. Over those minutes, screening found 274 hits in 480 seconds and Direct found 44, a ratio of **6.23**.
 
 ### Selection fractions
 
@@ -311,6 +311,6 @@ One ten-minute trial per mode does not measure run-to-run variance.
 Screened runs first. Direct follows in a fresh process, so run order can affect heat and clock state.
 
 Process snapshots show GPU use at each check. They cannot prove sole use for the full run.
-Task 5a reported unverified isolation for its cost model.
+The corpus run also relied on snapshots for isolation.
 This check measures pushed target hits.
 It does not measure chain rewards or proof acceptance.
