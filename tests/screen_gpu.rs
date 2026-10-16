@@ -123,18 +123,103 @@ fn verify(reads_log2: u32, couplings: &[i32], threads: u32) {
         .unwrap();
     assert_eq!(tail.best, vec![exact_tail]);
     expected.push(exact_tail);
-    let start = std::time::Instant::now();
     let run = screen.run(&nonces, &|| false).unwrap();
-    eprintln!(
-        "probe reads_log2={reads_log2} threads={threads}: two one-group launches {:?}",
-        start.elapsed()
-    );
     assert!(!run.stopped);
     assert_eq!(run.best.len(), npg + 1, "padded slots are excluded");
     assert_eq!(
         run.best, expected,
         "input order and exact milli minima across batches"
     );
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU"]
+fn individual_launch_durations_at_default_and_maximum_sweeps() {
+    let topo = topology(&[-1000, 1000]);
+    let nonces = nonces(8);
+    for sweeps in [512, 2048] {
+        let params = ScreenParams {
+            sweeps,
+            ..ScreenParams::default()
+        };
+        let screen = Screen::open(
+            device(),
+            ScreenDomain::check(device(), &topo, params).unwrap(),
+        )
+        .unwrap();
+        // Finish uploads and warm up before measuring each synchronous launch.
+        screen.run(&nonces, &|| false).unwrap();
+        for sample in 1..=3 {
+            let calls = Cell::new(0);
+            let start = std::time::Instant::now();
+            let run = screen
+                .run(&nonces, &|| {
+                    calls.set(calls.get() + 1);
+                    false
+                })
+                .unwrap();
+            let elapsed = start.elapsed();
+            assert_eq!(calls.get(), 1, "exactly one launch per sample");
+            assert_eq!(run.best.len(), 8);
+            assert!(!run.stopped);
+            eprintln!(
+                "single launch reads_log2=2 sweeps={sweeps} threads=256 groups=1 sample={sample}: {elapsed:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU"]
+fn multiple_groups_and_partial_group_match_protocol_minima() {
+    let topo = topology(&[-1000, 1000]);
+    let params = ScreenParams::default();
+    let screen = Screen::open(
+        device(),
+        ScreenDomain::check(device(), &topo, params).unwrap(),
+    )
+    .unwrap();
+    let npg = 32usize >> params.reads_log2;
+    let nonces = nonces(2 * npg + 1);
+    // Debug runs use one launch, without the timing-dependent batch estimator.
+    let debug = screen.run_debug(&nonces, 7).unwrap();
+    assert_eq!(debug.lanes.len(), 3 * 32, "exactly three groups launched");
+    assert_eq!(debug.state.len(), 3 * topo.num_nodes);
+    assert_eq!(debug.masks.len(), 3 * topo.edges.len());
+    assert_eq!(debug.best.len(), nonces.len(), "exclude padded slots");
+    for (group, batch) in nonces.chunks(npg).enumerate() {
+        let state = &debug.state[group * topo.num_nodes..(group + 1) * topo.num_nodes];
+        // The final group's unused nonce slots have no protocol input.
+        let masks = reference_masks(batch, params.reads_log2, &topo).unwrap();
+        let valid_lanes = (0..32).fold(0u32, |mask, lane| {
+            mask | (u32::from(lane % npg < batch.len()) << lane)
+        });
+        for (edge, expected) in masks.iter().enumerate() {
+            assert_eq!(
+                debug.masks[group * topo.edges.len() + edge] & valid_lanes,
+                *expected,
+                "group {group}, edge {edge}"
+            );
+        }
+        for (slot, nonce) in batch.iter().enumerate() {
+            let exact: Vec<i64> = (slot..32)
+                .step_by(npg)
+                .map(|lane| {
+                    let energy = reference_energy(*nonce, state, lane, &topo).unwrap();
+                    assert_eq!(i64::from(debug.lanes[group * 32 + lane]) * 1000, energy);
+                    energy
+                })
+                .collect();
+            assert_eq!(
+                debug.best[group * npg + slot],
+                *exact.iter().min().unwrap(),
+                "exact milli minimum for nonce {}",
+                group * npg + slot
+            );
+        }
+    }
 }
 
 #[test]

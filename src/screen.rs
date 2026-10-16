@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 const SCREEN_SRC: &str = include_str!("../kernels/screen.cu");
 /// Largest node degree the kernel handles (`SCR_MAX_DEG`).
 pub const MAX_DEGREE: usize = 20;
+/// One probe group is indivisible. This sweep cap bounds stop latency.
+pub const MAX_PROBE_SWEEPS: usize = 2048;
 const ROW: usize = 8192;
 const CUT_ENTRIES: usize = 64;
 const STATIC_SHARED_BYTES: usize = 128;
@@ -70,7 +72,7 @@ pub enum NotScreenable {
         have: usize,
     },
     /// Probe dimensions cannot be represented by the kernel.
-    #[error("screen requires reads_log2 2..=5, positive i32 sweeps, and 32..=1024 threads in multiples of 32")]
+    #[error("screen requires reads_log2 2..=5, sweeps in 1..={}, and 32..=1024 threads in multiples of 32", MAX_PROBE_SWEEPS)]
     Shape,
     /// The device could not report its opt-in shared-memory limit.
     #[error("screen device budget unavailable: {0}")]
@@ -83,7 +85,7 @@ pub enum ScreenError {
     /// The caller should fall back to ordinary MSA.
     #[error(transparent)]
     NotScreenable(#[from] NotScreenable),
-    /// A debug argument is outside the single-group layout.
+    /// A debug argument is outside the single-launch layout.
     #[error("bad screen parameter: {0}")]
     Param(String),
     /// Kernel compilation or module loading failed.
@@ -99,7 +101,7 @@ pub enum ScreenError {
 pub struct ScreenParams {
     /// Reads per nonce = `1 << reads_log2`, with exponent 2..=5.
     pub reads_log2: u32,
-    /// Sweeps per probe.
+    /// Sweeps per probe, in `1..=MAX_PROBE_SWEEPS`.
     pub sweeps: usize,
     /// Threads per block, a multiple of 32 in 32..=1024.
     pub threads: u32,
@@ -164,7 +166,7 @@ impl ScreenDomain {
     ) -> Result<ScreenShape, NotScreenable> {
         if !(2..=5).contains(&params.reads_log2)
             || params.sweeps == 0
-            || i32::try_from(params.sweeps).is_err()
+            || params.sweeps > MAX_PROBE_SWEEPS
             || params.threads == 0
             || params.threads > 1024
             || !params.threads.is_multiple_of(32)
@@ -282,16 +284,16 @@ pub struct ScreenRun {
     pub stopped: bool,
 }
 
-/// Single-group diagnostics for the protocol and threshold regression tests.
+/// Single-launch diagnostics for the protocol and threshold regression tests.
 #[doc(hidden)]
 pub struct ScreenDebug {
     /// Exact minima, excluding padded nonce slots.
     pub best: Vec<i64>,
     /// Final unit energy per lane.
     pub lanes: Vec<i32>,
-    /// Drawn coupling sign masks per edge.
+    /// Drawn coupling sign masks per edge, in group order.
     pub masks: Vec<u32>,
-    /// Final spin words per node.
+    /// Final spin words per node, in group order.
     pub state: Vec<u32>,
     /// First beta's 64 thresholds copied from shared memory.
     pub cut: Vec<u64>,
@@ -416,15 +418,17 @@ impl<'a> Screen<'a> {
         })
     }
 
-    /// Run one group and return its state for protocol verification.
+    /// Run one launch and return every group's state for protocol verification.
+    /// The lane count is exactly 32 times the launched group count.
     ///
     /// # Errors
-    /// Refuses empty inputs or more than one group's nonces, and returns driver failures.
+    /// Refuses empty inputs or more than one wave, and returns driver failures.
     #[doc(hidden)]
     pub fn run_debug(&self, nonces: &[[u8; 32]], seed: u32) -> Result<ScreenDebug, ScreenError> {
-        if nonces.is_empty() || nonces.len() > (32 >> self.params.reads_log2) {
+        let npg = 32usize >> self.params.reads_log2;
+        if nonces.is_empty() || nonces.len().div_ceil(npg) > self.max_groups {
             return Err(ScreenError::Param(
-                "debug requires one nonempty group".into(),
+                "debug requires one nonempty wave".into(),
             ));
         }
         let (lanes, debug) = self.launch(nonces, seed, true)?;
@@ -462,9 +466,9 @@ impl<'a> Screen<'a> {
         let mut dbg = if debug {
             Some((
                 self.stream
-                    .alloc_zeros::<u32>(usize::try_from(self.nnz).unwrap())?,
+                    .alloc_zeros::<u32>(groups * usize::try_from(self.nnz).unwrap())?,
                 self.stream
-                    .alloc_zeros::<u32>(usize::try_from(self.n).unwrap())?,
+                    .alloc_zeros::<u32>(groups * usize::try_from(self.n).unwrap())?,
                 self.stream.alloc_zeros::<u64>(CUT_ENTRIES)?,
             ))
         } else {
@@ -761,6 +765,26 @@ mod tests {
                 have: 8871
             })
         ));
+    }
+
+    #[test]
+    fn probe_sweep_limit_bounds_indivisible_work() {
+        let params = ScreenParams {
+            sweeps: 2048,
+            ..ScreenParams::default()
+        };
+        assert!(ScreenDomain::check_with_budget(&ring(4), params, usize::MAX).is_ok());
+        let reason = ScreenDomain::check_with_budget(
+            &ring(4),
+            ScreenParams {
+                sweeps: 2049,
+                ..params
+            },
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert_eq!(reason, NotScreenable::Shape);
+        assert!(reason.to_string().contains("2048"));
     }
 
     #[test]

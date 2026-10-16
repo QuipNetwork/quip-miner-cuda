@@ -143,8 +143,8 @@ __global__ void __launch_bounds__(SCR_THREADS) quip_screen_probe(
     int sweeps_per_beta,
     unsigned int base_seed,
     int* __restrict__ out_energy,          // [groups * 32] energy units per lane
-    u32* __restrict__ dbg_mask,            // group 0 lane masks [nnz], or null
-    u32* __restrict__ dbg_state,           // group 0 spin words [n_nodes], or null
+    u32* __restrict__ dbg_mask,            // lane masks [groups * nnz], or null
+    u32* __restrict__ dbg_state,           // spin words [groups * n_nodes], or null
     u64* __restrict__ dbg_cut              // group 0's first threshold table [64], or null
 ) {
     extern __shared__ u64 scr_smem[];
@@ -274,10 +274,8 @@ __global__ void __launch_bounds__(SCR_THREADS) quip_screen_probe(
     }
     __syncthreads();
     if (tid < 32) out_energy[(size_t)group * 32 + tid] = nnz - 2 * lane_count[tid];
-    if (group == 0) {
-        if (dbg_mask) for (int e = tid; e < nnz; e += blockDim.x) dbg_mask[e] = (u32)j8[e] * rep;
-        if (dbg_state) for (int i = tid; i < n_nodes; i += blockDim.x) dbg_state[i] = state[i];
-    }
+    if (dbg_mask) for (int e = tid; e < nnz; e += blockDim.x) dbg_mask[(size_t)group * nnz + e] = (u32)j8[e] * rep;
+    if (dbg_state) for (int i = tid; i < n_nodes; i += blockDim.x) dbg_state[(size_t)group * n_nodes + i] = state[i];
 }
 
 }  // extern "C"
