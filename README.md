@@ -281,8 +281,8 @@ cargo test --release                       # host-only tests
 cargo test --release -- --include-ignored  # adds the CUDA-device tests
 ```
 
-The ten-minute `pipeline::whole_pipeline` benchmark also needs `LEASE_PIPELINE_OUT`
-to contain `corpus-4096.csv` from the
+The ten-minute `pipeline::whole_pipeline` benchmark skips unless `LEASE_PIPELINE_OUT`
+names a directory that contains `corpus-4096.csv` from the
 [lease screen calibration](docs/perf/2026-10-cuda-lease-screen.md).
 
 `tests/arch_coverage.rs` needs the pinned CUDA 12.9 toolkit, so it skips unless

@@ -60,8 +60,13 @@ fn corpus_target(path: &std::path::Path) -> i64 {
 #[ignore = "600-second device-0 session benchmark per mode; set LEASE_PIPELINE_OUT"]
 #[allow(clippy::too_many_lines)] // Keep setup, timed windows and cancellation in one session lifecycle.
 async fn whole_pipeline() {
+    // CI runs ignored tests too; this benchmark runs only when asked for.
+    let Some(out) = std::env::var_os("LEASE_PIPELINE_OUT") else {
+        eprintln!("skipping whole_pipeline: LEASE_PIPELINE_OUT is not set");
+        return;
+    };
+    let out = std::path::PathBuf::from(out);
     assert_eq!(std::env::var("CUDA_VISIBLE_DEVICES").as_deref(), Ok("0"));
-    let out = std::path::PathBuf::from(std::env::var("LEASE_PIPELINE_OUT").expect("evidence path"));
     std::fs::create_dir_all(&out).unwrap();
     let seconds: u64 = std::env::var("LEASE_PIPELINE_SECONDS")
         .unwrap_or_else(|_| "600".into())
