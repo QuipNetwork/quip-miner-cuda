@@ -168,6 +168,11 @@ another process holds a context. A miner alone on a GPU never throttles.
 
 ## Session recovery
 
+Each device handle precreates 64 pairs of compute and transfer streams.
+At most 64 sessions per handle run concurrently.
+Further sessions wait for a pair to return after teardown drains both streams.
+Session setup creates no streams while persistent kernels run.
+
 The driver ends a self-feeding session and builds a new one in two cases.
 
 The pipeline goes empty. Nothing is in flight and the queue holds nothing, so no
