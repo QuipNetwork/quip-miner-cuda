@@ -222,6 +222,19 @@ impl Session {
         self.log.jobs_done.unwrap_or(0)
     }
 
+    /// Receive real session traffic for a fixed benchmark window.
+    pub(crate) async fn collect_until(&mut self, deadline: Instant) {
+        loop {
+            match tokio::time::timeout_at(deadline, self.inbound.message()).await {
+                Ok(Ok(Some(frame))) => self.observe(frame),
+                Err(_) => return,
+                other => panic!("benchmark stream ended: {other:?}\n{}", self.stderr()),
+            }
+            assert!(self.log.fatal.is_none(), "{:?}", self.log.fatal);
+            assert!(self.log.rejects.is_empty(), "{:?}", self.log.rejects);
+        }
+    }
+
     pub(crate) fn stderr(&self) -> String {
         std::fs::read_to_string(&self.stderr).expect("miner log")
     }

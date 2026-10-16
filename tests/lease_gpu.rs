@@ -2,6 +2,8 @@
 //! Run on device 0 with `--release --ignored --test-threads=1`.
 
 mod common;
+#[path = "common/lease_pipeline.rs"]
+mod pipeline;
 #[path = "common/lease.rs"]
 mod support;
 
