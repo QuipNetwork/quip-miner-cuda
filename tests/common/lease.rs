@@ -15,6 +15,8 @@ use quip_solver_core::quip_protocol::lease::TopologyView;
 use quip_solver_core::quip_protocol::target::Target;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::{io::Write, process::Stdio};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -92,6 +94,8 @@ pub(crate) struct Session {
     outbound: Option<Outbound>,
     child: Child,
     stderr: std::path::PathBuf,
+    log_lines: mpsc::UnboundedReceiver<String>,
+    logger: tokio::task::JoinHandle<()>,
     _server: tokio::task::JoinHandle<()>,
     _directory: tempfile::TempDir,
 }
@@ -111,15 +115,27 @@ impl Session {
                 .expect("serve test coordinator");
         });
         let stderr = directory.path().join("miner.log");
-        let log_file = std::fs::File::create(&stderr).expect("miner log");
-        let child = Command::new(binary)
+        let mut log_file = std::fs::File::create(&stderr).expect("miner log");
+        let mut child = Command::new(binary)
             .args(["--quip-coordinator", &format!("unix://{}", path.display())])
             .args(["--miner-id", "cuda-0", "--device", "0"])
-            .stderr(log_file)
+            .stderr(Stdio::piped())
+            .env(
+                "RUST_LOG",
+                "info,quip_solver_cuda::lease=debug,quip_solver_cuda::lease_turn=debug",
+            )
             .env("QUIP_SESSION_TOKEN", "test-token")
             .kill_on_drop(true)
             .spawn()
             .expect("start miner");
+        let mut lines = BufReader::new(child.stderr.take().expect("miner stderr")).lines();
+        let (log_send, log_lines) = mpsc::unbounded_channel();
+        let logger = tokio::spawn(async move {
+            while let Some(line) = lines.next_line().await.expect("read miner stderr") {
+                writeln!(log_file, "{line}").expect("write miner log");
+                drop(log_send.send(line));
+            }
+        });
         let (inbound, outbound) = tokio::time::timeout(Duration::from_secs(30), receive)
             .await
             .expect("miner connects within 30 s")
@@ -130,6 +146,8 @@ impl Session {
             outbound: Some(outbound),
             child,
             stderr,
+            log_lines,
+            logger,
             _server: server,
             _directory: directory,
         };
@@ -208,6 +226,20 @@ impl Session {
         std::fs::read_to_string(&self.stderr).expect("miner log")
     }
 
+    /// Wait for a device lifecycle event without consuming protocol frames.
+    pub(crate) async fn until_stderr(&mut self, needle: &str, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        loop {
+            let line = tokio::time::timeout_at(deadline, self.log_lines.recv())
+                .await
+                .unwrap_or_else(|_| panic!("missing log event {needle}:\n{}", self.stderr()))
+                .expect("miner log remains open");
+            if line.contains(needle) {
+                return;
+            }
+        }
+    }
+
     /// Send `Shutdown`, read to the end of the stream, and return the exit code.
     pub(crate) async fn shutdown(&mut self, grace_ms: u32) -> i32 {
         let started = Instant::now();
@@ -222,6 +254,7 @@ impl Session {
             .await
             .expect("miner exits after shutdown")
             .expect("wait for miner");
+        (&mut self.logger).await.expect("miner log task");
         // Allow two seconds for transport and scheduler delays beyond grace.
         let tolerance = Duration::from_secs(2);
         let elapsed = started.elapsed();

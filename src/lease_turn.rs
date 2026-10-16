@@ -71,6 +71,9 @@ impl Turn<'_> {
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        if state.waiting.front() != Some(&self.id) {
+            tracing::debug!(turn = self.id, "CUDA lease waiting for turn");
+        }
         loop {
             if state.waiting.front() == Some(&self.id) {
                 return true;

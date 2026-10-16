@@ -117,6 +117,42 @@ async fn an_easy_target_and_a_lease_only_session_report_every_salt() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires CUDA device 0"]
+async fn a_target_change_during_a_lease_applies_to_later_chunks() {
+    let mut s = start("[screen]\naudit_denominator = 0\nprobe_sweeps = 2048").await;
+    let (topology, view) = ring(1024, RING_A);
+    s.send(coord_msg::Msg::Topology(topology)).await;
+    s.send(coord_msg::Msg::SetTarget(target(i64::MIN, 32)))
+        .await;
+    let job = lease(b"live-target", 3, RING_A, 0, 1024);
+    let spec = generator(&job);
+    s.send(coord_msg::Msg::Job(job)).await;
+    // The initial probe budget is 88 salts at 2048 sweeps. Those warm-up
+    // observations are all rejects. Wait for the actual chunk boundary.
+    s.until_stderr("CUDA lease chunk finished", LONG).await;
+    assert!(s.log.done(b"live-target").is_none());
+    s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 32)))
+        .await;
+    finish(&mut s, b"live-target").await;
+    verify(&s, b"live-target", &spec, &view, 1024);
+    let salts: HashSet<_> = s
+        .log
+        .results_for(b"live-target")
+        .iter()
+        .map(|result| u64::from_le_bytes(result.salt[..8].try_into().unwrap()))
+        .collect();
+    assert!(
+        (0..88).all(|salt| !salts.contains(&salt)),
+        "unreachable warm-up chunk returns no reads"
+    );
+    assert!(
+        (896..1024).all(|salt| salts.contains(&salt)),
+        "easy target keeps every salt in later chunks"
+    );
+    assert_eq!(s.shutdown(2000).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires CUDA device 0"]
 async fn unreachable_target_counts_screened_and_audited_salts() {
     let mut s = start("[screen]\naudit_denominator = 2").await;
     let (topology, view) = ring(64, RING_A);
@@ -363,7 +399,7 @@ async fn two_leases_back_to_back_finish_in_fifo_order() {
     s.send(coord_msg::Msg::Topology(topology)).await;
     s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 16_384)))
         .await;
-    let first = lease(b"first", 3, RING_A, 0, 96);
+    let first = lease(b"first", 3, RING_A, 0, 1_000_000);
     let spec_a = generator(&first);
     s.send(coord_msg::Msg::Job(first)).await;
     // A first result proves the first lease owns the turn before the second joins.
@@ -371,11 +407,24 @@ async fn two_leases_back_to_back_finish_in_fifo_order() {
         !log.results_for(b"first").is_empty()
     })
     .await;
-    let second = lease(b"second", 3, RING_A, 100, 8);
+    let second = lease(b"second", 4, RING_A, 100, 8);
     let spec_b = generator(&second);
     s.send(coord_msg::Msg::Job(second)).await;
+    s.until_stderr("CUDA lease waiting for turn", LONG).await;
+    assert!(
+        s.log.done(b"first").is_none(),
+        "the first turn is still held"
+    );
+    assert!(
+        s.log.results_for(b"second").is_empty(),
+        "the second lease waits"
+    );
+    s.send(coord_msg::Msg::Cancel(Cancel { max_generation: 3 }))
+        .await;
     finish(&mut s, b"second").await;
-    verify(&s, b"first", &spec_a, &view, 96);
+    let first_count = s.log.done(b"first").expect("first summary").salts_done;
+    assert!(first_count > 0 && first_count < 1_000_000);
+    verify(&s, b"first", &spec_a, &view, first_count);
     verify(&s, b"second", &spec_b, &view, 8);
     let first_tail = s
         .log
