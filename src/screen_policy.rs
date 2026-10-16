@@ -16,9 +16,10 @@ pub(crate) struct ScreenConfig {
 
 impl Default for ScreenConfig {
     fn default() -> Self {
+        // Calibration: docs/perf/2026-10-cuda-lease-screen.md.
         Self {
             enabled: true,
-            keep_denominator: 64,
+            keep_denominator: 16,
             audit_denominator: 200,
             probe_reads_log2: 2,
             probe_sweeps: 512,
@@ -388,7 +389,7 @@ mod tests {
         let mut selector = Selector::with_seed(no_audits(), 7);
         warm(&mut selector, &key());
         selector.reconfigure(
-            &toml::from_str("audit_denominator = 200\nkeep_denominator = 64").unwrap(),
+            &toml::from_str("audit_denominator = 200\nkeep_denominator = 16").unwrap(),
         );
         assert_eq!(selector.decide(&key(), -100, None), Decision::Keep);
         selector.reconfigure(&toml::from_str("enabled = false").unwrap());
@@ -519,7 +520,7 @@ mod tests {
             kept += usize::from(i >= 100_000 && decision == Decision::Keep);
         }
         let rate = f64::from(u32::try_from(kept).unwrap()) / 100_000.0;
-        assert!((rate - 1.0 / 64.0).abs() < 0.1 / 64.0, "{rate}");
+        assert!((rate - 1.0 / 16.0).abs() < 0.1 / 16.0, "{rate}");
     }
 
     #[test]
@@ -566,7 +567,7 @@ mod tests {
             }
         }
         config.merge(&toml::from_str("keep_denominator = 1\naudit_denominator = 2").unwrap());
-        assert_eq!(config.keep_denominator, 64);
+        assert_eq!(config.keep_denominator, 16);
         assert_eq!(config.audit_denominator, 2);
     }
 
