@@ -3,13 +3,11 @@
 
 //! Copied from quip-solver-metal at 98e04a0.
 //!
-//! First-come, first-served turns for feeding leases to the resident runner.
+//! First-come, first-served turns for running leases on CUDA.
 //!
 //! One lease feeds salts at a time, so each lease finishes as fast as the
-//! whole GPU allows instead of sharing it with every other open lease. A lease
-//! gives up its turn once its last salt is queued, not when its last unit
-//! finishes: the next lease then fills the slots that the previous lease's
-//! tail frees, and the GPU never drains at a lease boundary.
+//! whole GPU allows instead of sharing it with every other open lease. CUDA
+//! holds the turn until the lease's final full-solve session and reporter finish.
 
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, PoisonError};

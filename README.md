@@ -163,6 +163,10 @@ Other supported models use Direct mode, which fully solves every salt.
 This includes weighted models and the production topology on Turing's 64 KB budget.
 SA and Gibbs solve jobs sent by the coordinator.
 
+Plain stream sessions do not take the lease turn. A sustained full-width plain
+stream on the same device can delay a lease probe and its cancellation until
+the plain session drains.
+
 The coordinator supplies these keys in the miner configuration:
 
 | `[screen]` key | Default | Accepted values |

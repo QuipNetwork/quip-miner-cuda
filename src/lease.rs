@@ -16,6 +16,25 @@ fn fault(error: impl std::fmt::Display) -> SampleError {
     SampleError::DeviceFault(format!("CUDA lease: {error}"))
 }
 
+fn check_capacity(topology: &TopologyView, max_nodes: usize) -> Result<(), SampleError> {
+    if topology.num_nodes > max_nodes {
+        return Err(SampleError::Capacity);
+    }
+    // Use the full solver's CSR degree calculation. Coefficients do not
+    // affect admission, and the field vector supplies only the node count.
+    let graph = IsingGraph::new(
+        vec![0.0; topology.num_nodes],
+        Vec::new(),
+        topology.edges.clone(),
+    );
+    if crate::topology::SelfFeedingTopology::build(&graph).max_degree()
+        > crate::capacity::MSA_MAX_DEGREE
+    {
+        return Err(SampleError::Capacity);
+    }
+    Ok(())
+}
+
 fn chunk_size(width: usize, screen: Option<(u32, usize)>, remaining: u64) -> usize {
     let base = width.max(1).saturating_mul(2);
     let count = screen.map_or(base, |(keep, budget)| {
@@ -136,6 +155,9 @@ pub(crate) fn sample(
     params: &SampleParams,
     sink: &LeaseSink,
 ) -> Result<(), SampleError> {
+    check_capacity(topology, sampler.inner.device.max_nodes)?;
+    // Plain stream sessions do not take this turn. A sustained full-width
+    // plain stream can delay the probe and its cancellation until it drains.
     let turn = sampler.turns.join();
     let mut stats = Stats::new(lease.salt_count(), turn.id());
     if !turn.wait(|| sink.is_stopped()) || sink.is_stopped() {
@@ -411,7 +433,10 @@ fn report(
                 None
             }
             (Err(error), _) | (_, StreamOutcome::Completed(Err(error))) => {
-                failure.get_or_insert_with(|| fault(error));
+                failure.get_or_insert_with(|| match error {
+                    SampleError::Capacity => SampleError::Capacity,
+                    error => fault(error),
+                });
                 cancel.cancel_through(1);
                 None
             }
@@ -461,6 +486,28 @@ fn report(
 mod tests {
     use super::*;
     use quip_solver_core::Sampler;
+
+    #[test]
+    fn capacity_check_uses_full_msa_degree_and_opened_node_limits() {
+        let mut topology = TopologyView {
+            num_nodes: 22,
+            edges: (1..22).map(|node| (0, node)).collect(),
+            allowed_h_milli: vec![0],
+            allowed_j_milli: vec![-1000, 1000],
+        };
+        assert!(matches!(
+            check_capacity(&topology, 22),
+            Err(SampleError::Capacity)
+        ));
+        topology.edges.pop();
+        assert!(check_capacity(&topology, 22).is_ok());
+        assert!(matches!(
+            check_capacity(&topology, 21),
+            Err(SampleError::Capacity)
+        ));
+        topology.num_nodes = 21;
+        assert!(check_capacity(&topology, 21).is_ok());
+    }
 
     #[test]
     #[ignore = "requires CUDA device 0"]
