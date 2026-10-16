@@ -27,6 +27,7 @@ pub mod nsight;
 pub mod nvml_gov;
 pub mod sampler;
 pub mod schema;
+mod stream_pool;
 pub mod streaming;
 pub mod topology;
 

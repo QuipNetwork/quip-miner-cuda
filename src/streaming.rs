@@ -23,6 +23,7 @@ use crate::driver_budget::{Bucket, DriverBudget};
 use crate::kernel::KernelKind;
 use crate::nvml_gov::UtilGovernor;
 use crate::sampler::SampleError;
+use crate::stream_pool::SessionStreams;
 use crate::topology::{fill_coefficients, SelfFeedingTopology};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg};
@@ -356,6 +357,8 @@ struct SelfFeedingSession<'a> {
     algo_state: AlgoState,
 
     launched: bool,
+    // Last: return the pair only after buffer drops and their queued frees.
+    _streams: SessionStreams<'a>,
 }
 
 /// Slot buffers and reusable host staging, selected by coefficient width.
@@ -730,9 +733,9 @@ impl<'a> SelfFeedingSession<'a> {
             reads_per_nonce: to_kernel_i32("reads_per_nonce", reads_per_nonce)?,
         };
 
-        let ctx = &device.ctx;
-        let stream_compute = ctx.new_stream()?;
-        let stream_transfer = ctx.new_stream()?;
+        let streams = device.stream_pool.take();
+        let stream_compute = Arc::clone(&streams.compute);
+        let stream_transfer = Arc::clone(&streams.transfer);
 
         let row_ptr = if topology.row_ptr.is_empty() {
             vec![0i32]
@@ -815,6 +818,7 @@ impl<'a> SelfFeedingSession<'a> {
             d_beta,
             algo_state,
             launched: false,
+            _streams: streams,
         })
     }
 
@@ -1358,10 +1362,8 @@ impl<'a> SelfFeedingSession<'a> {
     /// memory, which surfaces as `CUDA_ERROR_LAUNCH_FAILED` on the next call.
     fn wait_exit(&mut self) -> Result<(), SampleError> {
         self.stream_transfer.synchronize()?;
-        if self.launched {
-            self.stream_compute.synchronize()?;
-            self.launched = false;
-        }
+        self.stream_compute.synchronize()?;
+        self.launched = false;
         Ok(())
     }
 }

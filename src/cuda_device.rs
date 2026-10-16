@@ -5,6 +5,7 @@
 use crate::capacity;
 use crate::jit_cache;
 use crate::kernel::KernelKind;
+use crate::stream_pool::StreamPool;
 use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, Ptx};
@@ -375,10 +376,10 @@ pub struct CudaDevice {
     /// on, so the governor resolves its handle from this.
     pub pci_bus_id: String,
     pub(crate) ctx: Arc<CudaContext>,
-    /// The device's default (null) stream. `streaming` builds its own
-    /// compute/transfer streams, so nothing reads this today.
+    /// The device's default (null) stream. Sessions use the pool instead.
     #[allow(dead_code)]
     pub(crate) stream: Arc<CudaStream>,
+    pub(crate) stream_pool: StreamPool,
     /// `cuda_sa_self_feeding` — persistent kernel, 1 block (1 SM) per nonce.
     pub(crate) sa: CudaFunction,
     /// Wide `cuda_sa_self_feeding`, compiled with [`SA_WIDE_DEFINE`].
@@ -434,6 +435,9 @@ impl fmt::Debug for CudaDevice {
 
 impl CudaDevice {
     /// Create a context on `device_index` and NVRTC-compile the kernels.
+    ///
+    /// Precreates 64 session stream pairs. Additional concurrent sessions wait
+    /// for a pair to return instead of creating streams beside running kernels.
     ///
     /// # Errors
     ///
@@ -591,11 +595,13 @@ impl CudaDevice {
             ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID)?,
         );
 
+        let stream_pool = StreamPool::new(&ctx)?;
         Ok(Self {
             device_index,
             pci_bus_id,
             ctx,
             stream,
+            stream_pool,
             sa,
             sa_wide,
             gibbs,
