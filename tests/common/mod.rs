@@ -17,8 +17,13 @@ pub fn profile_bin(name: &str) -> String {
 }
 
 pub fn ensure_built(package_bins: &[&str]) {
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "quip-solver-cuda"])
+    let mut command = Command::new(env!("CARGO"));
+    command.args(["build", "-p", "quip-solver-cuda"]);
+    if !cfg!(debug_assertions) {
+        command.arg("--release");
+    }
+    let status = command
+        .env("CUDA_VISIBLE_DEVICES", "")
         .status()
         .expect("cargo build quip-solver-cuda");
     assert!(status.success(), "failed to build quip-solver-cuda");

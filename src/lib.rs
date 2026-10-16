@@ -20,13 +20,22 @@ pub mod capacity;
 pub mod coefficients;
 pub mod corpus;
 pub mod cuda_device;
+// Preserve Metal's estimator arithmetic: counts intentionally become floats,
+// and its probability midpoint stays in [0, 1]. Keep its exact-value tests.
+#[allow(clippy::cast_precision_loss, clippy::manual_midpoint)]
+#[cfg_attr(test, allow(clippy::float_cmp))]
+mod cutoff;
 pub mod driver_budget;
 mod jit_cache;
 pub mod kernel;
+mod lease;
+mod lease_turn;
 pub mod nsight;
 pub mod nvml_gov;
 pub mod sampler;
 pub mod schema;
+pub mod screen;
+mod screen_policy;
 mod stream_pool;
 pub mod streaming;
 pub mod topology;
@@ -44,6 +53,105 @@ use quip_solver_core::{
     EXACT_COEFFICIENTS_FEATURE, LINEAR_SCHEDULE_FEATURE,
 };
 use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
+
+/// MSA sampler with backend-owned salt leases and ordinary CUDA job handling.
+pub struct MsaSampler {
+    inner: CudaSampler,
+    turns: lease_turn::LeaseTurns,
+    logged_modes: Mutex<std::collections::HashSet<screen_policy::SelectorKey>>,
+}
+
+impl MsaSampler {
+    /// Bind an MSA device and governor. Lease turns share this device.
+    #[must_use]
+    pub fn new(device: CudaDevice, gov: UtilGovernor) -> Self {
+        Self {
+            inner: CudaSampler::new(device, gov, KernelKind::Msa),
+            turns: lease_turn::LeaseTurns::default(),
+            logged_modes: Mutex::default(),
+        }
+    }
+}
+
+impl Sampler for MsaSampler {
+    fn generates_locally() -> bool {
+        true
+    }
+
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        topology: &quip_solver_core::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), SampleError> {
+        lease::sample(self, lease, topology, params, sink)
+    }
+
+    fn sample(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        self.inner.sample(graph, params)
+    }
+
+    fn sample_stream(
+        &self,
+        jobs: tokio::sync::mpsc::Receiver<StreamJob>,
+        out: tokio::sync::mpsc::Sender<StreamResult>,
+        cancel: CancelToken,
+    ) {
+        self.inner.sample_stream(jobs, out, cancel);
+    }
+
+    fn accepts_warm_start() -> bool {
+        CudaSampler::accepts_warm_start()
+    }
+
+    fn sample_warm(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+        warm: &quip_solver_core::WarmStart,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        self.inner.sample_warm(graph, params, warm)
+    }
+
+    fn sample_stream_warm(
+        &self,
+        jobs: tokio::sync::mpsc::Receiver<quip_solver_core::WarmStreamJob>,
+        out: tokio::sync::mpsc::Sender<StreamResult>,
+        cancel: CancelToken,
+    ) {
+        self.inner.sample_stream_warm(jobs, out, cancel);
+    }
+
+    fn stream_width(&self) -> usize {
+        self.inner.stream_width()
+    }
+
+    fn declared_stream_width() -> u32 {
+        CudaSampler::declared_stream_width()
+    }
+
+    fn utilization(&self) -> f64 {
+        self.inner.utilization()
+    }
+
+    fn should_throttle(&self) -> bool {
+        self.inner.should_throttle()
+    }
+
+    fn max_reads(&self) -> u32 {
+        self.inner.max_reads()
+    }
+
+    fn apply_config(&self, backend_toml: &str) {
+        self.inner.apply_config(backend_toml);
+    }
+}
 
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 
@@ -67,6 +175,8 @@ struct CudaConfig {
     utilization: Option<u32>,
     /// Yield the GPU to siblings when util exceeds the ceiling.
     yielding: Option<bool>,
+    #[serde(default)]
+    screen: screen_policy::ScreenToml,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -206,6 +316,7 @@ pub struct CudaSampler {
     device: CudaDevice,
     gov: UtilGovernor,
     kernel: KernelKind,
+    screen: Mutex<screen_policy::Selector>,
 }
 
 impl CudaSampler {
@@ -216,6 +327,7 @@ impl CudaSampler {
             device,
             gov,
             kernel,
+            screen: Mutex::new(screen_policy::Selector::default()),
         }
     }
 }
@@ -282,6 +394,14 @@ impl Sampler for CudaSampler {
             }
         };
         warn_unknown_fields("cuda", cfg.unknown.keys());
+        warn_unknown_fields(
+            "cuda",
+            cfg.screen.unknown.keys().map(|key| format!("screen.{key}")),
+        );
+        self.screen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reconfigure(&cfg.screen);
         // config over CLI (the governor holds the CLI-set values until now).
         let ceiling = config_override(
             "utilization",
@@ -296,6 +416,7 @@ impl Sampler for CudaSampler {
 #[cfg(test)]
 mod config_tests {
     use super::CudaConfig;
+    use crate::screen_policy::Selector;
     use proptest::prelude::*;
 
     #[test]
@@ -317,6 +438,41 @@ mod config_tests {
         assert!(cfg.utilization.is_none());
         assert!(cfg.yielding.is_none());
         assert!(cfg.unknown.is_empty());
+    }
+
+    #[test]
+    fn nested_screen_config_updates_live_values_and_collects_unknown_keys() {
+        let cfg: CudaConfig = toml::from_str(
+            "utilization = 60\n[screen]\nenabled = false\nkeep_denominator = 128\naudit_denominator = 0\nprobe_reads_log2 = 3\nprobe_sweeps = 1024\nprobe_sweep = 99\nnum_sweeps = 7",
+        ).unwrap();
+        assert_eq!(cfg.utilization, Some(60));
+        assert!(cfg.unknown.is_empty());
+        assert_eq!(
+            cfg.screen
+                .unknown
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["num_sweeps", "probe_sweep"]
+        );
+        let mut selector = Selector::with_seed(crate::screen_policy::ScreenConfig::default(), 7);
+        selector.reconfigure(&cfg.screen);
+        let live = selector.config();
+        assert!(!live.enabled);
+        assert_eq!((live.keep_denominator, live.audit_denominator), (128, 0));
+        assert_eq!(
+            (
+                live.params().reads_log2,
+                live.params().sweeps,
+                live.params().threads
+            ),
+            (3, 1024, 256)
+        );
+        let invalid: CudaConfig = toml::from_str("[screen]\nkeep_denominator = -1\naudit_denominator = 1000001\nprobe_reads_log2 = 6\nprobe_sweeps = 0").unwrap();
+        selector.reconfigure(&invalid.screen);
+        assert_eq!(selector.config(), live);
+        selector.reconfigure(&toml::from_str::<CudaConfig>("").unwrap().screen);
+        assert_eq!(selector.config(), live);
     }
 
     /// Parse path used by `apply_config` must never panic on arbitrary input.
@@ -378,7 +534,7 @@ mod config_tests {
             key in "[a-z][a-z0-9_]{0,15}",
             val in -1000i64..1000i64,
         )| {
-            prop_assume!(key != "utilization" && key != "yielding");
+            prop_assume!(key != "utilization" && key != "yielding" && key != "screen");
             let s = format!("{key} = {val}");
             let cfg: CudaConfig = toml::from_str(&s).expect("valid constructed toml");
             prop_assert!(

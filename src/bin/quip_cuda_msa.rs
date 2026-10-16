@@ -11,7 +11,7 @@ use quip_solver_cuda::bench::{run_bench, BenchAction};
 use quip_solver_cuda::capacity::{self, advertised_nodes, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
 use quip_solver_cuda::cuda_device::{device_label_mismatch, probe_msa_replica_words, CudaDevice};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
-use quip_solver_cuda::{cuda_msa_identity, CudaSampler, KernelKind};
+use quip_solver_cuda::{cuda_msa_identity, KernelKind, MsaSampler};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -114,7 +114,7 @@ fn main() -> ExitCode {
         // process opened. Taking it from the opened device means both
         // APIs name the same physical GPU by construction.
         let gov = UtilGovernor::start(&device.pci_bus_id, cli.utilization, cli.yielding);
-        Ok(CudaSampler::new(device, gov, KernelKind::Msa))
+        Ok(MsaSampler::new(device, gov))
     })
 }
 

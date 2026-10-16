@@ -21,6 +21,7 @@ use std::process::{Command, Stdio};
 const SA_SRC: &str = include_str!("../kernels/sa.cu");
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
+const SCREEN_SRC: &str = include_str!("../kernels/screen.cu");
 
 /// Reports whether the caller must return without testing anything, and says
 /// so on stderr when it does.
@@ -133,6 +134,8 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
                 quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
                 &["-DQUIP_MSA_WEIGHTED", "-DQUIP_MSA_LANE_F32"][..],
             ),
+            // The screen sizes its shared memory per launch; the node define is unused.
+            ("screen", SCREEN_SRC, 0, &[][..]),
         ] {
             if let Err(e) = compile_and_assemble(name, src, nodes, arch, defines) {
                 failures.push(e);

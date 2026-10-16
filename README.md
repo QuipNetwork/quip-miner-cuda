@@ -9,7 +9,7 @@ Each process binds one CUDA device (`--device N`) and drives it directly.
 The coordinator takes N from the `[cuda.N]` config section and passes it as
 `--device N`. The miner warns at startup when its `cuda-N` label and `--device`
 disagree, and the label never overrides the flag.
-Kernels (`kernels/sa.cu`, `kernels/msa.cu`, `kernels/gibbs.cu`) are JIT-compiled via NVRTC at
+Solver kernels and the lease probe (`kernels/screen.cu`) are JIT-compiled via NVRTC at
 runtime through `cudarc`'s `dynamic-loading` feature. **Building this crate
 does not require the CUDA toolkit.** Running the binaries needs a CUDA GPU
 and driver.
@@ -117,7 +117,7 @@ in `quip-solver-cpu`'s `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer,
 two words. The Metropolis test is an integer comparison against a per-rung
 threshold table. Spins update one color class at a time, with the same greedy
 coloring the Gibbs kernel uses. One block anneals one problem in shared
-memory. The device computes no energies. The host rescores every sample with
+memory. The full MSA kernel computes no energies. The host rescores every sample with
 `energy_milli`, so results are consensus-scored like the other kernels.
 
 The unit kernel uses couplings and fields by sign. Consensus problems have
@@ -148,6 +148,45 @@ Two host-side changes came with it and apply to `quip-cuda-sa` too:
 * **Parallel scoring.** The host rescores downloaded samples on `QUIP_SCORE_THREADS`
   threads (default 4). With one thread the sampler capped a fast kernel at
   about 20 jobs per second and left the GPU idle between batches.
+
+## Lease screening (`quip-cuda-msa`)
+
+MSA accepts coordinator salt leases and screens each salt before a full solve.
+By default, the probe draws couplings on the device with ChaCha8 and runs
+4 reads for 512 sweeps. An adaptive energy cutoff keeps about 1 in 16 salts.
+Probe target hits always proceed. The miner also audits about 1 in 200 rejects.
+Kept and audited salts receive a full MSA solve with exact host scoring.
+
+The probe requires zero fields, both −1000 and +1000 milli couplings, degree
+at most 20, and a topology that fits the device's shared memory.
+Other supported models use Direct mode, which fully solves every salt.
+This includes weighted models and the production topology on Turing's 64 KB budget.
+SA and Gibbs solve jobs sent by the coordinator.
+
+Plain stream sessions do not take the lease turn. A sustained full-width plain
+stream on the same device can delay a lease probe and its cancellation until
+the plain session drains.
+
+The coordinator supplies these keys in the miner configuration:
+
+| `[screen]` key | Default | Accepted values |
+| --- | --- | --- |
+| `enabled` | `true` | `true` or `false`. Set `false` for Direct mode. |
+| `keep_denominator` | `16` | 2–100,000. Target keep fraction is 1/value. |
+| `audit_denominator` | `200` | 0 or 2–1,000,000. Audit fraction of rejects is 1/value. Zero disables audits. |
+| `probe_reads_log2` | `2` | 2–5, for 4–32 reads. |
+| `probe_sweeps` | `512` | 1–2048. |
+
+Invalid numeric values log an error and keep the previous value.
+Audits observe full-solve quality but do not adjust the cutoff.
+
+On an RTX A4000 with Aglais, a ten-minute trial found 6.7 times as many
+target hits per second as Direct mode. Direct shared the GPU late in that trial.
+The first eight minutes gave a ratio of 6.2.
+See the [calibration and session results](docs/perf/2026-10-cuda-lease-screen.md) for methods and limits.
+
+The probe kernel comes from rdyplayerB's
+[QuipNetwork/quip-solver-cuda#1](https://github.com/QuipNetwork/quip-solver-cuda/pull/1).
 
 ## Sharing the graphics processor
 
@@ -245,6 +284,10 @@ temperature loses core clock, and that loss looks like a software decay.
 cargo test --release                       # host-only tests
 cargo test --release -- --include-ignored  # adds the CUDA-device tests
 ```
+
+The ten-minute `pipeline::whole_pipeline` benchmark skips unless `LEASE_PIPELINE_OUT`
+names a directory that contains `corpus-4096.csv` from the
+[lease screen calibration](docs/perf/2026-10-cuda-lease-screen.md).
 
 `tests/arch_coverage.rs` needs the pinned CUDA 12.9 toolkit, so it skips unless
 the environment sets `CI`. Run it with `make test-archs`, which supplies both
