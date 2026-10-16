@@ -54,6 +54,7 @@ impl Moments {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn skew(&self) -> f64 {
         if self.m2 <= 0.0 {
             0.0
@@ -62,6 +63,7 @@ impl Moments {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn excess_kurtosis(&self) -> f64 {
         if self.m2 <= 0.0 {
             0.0
@@ -278,6 +280,7 @@ impl Cutoff {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn moments(&self) -> &Moments {
         &self.moments
     }
@@ -339,6 +342,7 @@ impl Cutoff {
     }
 
     /// Halve the denominator, down to the loosest clamp.
+    #[cfg(test)]
     pub(crate) fn loosen_step(&mut self) -> f64 {
         let before = self.loosen;
         self.loosen = (self.loosen * 0.5).max(self.cfg.keep_min / self.cfg.keep_max);
@@ -346,21 +350,25 @@ impl Cutoff {
     }
 
     /// Undo only the effective factor returned by [`Self::loosen_step`].
+    #[cfg(test)]
     pub(crate) fn restore_step(&mut self, factor: f64) {
         self.loosen = (self.loosen / factor).min(1.0);
     }
 
     /// Give the Gaussian anchor more weight for longer.
+    #[cfg(test)]
     pub(crate) fn double_k0(&mut self) {
         self.cfg.k0 *= 2.0;
     }
 
     /// Current load integral, used by the relay's idle-error decay.
+    #[cfg(test)]
     pub(crate) fn log_adjust(&self) -> f64 {
         self.log_adjust
     }
 
     /// Load layer: positive `error` tightens, negative loosens.
+    #[cfg(test)]
     pub(crate) fn load_update(&mut self, error: f64, gain: f64) {
         let c = &self.cfg;
         let lo = (c.keep_min / c.keep).ln();

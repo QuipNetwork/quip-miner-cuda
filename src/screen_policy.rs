@@ -102,6 +102,8 @@ pub(crate) enum Decision {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct SelectorKey {
     topology_hash: Vec<u8>,
+    num_nodes: usize,
+    edges: std::sync::Arc<[(usize, usize)]>,
     allowed_h: Vec<i32>,
     allowed_j: Vec<i32>,
     reads_log2: u32,
@@ -116,6 +118,8 @@ impl SelectorKey {
     ) -> Self {
         Self {
             topology_hash: hash.to_vec(),
+            num_nodes: topology.num_nodes,
+            edges: topology.edges.clone().into(),
             allowed_h: topology.allowed_h_milli.clone(),
             allowed_j: topology.allowed_j_milli.clone(),
             reads_log2: params.reads_log2,
@@ -347,12 +351,14 @@ mod tests {
         let mut selector = Selector::with_seed(no_audits(), 7);
         let original = key();
         warm(&mut selector, &original);
-        let mut variants = vec![original.clone(); 5];
+        let mut variants = vec![original.clone(); 7];
         variants[0].topology_hash[0] ^= 1;
         variants[1].allowed_h.push(1000);
         variants[2].allowed_j.reverse();
         variants[3].reads_log2 = 3;
         variants[4].sweeps = 1024;
+        variants[5].num_nodes += 1;
+        std::sync::Arc::make_mut(&mut variants[6].edges).swap(0, 1);
         for variant in variants {
             assert_eq!(selector.decide(&variant, -100, None), Decision::Reject);
         }

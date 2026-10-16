@@ -24,31 +24,17 @@ pub mod cuda_device;
 // and its probability midpoint stays in [0, 1]. Keep its exact-value tests.
 #[allow(clippy::cast_precision_loss, clippy::manual_midpoint)]
 #[cfg_attr(test, allow(clippy::float_cmp))]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Keep the copied cutoff API until lease integration"
-    )
-)]
 mod cutoff;
 pub mod driver_budget;
 mod jit_cache;
 pub mod kernel;
-#[expect(dead_code, reason = "Task 4 wires FIFO turns into sample_lease")]
+mod lease;
 mod lease_turn;
 pub mod nsight;
 pub mod nvml_gov;
 pub mod sampler;
 pub mod schema;
 pub mod screen;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 4 consumes the screen policy in sample_lease"
-    )
-)]
 mod screen_policy;
 mod stream_pool;
 pub mod streaming;
@@ -68,6 +54,104 @@ use quip_solver_core::{
 };
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
+
+/// MSA sampler with backend-owned salt leases and ordinary CUDA job handling.
+pub struct MsaSampler {
+    inner: CudaSampler,
+    turns: lease_turn::LeaseTurns,
+    logged_modes: Mutex<std::collections::HashSet<screen_policy::SelectorKey>>,
+}
+
+impl MsaSampler {
+    /// Bind an MSA device and governor. Lease turns share this device.
+    #[must_use]
+    pub fn new(device: CudaDevice, gov: UtilGovernor) -> Self {
+        Self {
+            inner: CudaSampler::new(device, gov, KernelKind::Msa),
+            turns: lease_turn::LeaseTurns::default(),
+            logged_modes: Mutex::default(),
+        }
+    }
+}
+
+impl Sampler for MsaSampler {
+    fn generates_locally() -> bool {
+        true
+    }
+
+    fn sample_lease(
+        &self,
+        lease: &quip_solver_core::Lease,
+        topology: &quip_solver_core::TopologyView,
+        params: &SampleParams,
+        sink: &quip_solver_core::LeaseSink,
+    ) -> Result<(), SampleError> {
+        lease::sample(self, lease, topology, params, sink)
+    }
+
+    fn sample(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        self.inner.sample(graph, params)
+    }
+
+    fn sample_stream(
+        &self,
+        jobs: tokio::sync::mpsc::Receiver<StreamJob>,
+        out: tokio::sync::mpsc::Sender<StreamResult>,
+        cancel: CancelToken,
+    ) {
+        self.inner.sample_stream(jobs, out, cancel);
+    }
+
+    fn accepts_warm_start() -> bool {
+        CudaSampler::accepts_warm_start()
+    }
+
+    fn sample_warm(
+        &self,
+        graph: &IsingGraph,
+        params: &SampleParams,
+        warm: &quip_solver_core::WarmStart,
+    ) -> Result<Vec<SamplerResult>, SampleError> {
+        self.inner.sample_warm(graph, params, warm)
+    }
+
+    fn sample_stream_warm(
+        &self,
+        jobs: tokio::sync::mpsc::Receiver<quip_solver_core::WarmStreamJob>,
+        out: tokio::sync::mpsc::Sender<StreamResult>,
+        cancel: CancelToken,
+    ) {
+        self.inner.sample_stream_warm(jobs, out, cancel);
+    }
+
+    fn stream_width(&self) -> usize {
+        self.inner.stream_width()
+    }
+
+    fn declared_stream_width() -> u32 {
+        CudaSampler::declared_stream_width()
+    }
+
+    fn utilization(&self) -> f64 {
+        self.inner.utilization()
+    }
+
+    fn should_throttle(&self) -> bool {
+        self.inner.should_throttle()
+    }
+
+    fn max_reads(&self) -> u32 {
+        self.inner.max_reads()
+    }
+
+    fn apply_config(&self, backend_toml: &str) {
+        self.inner.apply_config(backend_toml);
+    }
+}
 
 const DEFAULT_MAX_EDGES: u32 = 1_000_000;
 

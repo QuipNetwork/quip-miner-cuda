@@ -76,6 +76,13 @@ async fn quip_cuda_msa_passes_conformance() {
     );
     let report = drive_miner(&miner, &format!("unix://{socket}")).await;
     assert!(report.is_conformant(), "{}", report.summary());
+    let lease = report.lease.as_ref().expect("MSA advertises salt leases");
+    assert_eq!(
+        lease.results_verified, 4,
+        "the nonzero-field lease uses Direct"
+    );
+    assert_eq!(lease.lease_done.map(|(salts, _)| salts), Some(4));
+    assert!(lease.credit_refunded);
 }
 
 #[tokio::test]
