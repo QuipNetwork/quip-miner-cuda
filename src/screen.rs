@@ -10,17 +10,16 @@
 //! (`kernels/screen.cu`). Couplings are drawn on the device from each nonce
 //! with the protocol's `ChaCha8` draw and scored on the device, so the host only
 //! derives nonces and reads back one energy per lane. [`reference_masks`] and
-//! [`reference_energy`] are the protocol-side references `quip-screen verify`
-//! checks the device against.
+//! [`reference_energy`] are the protocol-side references used by
+//! `tests/screen_gpu.rs` to check the device.
 
-use crate::cuda_device::select_arch;
+use crate::cuda_device::{select_arch, CudaDevice};
+use crate::stream_pool::SessionStreams;
 use crate::streaming::build_beta_schedule;
 use crate::topology::SelfFeedingTopology;
 use crate::IsingGraph;
 use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute_enum};
-use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
-};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use quip_solver_core::BetaSchedule;
 use std::sync::Arc;
@@ -207,7 +206,7 @@ impl Default for ScreenParams {
 }
 
 /// One loaded probe screen: a compiled kernel and device-resident topology.
-pub struct Screen {
+pub struct Screen<'a> {
     stream: Arc<CudaStream>,
     func: CudaFunction,
     d_adj: CudaSlice<u32>,
@@ -228,6 +227,8 @@ pub struct Screen {
     groups: u32,
     shared: u32,
     params: ScreenParams,
+    // Return the pair only after all device buffers have queued their frees.
+    _streams: SessionStreams<'a>,
 }
 
 /// Device output of one launch.
@@ -240,14 +241,15 @@ pub struct ScreenRun {
     pub group0_debug: Option<(Vec<u32>, Vec<u32>)>,
 }
 
-impl Screen {
-    /// Compile the kernel for `device` and upload the topology and schedule.
+impl<'a> Screen<'a> {
+    /// Compile on an open device and upload the topology and schedule.
+    /// Uses a pair from the device stream pool for the lifetime of the screen.
     ///
     /// # Errors
     /// Bad parameters, a device without enough shared memory per block, or a
     /// compile or driver failure.
     pub fn open(
-        device: usize,
+        device: &'a CudaDevice,
         topo: &ScreenTopology,
         params: ScreenParams,
     ) -> Result<Self, ScreenError> {
@@ -264,8 +266,7 @@ impl Screen {
                 "sweeps and waves must be positive".into(),
             ));
         }
-        let ctx = CudaContext::new(device)?;
-        let stream = ctx.default_stream();
+        let ctx = &device.ctx;
         let cc = ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?
             * 10
             + ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
@@ -281,7 +282,11 @@ impl Screen {
         let need = topo.shared_bytes();
         // The kernel's static `lane_count[32]` shares the same budget.
         if need + 128 > have {
-            return Err(ScreenError::SharedMemory { need, have, device });
+            return Err(ScreenError::SharedMemory {
+                need,
+                have,
+                device: device.device_index,
+            });
         }
         let opts = CompileOptions {
             use_fast_math: Some(true),
@@ -318,6 +323,8 @@ impl Screen {
         let to_i32 = |v: usize, what: &str| {
             i32::try_from(v).map_err(|_| ScreenError::Param(format!("{what} does not fit i32")))
         };
+        let streams = device.stream_pool.take();
+        let stream = Arc::clone(&streams.compute);
         Ok(Self {
             d_adj: stream.clone_htod(&topo.adj)?,
             d_color_starts: stream.clone_htod(&topo.color_starts)?,
@@ -339,6 +346,7 @@ impl Screen {
             params,
             stream,
             func,
+            _streams: streams,
         })
     }
 

@@ -1,11 +1,9 @@
 //! CUDA Ising samplers.
 //!
-//! Four binaries share this library:
+//! Three binaries share this library:
 //! - `quip-cuda-sa` — Metropolis simulated annealing on one GPU
 //! - `quip-cuda-msa` — multi-spin coded simulated annealing, 64 reads per word
 //! - `quip-cuda-gibbs` — single-site heat-bath Gibbs on one GPU
-//! - `quip-screen` — nonce-parallel probe screen that ranks `PoW` nonces for the
-//!   coordinator (see [`screen`])
 //!
 //! Kernels are the v0.2 self-feeding persistent kernels (`GPU/cuda_sa.cu` /
 //! `GPU/cuda_gibbs.cu`, copied verbatim into `kernels/`): a kernel-side
