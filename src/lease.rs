@@ -511,6 +511,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUDA device 0"]
+    #[serial_test::serial]
     fn blocked_push_does_not_prevent_device_session_retirement() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let device = crate::cuda_device::CudaDevice::open(0).unwrap();
