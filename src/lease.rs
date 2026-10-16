@@ -4,7 +4,7 @@ use crate::screen::{Screen, ScreenDomain, ScreenError, ScreenParams};
 use crate::screen_policy::{Decision, SelectorKey};
 use crate::{streaming, CudaSampler, IsingGraph, KernelKind, MsaSampler, SampleParams};
 use quip_solver_core::{
-    CancelToken, Lease, LeaseSink, SampleError, Sampler, StreamJob, StreamOutcome, StreamResult,
+    CancelToken, Lease, LeaseSink, SampleError, StreamJob, StreamOutcome, StreamResult,
     TopologyView,
 };
 use std::collections::BTreeMap;
@@ -274,6 +274,7 @@ fn work(
                 return Ok(());
             }
         }
+        tracing::debug!(start, end, "CUDA lease chunk finished");
         start = end;
     }
     Ok(())
@@ -291,7 +292,7 @@ fn full_solve(
     pushed: &mut u64,
 ) -> Result<bool, SampleError> {
     let (job_tx, job_rx) = channel(pending.len());
-    let (out_tx, out_rx) = channel(sampler.stream_width().max(1));
+    let batch_len = pending.len();
     let edges: Arc<[(usize, usize)]> = topology.edges.clone().into();
     for &index in pending.keys() {
         if sink.is_stopped() {
@@ -314,17 +315,52 @@ fn full_solve(
     }
     // Closing intake lets even a sparse finite batch skip the cold-start timeout.
     drop(job_tx);
+    run_full_batch(
+        sampler,
+        job_rx,
+        batch_len,
+        || sink.is_stopped(),
+        |out, cancel| report(sampler, sink, key, pending, out, cancel, pushed),
+    )
+}
+
+fn run_full_batch(
+    sampler: &CudaSampler,
+    jobs: Receiver<StreamJob>,
+    batch_len: usize,
+    stopped: impl Fn() -> bool + Sync,
+    report: impl FnOnce(Receiver<StreamResult>, &CancelToken) -> Result<bool, SampleError> + Send,
+) -> Result<bool, SampleError> {
+    // One result per job fits even while the reporter is blocked in core.
+    let (out_tx, out_rx) = channel(batch_len);
     let cancel = CancelToken::default();
     std::thread::scope(|scope| {
-        let reporter = scope.spawn(|| report(sampler, sink, key, pending, out_rx, &cancel, pushed));
+        let reporter = scope.spawn(|| report(out_rx, &cancel));
+        let (session_done, retired) = std::sync::mpsc::channel::<()>();
+        let cancel_ref = &cancel;
+        let stop_ref = &stopped;
+        let watcher = scope.spawn(move || loop {
+            if stop_ref() {
+                cancel_ref.cancel_through(1);
+                break;
+            }
+            match retired.recv_timeout(Duration::from_millis(10)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        });
         streaming::run_stream(
             &sampler.device,
             KernelKind::Msa,
-            job_rx,
+            jobs,
             out_tx,
             cancel.clone(),
             &sampler.gov,
         );
+        drop(session_done);
+        watcher
+            .join()
+            .map_err(|_| fault("lease stop watcher panicked"))?;
         reporter
             .join()
             .map_err(|_| fault("lease reporter panicked"))?
@@ -360,6 +396,11 @@ fn report(
             Ok(None) => break,
             Err(_) => continue,
         };
+        stopped |= sink.is_stopped();
+        if stopped || failure.is_some() {
+            // Keep draining after a stop, but never publish remaining results.
+            continue;
+        }
         let mapped = take_decision(&mut pending, &result.job_id);
         let completed = match (mapped, result.outcome) {
             (Ok((index, decision)), StreamOutcome::Completed(Ok(reads))) => {
@@ -386,6 +427,9 @@ fn report(
                 cancel.cancel_through(1);
                 continue;
             }
+            // Core's blocking push cannot be interrupted. The independent
+            // watcher retires the device session on stop, but the lease thread
+            // can still wait for an in-flight push to return.
             if sink.push(index, reads).is_err() {
                 stopped = true;
                 cancel.cancel_through(1);
@@ -416,6 +460,81 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quip_solver_core::Sampler;
+
+    #[test]
+    #[ignore = "requires CUDA device 0"]
+    fn blocked_push_does_not_prevent_device_session_retirement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let device = crate::cuda_device::CudaDevice::open(0).unwrap();
+        let gov = crate::nvml_gov::UtilGovernor::start(&device.pci_bus_id, 100, false);
+        let sampler = CudaSampler::new(device, gov, KernelKind::Msa);
+        let count = sampler.stream_width() * 3;
+        let (jobs, incoming) = channel(count);
+        let n = 1024;
+        for index in 0..count {
+            jobs.try_send(StreamJob {
+                job_id: index.to_le_bytes().to_vec(),
+                graph: IsingGraph::new(
+                    vec![0.0; n],
+                    vec![1.0; n],
+                    (0..n).map(|i| (i, (i + 1) % n)).collect(),
+                ),
+                params: SampleParams {
+                    num_reads: 64,
+                    num_sweeps: if index == 0 { 32 } else { 20_000_000 },
+                    ..SampleParams::default()
+                },
+                watermark: Some(1),
+            })
+            .unwrap();
+        }
+        drop(jobs);
+        let stopped = AtomicBool::new(false);
+        let (pushing, push_started) = std::sync::mpsc::channel();
+        let (_release, blocked_push) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                run_full_batch(
+                    &sampler,
+                    incoming,
+                    count,
+                    || stopped.load(Ordering::Acquire),
+                    move |mut results, cancel| {
+                        let first = results.blocking_recv().expect("first solve");
+                        assert!(matches!(first.outcome, StreamOutcome::Completed(Ok(_))));
+                        pushing.send(()).unwrap();
+                        // Simulate a core push that cannot return for five seconds.
+                        assert!(blocked_push.recv_timeout(Duration::from_secs(5)).is_err());
+                        let retired = results.is_closed();
+                        // Always unblock the old implementation after the assertion
+                        // snapshot, so a regression fails without leaving GPU work.
+                        cancel.cancel_through(1);
+                        let mut received = 1;
+                        let mut cancelled = 0;
+                        while let Some(result) = results.blocking_recv() {
+                            received += 1;
+                            if matches!(result.outcome, StreamOutcome::Cancelled) {
+                                cancelled += 1;
+                            }
+                        }
+                        assert!(retired, "run_stream must return while push is blocked");
+                        assert_eq!(
+                            received, count,
+                            "every local job can retire without a receiver"
+                        );
+                        assert!(cancelled > 0, "stop must abandon the long full solves");
+                        Ok(true)
+                    },
+                )
+            });
+            let started = push_started.recv_timeout(Duration::from_secs(30));
+            stopped.store(true, Ordering::Release);
+            let outcome = worker.join();
+            started.expect("first solve reaches the blocked push");
+            assert!(outcome.unwrap().unwrap());
+        });
+    }
 
     #[test]
     fn chunks_cover_the_remaining_range_and_target_two_widths() {
