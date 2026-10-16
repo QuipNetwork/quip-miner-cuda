@@ -22,6 +22,7 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
+use quip_solver_core::BetaSchedule;
 use std::sync::Arc;
 
 const SCREEN_SRC: &str = include_str!("../kernels/screen.cu");
@@ -300,8 +301,14 @@ impl Screen {
             i32::try_from(need).map_err(|_| ScreenError::Param("shared memory size".into()))?,
         )?;
 
-        let (schedule, sweeps_per_beta) =
-            build_beta_schedule(&topo.unit_graph, params.sweeps, 1, None);
+        let (schedule, sweeps_per_beta) = build_beta_schedule(
+            &topo.unit_graph,
+            params.sweeps,
+            1,
+            None,
+            BetaSchedule::Geometric,
+            1.0,
+        );
         let cut = cut_table(&schedule);
         let groups = sms
             .checked_mul(params.waves)

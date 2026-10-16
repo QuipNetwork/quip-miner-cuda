@@ -14,7 +14,7 @@
 //! chain's order, because the nonce draw assigns couplings in that order.
 
 use clap::{Parser, Subcommand};
-use quip_miner_cuda::screen::{
+use quip_solver_cuda::screen::{
     reference_energy, reference_masks, Screen, ScreenParams, ScreenTopology,
 };
 use std::collections::HashMap;
