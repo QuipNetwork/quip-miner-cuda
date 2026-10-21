@@ -305,14 +305,28 @@ __device__ __forceinline__ int count_satisfied(
 }
 #else
 // Per-lane Metropolis test of the weighted kernel, with this spin's draw.
+// arm() turns the draw into the threshold. The accept functions call it after
+// they load the neighbour words, so the threshold lookup issues in the same
+// order as in the single-pass kernel.
 struct LaneTest {
+    u64 draw;
 #ifdef QUIP_MSA_LANE_I32
     long long rung_beta;
     int rung_cut;
+    const long long* neglog_table;
     long long bound;
+
+    __device__ __forceinline__ void arm() {
+        bound = __ldg(&neglog_table[draw & NEGLOG_MASK]);
+    }
 #else
     float beta;
     float u;
+
+    __device__ __forceinline__ void arm() {
+        // 23 bits keep k + 0.5f exact, so u never reaches 1.0f.
+        u = ((float)(draw >> 41) + 0.5f) * 1.1920929e-7f;
+    }
 #endif
 
     __device__ __forceinline__ bool ok(int field, u64 bi, int lane) const {
@@ -325,63 +339,48 @@ struct LaneTest {
     }
 };
 
-// Accept mask of spin `var`, word `w`. A spin of degree <= MSA_CHUNK keeps
-// its neighbour words in registers, as the single-pass kernel did. A denser
-// spin sums per-lane fields chunk by chunk into a local array; integer sums
-// are exact in any order, so the result does not depend on the chunking.
+// Accept mask of a spin denser than MSA_CHUNK. Lanes go in groups of
+// MSA_LANE_GROUP, whose partial fields stay in registers while the neighbour
+// words are reloaded chunk by chunk for each group. Integer sums are exact in
+// any order, so the result does not depend on the chunking. Only spins denser
+// than MSA_CHUNK come here; the others take the single-pass code in
+// anneal_model, whose neighbour words stay in registers.
+#define MSA_LANE_GROUP 8
 template <bool SPILL>
-__device__ __forceinline__ u64 weighted_accept(
-    const MsaModel& mdl, const SpinStore<SPILL>& st,
-    u64 bi, int w, int pstart, int pend, int h, const LaneTest& test) {
+__device__ __forceinline__ u64 weighted_accept_dense(
+    const int* col_ind, const msa_coef_t* J, const SpinStore<SPILL>& st,
+    u64 bi, int w, int pstart, int pend, int h, LaneTest test) {
     u64 accept = 0ull;
-    if (pend - pstart <= MSA_CHUNK) {
-        int jj[MSA_CHUNK];
-        u64 sw[MSA_CHUNK];
+    for (int lane0 = 0; lane0 < 64; lane0 += MSA_LANE_GROUP) {
+        int field[MSA_LANE_GROUP];
         #pragma unroll
-        for (int q = 0; q < MSA_CHUNK; ++q) {
-            int p = pstart + q;
-            bool ok = p < pend;
-            int nb = ok ? __ldg(&mdl.csr_col_ind[p]) : 0;
-            jj[q] = ok ? (int)__ldg(&mdl.J[p]) : 0;
-            sw[q] = st.at(nb, w);
+        for (int l = 0; l < MSA_LANE_GROUP; ++l) {
+            field[l] = h;
         }
-        for (int lane = 0; lane < 64; ++lane) {
-            int field = h;
+        for (int base = pstart; base < pend; base += MSA_CHUNK) {
+            int jj[MSA_CHUNK];
+            u64 sw[MSA_CHUNK];
             #pragma unroll
             for (int q = 0; q < MSA_CHUNK; ++q) {
-                // Spin bit 1 is -1. Missing neighbours have J = 0.
-                field += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
+                int p = base + q;
+                bool ok = p < pend;
+                int nb = ok ? __ldg(&col_ind[p]) : 0;
+                jj[q] = ok ? (int)__ldg(&J[p]) : 0;
+                sw[q] = st.at(nb, w);
             }
-            accept |= (u64)test.ok(field, bi, lane) << lane;
-        }
-        return accept;
-    }
-    int field[64];
-    for (int lane = 0; lane < 64; ++lane) {
-        field[lane] = h;
-    }
-    for (int base = pstart; base < pend; base += MSA_CHUNK) {
-        int jj[MSA_CHUNK];
-        u64 sw[MSA_CHUNK];
-        #pragma unroll
-        for (int q = 0; q < MSA_CHUNK; ++q) {
-            int p = base + q;
-            bool ok = p < pend;
-            int nb = ok ? __ldg(&mdl.csr_col_ind[p]) : 0;
-            jj[q] = ok ? (int)__ldg(&mdl.J[p]) : 0;
-            sw[q] = st.at(nb, w);
-        }
-        for (int lane = 0; lane < 64; ++lane) {
-            int sum = 0;
             #pragma unroll
-            for (int q = 0; q < MSA_CHUNK; ++q) {
-                sum += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
+            for (int l = 0; l < MSA_LANE_GROUP; ++l) {
+                #pragma unroll
+                for (int q = 0; q < MSA_CHUNK; ++q) {
+                    field[l] += ((sw[q] >> (lane0 + l)) & 1ull) ? -jj[q] : jj[q];
+                }
             }
-            field[lane] += sum;
         }
-    }
-    for (int lane = 0; lane < 64; ++lane) {
-        accept |= (u64)test.ok(field[lane], bi, lane) << lane;
+        test.arm();
+        #pragma unroll
+        for (int l = 0; l < MSA_LANE_GROUP; ++l) {
+            accept |= (u64)test.ok(field[l], bi, lane0 + l) << (lane0 + l);
+        }
     }
     return accept;
 }
@@ -470,21 +469,68 @@ __device__ __forceinline__ bool anneal_model(
                     int h = __ldg(&mdl.h[var]);
 
 #ifdef QUIP_MSA_WEIGHTED
+                    if (pend - pstart > MSA_CHUNK) {
+                        LaneTest test;
+                        test.draw = splitmix64(
+                            mdl.slot_seed ^ ((u64)beta_idx << 40)
+                            ^ ((u64)sweep << 20) ^ (u64)var);
+#ifdef QUIP_MSA_LANE_I32
+                        test.rung_beta = rung_beta;
+                        test.rung_cut = rung_cut;
+                        test.neglog_table = mdl.neglog_table;
+#else
+                        test.beta = beta;
+#endif
+                        u64 bi = st.at(var, w);
+                        st.at(var, w) = bi ^ weighted_accept_dense<SPILL>(
+                            mdl.csr_col_ind, mdl.J, st, bi, w, pstart, pend, h, test);
+                        continue;
+                    }
+                    // Prefetch every neighbour index and coupling before
+                    // touching spin state.
+                    int nb[MSA_CHUNK];
+                    int jj[MSA_CHUNK];
+                    #pragma unroll
+                    for (int q = 0; q < MSA_CHUNK; ++q) {
+                        int p = pstart + q;
+                        bool ok = p < pend;
+                        nb[q] = ok ? __ldg(&mdl.csr_col_ind[p]) : 0;
+                        jj[q] = ok ? (int)__ldg(&mdl.J[p]) : 0;
+                    }
+
                     u64 bi = st.at(var, w);
+                    u64 sw[MSA_CHUNK];
+                    #pragma unroll
+                    for (int q = 0; q < MSA_CHUNK; ++q) {
+                        sw[q] = st.at(nb[q], w);
+                    }
                     const u64 draw = splitmix64(
                         mdl.slot_seed ^ ((u64)beta_idx << 40)
                         ^ ((u64)sweep << 20) ^ (u64)var);
-                    LaneTest test;
 #ifdef QUIP_MSA_LANE_I32
-                    test.rung_beta = rung_beta;
-                    test.rung_cut = rung_cut;
-                    test.bound = __ldg(&mdl.neglog_table[draw & NEGLOG_MASK]);
+                    const long long bound = __ldg(&mdl.neglog_table[draw & NEGLOG_MASK]);
 #else
-                    test.beta = beta;
                     // 23 bits keep k + 0.5f exact, so u never reaches 1.0f.
-                    test.u = ((float)(draw >> 41) + 0.5f) * 1.1920929e-7f;
+                    const float u = ((float)(draw >> 41) + 0.5f) * 1.1920929e-7f;
 #endif
-                    st.at(var, w) = bi ^ weighted_accept(mdl, st, bi, w, pstart, pend, h, test);
+                    u64 accept = 0ull;
+                    for (int lane = 0; lane < 64; ++lane) {
+                        int field = h;
+                        #pragma unroll
+                        for (int q = 0; q < MSA_CHUNK; ++q) {
+                            // Spin bit 1 is -1. Missing neighbours have J = 0.
+                            field += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
+                        }
+                        const int de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
+#ifdef QUIP_MSA_LANE_I32
+                        const bool ok = de <= 0
+                            || (de <= rung_cut && (long long)de * rung_beta < bound);
+#else
+                        const bool ok = de <= 0 || u < __expf(-beta * (float)de);
+#endif
+                        accept |= (u64)ok << lane;
+                    }
+                    st.at(var, w) = bi ^ accept;
 #else
                     u64 bi = st.at(var, w);
                     u64 planes[MSA_PLANES];
