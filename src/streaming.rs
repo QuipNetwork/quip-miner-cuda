@@ -1739,9 +1739,9 @@ fn timing_event(device: &CudaDevice) -> Result<CudaEvent, SampleError> {
         .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?)
 }
 
-/// Poll `sess`'s first `num_nonces` ctrl mailboxes until all are `SLOT_COMPLETE`, returning the host
-/// wall time spent waiting. Extracted from [`bench_many`] to keep it under the
-/// crate's complexity cap.
+/// Poll `sess`'s first `num_nonces` ctrl mailboxes until all are
+/// `SLOT_COMPLETE`, returning the host wall time spent waiting. Extracted from
+/// [`bench_many`] to keep it under the crate's complexity cap.
 fn poll_until_complete(
     sess: &SelfFeedingSession<'_>,
     num_nonces: usize,
@@ -1790,7 +1790,8 @@ pub fn bench_one(
 }
 
 /// [`bench_one`] with `num_nonces` blocks annealing the same model at once,
-/// one per SM, the way a mining session fills the device. Only nonce 0's
+/// one model per nonce, up to the device's stream width (its SMs divided by
+/// the SMs each nonce uses), the way a mining session fills the device. Only nonce 0's
 /// reads are downloaded and scored, so host time does not grow with
 /// `num_nonces`.
 ///
@@ -1862,7 +1863,7 @@ pub fn bench_many(
     sess.stream_transfer.synchronize()?; // commit setup before timing the launch
     let upload_ns = ms_to_ns(up0.elapsed_ms(&up1)?);
 
-    // --- Timed launch on the compute stream (one model, then kernel returns). ---
+    // --- Timed launch on the compute stream (every nonce one model, then the kernel returns). ---
     let k0 = timing_event(device)?;
     let k1 = timing_event(device)?;
     let seed = kernel_seed(params.seed);

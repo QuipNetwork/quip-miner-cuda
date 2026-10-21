@@ -36,8 +36,8 @@ fn derives_per_sweep_by_cancelling_fixed_overhead() {
 fn parses_ncu_metrics() {
     let m = parse_ncu_csv(NCU).unwrap();
     assert_eq!(m.len(), 1);
-    assert!(m[0].sm_efficiency_pct > 0.0);
-    assert!(m[0].achieved_occupancy_pct > 0.0);
+    assert!(m[0].sm_efficiency_pct.unwrap() > 0.0);
+    assert!(m[0].achieved_occupancy_pct.unwrap() > 0.0);
     assert!(m[0].duration_ns > 0);
 }
 
@@ -154,4 +154,6 @@ fn parses_cache_and_dram_metrics_when_present() {
     assert_eq!(rows[0].l2_hit_rate_pct, Some(42.5));
     assert_eq!(rows[0].l1_hit_rate_pct, Some(80.0));
     assert_eq!(rows[0].dram_throughput_pct, Some(61.0));
+    assert_eq!(rows[0].sm_efficiency_pct, None);
+    assert_eq!(rows[0].achieved_occupancy_pct, None);
 }

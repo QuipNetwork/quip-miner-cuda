@@ -1,6 +1,6 @@
 //! `bench` subcommand: isolated single-model timing + unified JSON emission.
 //!
-//! Runs the isolated single-shot launch path ([`crate::streaming::bench_one`])
+//! Runs the isolated single-shot launch path ([`crate::streaming::bench_many`])
 //! over a config grid, folds host-seam and CUDA-event timings into the
 //! locked-schema [`crate::schema::BenchRecord`], and (optionally, via `bench
 //! fold`) folds an external Nsight report ([`crate::nsight`]) into an
@@ -123,13 +123,13 @@ pub struct RunArgs {
     pub nodes: u64,
     /// Neighbours per node of the synthetic circulant graph (even, at least 2).
     /// Node i links to i+1 ..= i+degree/2 (mod n). The default 2 is a ring.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, conflicts_with = "source")]
     pub degree: u64,
     /// Relabel the synthetic graph's nodes by a seeded random permutation. The
     /// graph is the same; neighbours are no longer adjacent in memory.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "source")]
     pub shuffle: bool,
-    /// Models annealed at once, one per SM, at most the device's stream width.
+    /// Models annealed at once, one per nonce, at most the device's stream width.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     pub nonces: u64,
     /// msa only: hold at most this many spins in shared memory.
@@ -365,14 +365,29 @@ fn circulant_graph(n: u64, degree: u64, shuffle: Option<[u8; 32]>) -> IsingGraph
     IsingGraph::new(vec![0.0; n], vec![1.0; m], edges)
 }
 
-/// Refuse a synthetic degree the circulant cannot build.
-fn check_degree(degree: u64) -> Result<(), BenchError> {
-    if degree >= 2 && degree.is_multiple_of(2) {
-        return Ok(());
+/// Refuse a synthetic `degree` the circulant cannot build on `nodes` nodes,
+/// before any edge is allocated: it must be even, at least 2, below `nodes`
+/// (else pairs repeat and self-loops appear), and within
+/// [`crate::capacity::MSA_MAX_DEGREE`]. SA and Gibbs declare no degree limit
+/// of their own, so the msa limit is the bench-wide cap.
+fn check_degree(degree: u64, nodes: u64) -> Result<(), BenchError> {
+    let max = crate::capacity::MSA_MAX_DEGREE as u64;
+    if degree < 2 || !degree.is_multiple_of(2) {
+        return Err(BenchError::Args(format!(
+            "--degree {degree} must be even and at least 2"
+        )));
     }
-    Err(BenchError::Args(format!(
-        "--degree {degree} must be even and at least 2"
-    )))
+    if degree >= nodes {
+        return Err(BenchError::Args(format!(
+            "--degree {degree} must be below --nodes {nodes}"
+        )));
+    }
+    if degree > max {
+        return Err(BenchError::Args(format!(
+            "--degree {degree} exceeds the kernel limit of {max}"
+        )));
+    }
+    Ok(())
 }
 
 /// One graph to bench in the grid: either the synthetic circulant problem or a
@@ -416,7 +431,7 @@ fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
         return Err(BenchError::Args("--weights must be at least 1".into()));
     }
     let Some(source) = &args.source else {
-        check_degree(args.degree)?;
+        check_degree(args.degree, args.nodes)?;
         let mut model = BenchModel::synthetic(args);
         reweight_model(&mut model, args.weights);
         return Ok(vec![model]);
@@ -900,21 +915,48 @@ mod tests {
         assert_eq!(topo.max_degree(), 40);
     }
 
-    #[test]
-    fn shuffle_relabels_without_changing_the_degree_sequence() {
-        let plain = circulant_graph(500, 20, None);
-        let shuffled = circulant_graph(500, 20, Some([7; 32]));
-        assert_eq!(plain.edges.len(), shuffled.edges.len());
-        assert_ne!(plain.edges, shuffled.edges);
-        let topo = crate::topology::SelfFeedingTopology::build(&shuffled);
-        assert_eq!(topo.max_degree(), 20);
+    fn sorted_degrees(g: &crate::IsingGraph) -> Vec<usize> {
+        let mut deg = vec![0; g.num_nodes()];
+        for &(u, v) in g.edges.iter() {
+            deg[u] += 1;
+            deg[v] += 1;
+        }
+        deg.sort_unstable();
+        deg
     }
 
     #[test]
-    fn odd_degree_is_refused() {
-        assert!(check_degree(3).is_err());
-        assert!(check_degree(0).is_err());
-        assert!(check_degree(40).is_ok());
+    fn shuffle_relabels_without_changing_the_degree_sequence() {
+        let plain = circulant_graph(500, 20, None);
+        for seed in [[7; 32], [0; 32]] {
+            let shuffled = circulant_graph(500, 20, Some(seed));
+            assert_eq!(plain.edges.len(), shuffled.edges.len());
+            assert_ne!(plain.edges, shuffled.edges, "seed {seed:?} is the identity");
+            assert_eq!(sorted_degrees(&plain), sorted_degrees(&shuffled));
+        }
+    }
+
+    #[test]
+    fn unbuildable_degrees_are_refused() {
+        assert!(check_degree(3, 100).is_err(), "odd");
+        assert!(check_degree(0, 100).is_err(), "zero");
+        assert!(check_degree(100, 100).is_err(), "degree equals nodes");
+        assert!(check_degree(6, 6).is_err(), "degree above nodes");
+        assert!(check_degree(64, 1000).is_err(), "above the msa limit");
+        assert!(check_degree(1_000_000, 200_000).is_err(), "huge");
+        assert!(check_degree(40, 1000).is_ok());
+        assert!(check_degree(62, 1000).is_ok());
+        assert!(check_degree(2, 5).is_ok());
+    }
+
+    #[test]
+    fn degree_and_shuffle_conflict_with_source() {
+        use clap::Parser as _;
+        for flag in [&["--degree", "4"][..], &["--shuffle"][..]] {
+            let mut argv = vec!["bench", "--out", "x", "--source", "s", "--topology", "t"];
+            argv.extend_from_slice(flag);
+            assert!(RunCli::try_parse_from(argv).is_err(), "{flag:?}");
+        }
     }
 
     #[test]

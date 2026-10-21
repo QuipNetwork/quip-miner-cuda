@@ -50,10 +50,10 @@ pub struct KernSum {
 pub struct NcuMetrics {
     /// `gpu__time_duration.sum`, nanoseconds.
     pub duration_ns: u64,
-    /// `sm__throughput.avg.pct_of_peak_sustained_elapsed`, percent.
-    pub sm_efficiency_pct: f64,
-    /// `sm__warps_active.avg.pct_of_peak_sustained_active`, percent.
-    pub achieved_occupancy_pct: f64,
+    /// `sm__throughput.avg.pct_of_peak_sustained_elapsed`, percent, when present.
+    pub sm_efficiency_pct: Option<f64>,
+    /// `sm__warps_active.avg.pct_of_peak_sustained_active`, percent, when present.
+    pub achieved_occupancy_pct: Option<f64>,
     /// `lts__t_sector_hit_rate.pct`, percent, when the report carries it.
     pub l2_hit_rate_pct: Option<f64>,
     /// `l1tex__t_sector_hit_rate.pct`, percent, when the report carries it.
@@ -230,8 +230,8 @@ pub fn parse_ncu_csv(csv: &str) -> Result<Vec<NcuMetrics>, NsightError> {
             let duration_ns = r.duration.map_or(0, |d| d.max(0.0).round() as u64);
             NcuMetrics {
                 duration_ns,
-                sm_efficiency_pct: r.sm_efficiency.unwrap_or(0.0),
-                achieved_occupancy_pct: r.occupancy.unwrap_or(0.0),
+                sm_efficiency_pct: r.sm_efficiency,
+                achieved_occupancy_pct: r.occupancy,
                 l2_hit_rate_pct: r.l2_hit,
                 l1_hit_rate_pct: r.l1_hit,
                 dram_throughput_pct: r.dram,
@@ -292,19 +292,9 @@ pub fn fold_into(
         }
     }
     if let Some(rows) = ncu.and_then(<[NcuMetrics]>::first) {
-        record.metrics.push(Metric::new(
-            "sm_efficiency",
-            rows.sm_efficiency_pct,
-            "%",
-            Source::Ncu,
-        ));
-        record.metrics.push(Metric::new(
-            "achieved_occupancy",
-            rows.achieved_occupancy_pct,
-            "%",
-            Source::Ncu,
-        ));
         for (name, value) in [
+            ("sm_efficiency", rows.sm_efficiency_pct),
+            ("achieved_occupancy", rows.achieved_occupancy_pct),
             ("l2_hit_rate", rows.l2_hit_rate_pct),
             ("l1_hit_rate", rows.l1_hit_rate_pct),
             ("dram_throughput", rows.dram_throughput_pct),
@@ -353,8 +343,8 @@ mod tests {
     fn parses_ncu_metrics() {
         let m = parse_ncu_csv(NCU).unwrap();
         assert_eq!(m.len(), 1);
-        assert!(m[0].sm_efficiency_pct > 0.0);
-        assert!(m[0].achieved_occupancy_pct > 0.0);
+        assert!(m[0].sm_efficiency_pct.unwrap() > 0.0);
+        assert!(m[0].achieved_occupancy_pct.unwrap() > 0.0);
         assert!(m[0].duration_ns > 0);
     }
 
