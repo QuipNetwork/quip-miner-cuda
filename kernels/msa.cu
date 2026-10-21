@@ -304,10 +304,11 @@ __device__ __forceinline__ int count_satisfied(
     return d;
 }
 #else
-// Per-lane Metropolis test of the weighted kernel, with this spin's draw.
-// arm() turns the draw into the threshold. The accept functions call it after
-// they load the neighbour words, so the threshold lookup issues in the same
-// order as in the single-pass kernel.
+// Per-lane Metropolis test of the dense weighted path, with this spin's draw.
+// arm() turns the draw into the threshold; weighted_accept_dense calls it once
+// per spin. The single-pass path in anneal_model keeps its own copies of this
+// code (the draw hash, the threshold and the accept predicate) because a
+// shared helper measured +8.6% to +10.5% on weighted-i32 against main.
 struct LaneTest {
     u64 draw;
 #ifdef QUIP_MSA_LANE_I32
@@ -329,6 +330,7 @@ struct LaneTest {
     }
 #endif
 
+    // Same predicate as the inline one in anneal_model's single-pass path.
     __device__ __forceinline__ bool ok(int field, u64 bi, int lane) const {
         const int de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
 #ifdef QUIP_MSA_LANE_I32
@@ -350,6 +352,7 @@ template <bool SPILL>
 __device__ __forceinline__ u64 weighted_accept_dense(
     const int* col_ind, const msa_coef_t* J, const SpinStore<SPILL>& st,
     u64 bi, int w, int pstart, int pend, int h, LaneTest test) {
+    test.arm();
     u64 accept = 0ull;
     for (int lane0 = 0; lane0 < 64; lane0 += MSA_LANE_GROUP) {
         int field[MSA_LANE_GROUP];
@@ -376,7 +379,6 @@ __device__ __forceinline__ u64 weighted_accept_dense(
                 }
             }
         }
-        test.arm();
         #pragma unroll
         for (int l = 0; l < MSA_LANE_GROUP; ++l) {
             accept |= (u64)test.ok(field[l], bi, lane0 + l) << (lane0 + l);
@@ -471,6 +473,7 @@ __device__ __forceinline__ bool anneal_model(
 #ifdef QUIP_MSA_WEIGHTED
                     if (pend - pstart > MSA_CHUNK) {
                         LaneTest test;
+                        // Same draw as the single-pass path below.
                         test.draw = splitmix64(
                             mdl.slot_seed ^ ((u64)beta_idx << 40)
                             ^ ((u64)sweep << 20) ^ (u64)var);
@@ -487,7 +490,10 @@ __device__ __forceinline__ bool anneal_model(
                         continue;
                     }
                     // Prefetch every neighbour index and coupling before
-                    // touching spin state.
+                    // touching spin state. weighted_accept_dense masks the
+                    // same chunk load; the single-pass path stays inline
+                    // (a shared helper measured +8.6% to +10.5% on
+                    // weighted-i32 against main).
                     int nb[MSA_CHUNK];
                     int jj[MSA_CHUNK];
                     #pragma unroll

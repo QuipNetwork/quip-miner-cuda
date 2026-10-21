@@ -198,6 +198,14 @@ fn ferro_ground_milli(n: usize, scale_j: i64, scale_h: i64) -> i64 {
     -1000 * (n * (n - 1) / 2 * scale_j + n * scale_h)
 }
 
+/// Every read (one per lane) must sit at the ground energy, so a wrong
+/// field in any lane group of the dense path shows.
+fn assert_all_ground(reads: &[quip_solver_cuda::SamplerResult], ground: i64, what: &str) {
+    for (i, r) in reads.iter().enumerate() {
+        assert_eq!(r.energy_milli, ground, "{what}: read {i}");
+    }
+}
+
 /// Degree 21 is the first two-pass spin and degree 62 the ceiling. Every
 /// lane must reach the ground state, which a wrong carry in the chunked
 /// counter or the chunked weighted field would miss.
@@ -207,7 +215,7 @@ fn ferro_ground_milli(n: usize, scale_j: i64, scale_h: i64) -> i64 {
 fn msa_reaches_ground_states_at_degree_21_and_62_on_every_lane() {
     let p = SampleParams {
         num_reads: 64,
-        num_sweeps: 512,
+        num_sweeps: 4096,
         seed: 3,
         ..SampleParams::default()
     };
@@ -215,8 +223,7 @@ fn msa_reaches_ground_states_at_degree_21_and_62_on_every_lane() {
         let unit = ferro_complete(n, 1.0, 1.0);
         let (reads, _) =
             bench_one(device(KernelKind::Msa), &unit, &p, KernelKind::Msa, None).unwrap();
-        let best = reads.iter().map(|r| r.energy_milli).min().unwrap();
-        assert_eq!(best, ferro_ground_milli(n, 1, 1), "unit K_{n}");
+        assert_all_ground(&reads, ferro_ground_milli(n, 1, 1), &format!("unit K_{n}"));
 
         let weighted = ferro_complete(n, 2.0, 3.0);
         for lane in [MsaLane::I32, MsaLane::F32] {
@@ -228,8 +235,11 @@ fn msa_reaches_ground_states_at_degree_21_and_62_on_every_lane() {
                 Some(lane),
             )
             .unwrap();
-            let best = reads.iter().map(|r| r.energy_milli).min().unwrap();
-            assert_eq!(best, ferro_ground_milli(n, 2, 3), "{lane:?} K_{n}");
+            assert_all_ground(
+                &reads,
+                ferro_ground_milli(n, 2, 3),
+                &format!("{lane:?} K_{n}"),
+            );
         }
     }
 }
