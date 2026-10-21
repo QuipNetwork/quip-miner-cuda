@@ -141,3 +141,19 @@ fn msa_cancel_aborts_the_active_model_and_the_next_session_completes() {
     }
     cancel_then_complete(&device, KernelKind::Msa, 128);
 }
+
+/// The abort path leaves the spilled template body early; the next session
+/// must still complete.
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn msa_cancel_with_spilled_spins_aborts_and_the_next_session_completes() {
+    if CudaDevice::device_count().unwrap_or(0) == 0 {
+        eprintln!("no CUDA device visible; skipping");
+        return;
+    }
+    let mut device =
+        CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES).expect("open msa");
+    device.msa_shared_spins_cap = Some(100);
+    cancel_then_complete(&device, KernelKind::Msa, 128);
+}

@@ -405,6 +405,10 @@ pub struct CudaDevice {
     /// `streaming::algo_limits` reads it for the per-nonce read cap, so the
     /// envelope this miner declares matches what the device can hold.
     pub msa_replica_words: usize,
+    /// Hold at most this many spins in shared memory per msa block, spilling
+    /// the rest to global memory. `None` uses the full opt-in budget. Tests
+    /// and `bench run --msa-shared-spins` set it; the miner never does.
+    pub msa_shared_spins_cap: Option<usize>,
     /// SMs on this device (`launch_self_feeding`'s `num_kernels` budget).
     pub max_sms: usize,
     /// Node capacity the running kernel was compiled for.
@@ -609,6 +613,7 @@ impl CudaDevice {
             msa_weighted,
             msa_dynamic_shared_bytes,
             msa_replica_words,
+            msa_shared_spins_cap: None,
             max_sms: max_sms.max(1),
             max_nodes: resolved,
             sa_wide_max_nodes,

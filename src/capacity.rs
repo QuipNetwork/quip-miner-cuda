@@ -238,6 +238,16 @@ pub fn msa_budget(dynamic_shared_bytes: usize, words: usize) -> usize {
     dynamic_shared_bytes.saturating_sub(MSA_FIXED_SHARED_BYTES) / per_node
 }
 
+/// `u64` words of global spill buffer an msa session allocates: the spins
+/// past `shared_spins`, at `words` replica words each, for every nonce.
+#[must_use]
+pub fn msa_spill_words(nodes: usize, shared_spins: usize, words: usize, nonces: usize) -> usize {
+    nodes
+        .saturating_sub(shared_spins)
+        .saturating_mul(words)
+        .saturating_mul(nonces)
+}
+
 /// Replica words per spin an msa session on this device uses for `nodes`
 /// spins: the most it can hold, down to one.
 ///
@@ -612,6 +622,17 @@ mod tests {
     /// An A4000 opts in to 101376 bytes (99 KB) per block. Less the two
     /// static ints and the 8704-byte threshold structures, two 8-byte
     /// words per spin fit 5791 spins.
+    #[test]
+    fn msa_spill_words_covers_every_nonce_past_the_shared_spins() {
+        assert_eq!(msa_spill_words(5000, 5000, 2, 48), 0);
+        assert_eq!(msa_spill_words(5000, 6000, 2, 48), 0);
+        assert_eq!(
+            msa_spill_words(200_000, 5791, 2, 48),
+            (200_000 - 5791) * 2 * 48
+        );
+        assert_eq!(msa_spill_words(10, 0, 1, 1), 10);
+    }
+
     #[test]
     fn msa_budget_on_a_99_kb_optin() {
         assert_eq!(msa_dynamic_shared_bytes(101_376), 101_360);

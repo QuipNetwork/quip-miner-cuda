@@ -431,6 +431,39 @@ struct MsaState {
     num_colors: i32,
     words: i32,
     shared_bytes: u32,
+    /// Spill buffer: `(n - shared_spins) * words` u64 per nonce, nonce-major.
+    /// One element when nothing spills, so the kernel always has an address.
+    d_spill: CudaSlice<u64>,
+    /// Spins held in shared memory (`k_shared` in the kernel).
+    shared_spins: i32,
+}
+
+/// Spin layout of an msa session: replica words per spin, and how many spins
+/// stay in shared memory. The rest spill to a per-nonce global buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsaLayout {
+    /// 64-lane replica words per spin: 1 for up to 64 reads, else 2.
+    pub words: usize,
+    /// Spins held in dynamic shared memory; spins past this index spill.
+    pub shared_spins: usize,
+}
+
+/// The layout an msa session on `device` uses for `n` spins at
+/// `reads_per_nonce` reads: as many spins in shared memory as the opt-in
+/// budget holds, less if [`CudaDevice::msa_shared_spins_cap`] says so.
+#[must_use]
+pub fn msa_layout(device: &CudaDevice, n: usize, reads_per_nonce: usize) -> MsaLayout {
+    // A power of two, which the kernel's thread-to-word mask requires.
+    let words = reads_per_nonce
+        .max(1)
+        .div_ceil(capacity::MSA_LANES)
+        .next_power_of_two();
+    let budget = capacity::msa_budget(device.msa_dynamic_shared_bytes, words);
+    let cap = device.msa_shared_spins_cap.unwrap_or(usize::MAX);
+    MsaLayout {
+        words,
+        shared_spins: n.min(budget).min(cap),
+    }
 }
 
 impl SlotCoefficients {
@@ -518,6 +551,7 @@ fn build_msa_state(
     stream: &Arc<CudaStream>,
     topology: &SelfFeedingTopology,
     reads_per_nonce: usize,
+    num_nonces: usize,
 ) -> Result<MsaState, SampleError> {
     let max_deg = topology.max_degree();
     if max_deg > capacity::MSA_MAX_DEGREE {
@@ -526,28 +560,18 @@ fn build_msa_state(
             capacity::MSA_MAX_DEGREE
         )));
     }
-    // One 64-lane word per 64 reads. `reads_per_nonce` is already capped at
-    // `MSA_MAX_READS`, so this is 1 or 2: a power of two, which the kernel's
-    // thread-to-word mask requires.
-    let words = reads_per_nonce
-        .div_ceil(capacity::MSA_LANES)
-        .next_power_of_two();
-    let shared = capacity::msa_shared_bytes(topology.n, words);
-    // Defense in depth, as the `n > device.max_nodes` guard in `build`: the
-    // node ceiling was resolved for two words at open, so this fires only
-    // if that derivation and this footprint drift apart.
-    if shared > device.msa_dynamic_shared_bytes {
-        return Err(SampleError::GraphTooLarge {
-            n: topology.n,
-            limit: capacity::msa_budget(device.msa_dynamic_shared_bytes, words),
-        });
-    }
+    let layout = msa_layout(device, topology.n, reads_per_nonce);
+    let words = layout.words;
+    let shared = capacity::msa_shared_bytes(layout.shared_spins, words);
+    let spill_words = capacity::msa_spill_words(topology.n, layout.shared_spins, words, num_nonces);
     tracing::info!(
         num_colors = topology.colors.num_colors,
         words,
         max_deg,
+        shared_spins = layout.shared_spins,
+        spill_words,
         shared_bytes = shared,
-        "msa session: colour classes and shared-memory footprint"
+        "msa session: colour classes, shared spins and spill footprint"
     );
     // Every array gets a one-element stand-in where it would be empty: a
     // zero-length allocation has no device address for the kernel to index.
@@ -578,6 +602,8 @@ fn build_msa_state(
         num_colors: topology.colors.num_colors,
         words: to_kernel_i32("words", words)?,
         shared_bytes,
+        d_spill: stream.alloc_zeros::<u64>(spill_words.max(1))?,
+        shared_spins: to_kernel_i32("shared_spins", layout.shared_spins)?,
     })
 }
 
@@ -587,6 +613,7 @@ fn build_msa_weighted_state(
     stream: &Arc<CudaStream>,
     topology: &SelfFeedingTopology,
     reads_per_nonce: usize,
+    num_nonces: usize,
     max_num_betas: usize,
     lane: MsaLane,
 ) -> Result<AlgoState, SampleError> {
@@ -595,7 +622,7 @@ fn build_msa_weighted_state(
             "weighted MSA requires an MSA device open".into(),
         ));
     }
-    let msa = build_msa_state(device, stream, topology, reads_per_nonce)?;
+    let msa = build_msa_state(device, stream, topology, reads_per_nonce, num_nonces)?;
     let (d_beta_fixed, d_delta_cut, d_neglog) = match lane {
         MsaLane::I32 => (
             Some(stream.alloc_zeros::<i64>(max_num_betas.max(1))?),
@@ -646,9 +673,8 @@ fn build_algo_state(
 ) -> Result<AlgoState, SampleError> {
     let limits = algo_limits(kernel, device.msa_replica_words);
     match kernel {
-        KernelKind::Msa => {
-            build_msa_state(device, stream, topology, reads_per_nonce).map(AlgoState::Msa)
-        }
+        KernelKind::Msa => build_msa_state(device, stream, topology, reads_per_nonce, num_nonces)
+            .map(AlgoState::Msa),
         KernelKind::Sa => {
             let total_threads = num_nonces * 256;
             Ok(AlgoState::Sa {
@@ -767,6 +793,7 @@ impl<'a> SelfFeedingSession<'a> {
                 &stream_compute,
                 &topology,
                 reads_per_nonce,
+                num_nonces,
                 max_num_betas,
                 msa_lane,
             )?
@@ -968,6 +995,8 @@ impl<'a> SelfFeedingSession<'a> {
             d_color_nodes,
             num_colors,
             words,
+            d_spill,
+            shared_spins,
             ..
         } = msa;
         let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
@@ -998,10 +1027,13 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(&dims.max_packed);
         b.arg(&seed);
         b.arg(words);
-        // SAFETY: the 21 `b.arg` calls above mirror `cuda_msa_self_feeding` in
+        b.arg(d_spill);
+        b.arg(shared_spins);
+        // SAFETY: the 23 `b.arg` calls above mirror `cuda_msa_self_feeding` in
         // `kernels/msa.cu` in order, type and count; every buffer is sized by
         // `build` from the same `dims` the kernel receives, and the colour
-        // buffers are bounded by `num_colors` / `dims.n`.
+        // buffers are bounded by `num_colors` / `dims.n`. `d_spill` holds
+        // `msa_spill_words` u64 for every nonce of this launch.
         unsafe { b.launch(cfg) }?;
         Ok(())
     }
@@ -1038,6 +1070,8 @@ impl<'a> SelfFeedingSession<'a> {
             d_color_nodes,
             num_colors,
             words,
+            d_spill,
+            shared_spins,
             ..
         } = msa;
         let SlotCoefficients::Wide { d_j, d_h, .. } = &self.coefs else {
@@ -1068,6 +1102,8 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(&dims.max_packed);
         b.arg(&seed);
         b.arg(words);
+        b.arg(d_spill);
+        b.arg(shared_spins);
         if *lane == MsaLane::I32 {
             let (Some(beta_fixed), Some(delta_cut), Some(neglog)) =
                 (d_beta_fixed, d_delta_cut, d_neglog)
@@ -1080,12 +1116,13 @@ impl<'a> SelfFeedingSession<'a> {
             b.arg(delta_cut);
             b.arg(neglog);
         }
-        // SAFETY: the 24 arguments for I32, or 21 for F32, mirror
+        // SAFETY: the 26 arguments for I32, or 23 for F32, mirror
         // `cuda_msa_self_feeding` compiled with QUIP_MSA_WEIGHTED and its lane
         // define, in order, type and count. J and h are i32. `build` sizes
         // every slot and colouring buffer from these same dimensions, and
         // checks both the degree and shared spin-state budget. The three I32
-        // buffers hold num_betas, num_betas and NEGLOG_LEN entries. `Drop`
+        // buffers hold num_betas, num_betas and NEGLOG_LEN entries. `d_spill`
+        // holds `msa_spill_words` u64 for every nonce of this launch. `Drop`
         // signals exit and synchronizes the compute stream before freeing them.
         unsafe { b.launch(cfg) }?;
         Ok(())
