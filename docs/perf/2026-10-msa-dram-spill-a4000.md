@@ -21,8 +21,10 @@ The hypothesis that DRAM traffic at the ceiling comes mainly from topology is no
 | Idle check | GPU 1 showed 0% load and 9 MiB used before the `ncu` slice and after the grid |
 
 GPU 0 took no part in the runs.
-The idle check for the grid start ran in the same step as a blocked command, so no reading exists from the instant before the first cell.
+The idle check for the main grid start ran in the same step as a blocked command, so no reading exists from the instant before its first cell.
 The first sampler reading, at the start of the first cell, showed 177 MiB used on GPU 1. Another process using the card is unlikely but not excluded.
+The follow-up runs (the weighted degree-20 control and the nine-repeat one-model sweep) each have a reading taken immediately before the run.
+All 13 readings show 0% load and 9 MiB used (`idle-followup.log`).
 The full `nvidia-smi -q` output is in `device.txt` under the evidence path.
 
 ## Method
@@ -43,11 +45,12 @@ A lane-update is one spin update in one read of one model.
 At 128 reads each spin has two 64-lane words, so the shared budget holds 5,791 spins.
 Spins past K live in a per-model global buffer of (N − K) × 16 bytes.
 
-The grid has 109 cells and every one completed:
+The grid has 109 cells and every one completed. A follow-up added 13 more cells, which also completed:
 
 - Section A: 96 cells. Each combination of degree (20 or 40), order, and model count (1 or 48) runs 12 node counts from 1,000 to 200,000.
 - Section B: 10 cells. N = 5,791 and degree 20 with five values of K from 5,791 down to 0, at both model counts.
 - Section C: 3 cells. The weighted `i32` lane (`--msa-path weighted-i32`) at degree 40 and 48 models, N = 5,791, 64,000, and 200,000.
+- Follow-up: 3 weighted cells at degree 20 (same N values) and 10 one-model cells with nine repeats at N = 5,791, K from 5,791 to 0, in two passes of opposite order.
 
 The `ncu` slice has 8 kernel profiles at degree 40, plain order, 16 sweeps, one repeat, with N = 5,791, 16,000, 64,000, and 200,000 at 1 and 48 models.
 
@@ -138,41 +141,61 @@ Once spins spill, the shuffled series fall much further, most of all at 48 model
 
 N = 5,791 and degree 20, plain order. Only the placement changes.
 
+The 48-model rows use three repeats per cell.
+
 | Models | Shared K | Sweep (µs) | Versus all-shared |
 | ---: | ---: | ---: | ---: |
-| 1 | 5,791 | 160.7 | 1.00x |
-| 1 | 4,000 | 207.6 | 1.29x |
-| 1 | 2,000 | 226.7 | 1.41x |
-| 1 | 1,000 | 199.9 | 1.24x |
-| 1 | 0 | 211.9 | 1.32x |
 | 48 | 5,791 | 164.1 | 1.00x |
 | 48 | 4,000 | 332.8 | 2.03x |
 | 48 | 2,000 | 408.3 | 2.49x |
 | 48 | 1,000 | 352.6 | 2.15x |
 | 48 | 0 | 381.3 | 2.32x |
 
-Moving the last 1,791 spins out of shared memory costs 29% for one model and 103% for 48 models.
-Moving more spins out adds little.
-The cost is not proportional to the spilled fraction, and it does not rise monotonically as K falls.
-The same configuration (N = 5,791, degree 20, K = 5,791, one model) measured 123.5 µs in the node sweep and 160.7 µs here.
-Single-model cells carry a spread of about 30% between cells.
-The 48-model cells agree within 10% (180.7 and 164.1 µs).
-The K sweep at one model is too noisy to rank K = 4,000 against K = 0.
+The first run of the one-model rows used three repeats and showed a spread of about 30%.
+The same configuration (K = 5,791) measured 123.5 µs in the node sweep and 160.7 µs there.
+A rerun used nine repeats and two passes in opposite K orders (5,791, 0, 4,000, 1,000, 2,000, then the reverse).
+Times are medians in microseconds. The last two columns use the lowest repeat of the two passes.
 
-### Weighted i32 lane, degree 40, 48 models
-
-| N | Weighted sweep (µs) | Unit d40 plain sweep (µs) | Weighted / unit | Weighted G/s |
+| Shared K | Pass 1 median | Pass 2 median | Lowest repeat | Lowest / all-shared |
 | ---: | ---: | ---: | ---: | ---: |
-| 5,791 | 2,900.3 | 334.1 | 8.68x | 12.27 |
-| 64,000 | 104,537.7 | 15,900.7 | 6.57x | 3.76 |
-| 200,000 | 343,328.0 | 54,407.6 | 6.31x | 3.58 |
+| 5,791 | 127.0 | 142.5 | 125.1 | 1.00x |
+| 4,000 | 206.4 | 206.5 | 206.0 | 1.65x |
+| 2,000 | 225.0 | 224.9 | 223.5 | 1.79x |
+| 1,000 | 198.6 | 198.6 | 198.4 | 1.59x |
+| 0 | 211.6 | 210.4 | 210.1 | 1.68x |
 
-The weighted `i32` lane costs 6.3 to 8.7 times the unit lane at degree 40.
+At one model the spilled cells are tight. The medians of the two passes agree within 1%, and the order of K values is the same in both passes.
+From fastest to slowest the order is K = 1,000, 4,000, 0, and 2,000, with gaps of 4%, 2.5%, and 6%.
+The cost does not fall or rise steadily with K.
+Placing any spins outside shared memory costs 1.6x to 1.8x of the lowest all-shared repeat at one model.
+The all-shared cell is the unstable one. Its repeats range from 125 to 161 µs and its medians differ by 12% between passes.
+The 3-repeat 1-model rows from the first run are not used.
+At 48 models, moving the last 1,791 spins out costs 103%, and further K reduction adds up to 46 points more with no monotonic trend.
+The 48-model cells agree within 10% between the two all-shared measurements (180.7 and 164.1 µs).
+
+### Weighted i32 lane, 48 models
+
+Plain order, same bench settings as the unit cells. The control at degree 20 follows the degree 40 section.
+
+| Degree | N | Weighted sweep (µs) | Unit sweep (µs) | Weighted / unit | Weighted G/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 20 | 5,791 | 861.9 | 180.7 | 4.77x | 41.3 |
+| 20 | 64,000 | 9,069.4 | 5,992.3 | 1.51x | 43.4 |
+| 20 | 200,000 | 30,428.5 | 22,095.4 | 1.38x | 40.4 |
+| 40 | 5,791 | 2,900.3 | 334.1 | 8.68x | 12.3 |
+| 40 | 64,000 | 104,537.7 | 15,900.7 | 6.57x | 3.76 |
+| 40 | 200,000 | 343,328.0 | 54,407.6 | 6.31x | 3.58 |
+
 In the Task 4b design, a spin of degree over 20 on the weighted lanes reloads its neighbour words once per 8-lane group.
-Degree 40 exceeds that threshold for every spin, so this section measures that reload.
-The 8.7x cost at N = 5,791 occurs with no spill, so the reload and the wider coefficients cause it, not placement.
-No weighted run at degree 20 exists in this grid, so the reload cost is not separated from the cost of 4-byte coefficients.
+Degree 20 never triggers that path, so the degree-20 rows show the cost of 4-byte coefficients and weighted arithmetic alone.
+Degree 40 triggers the path for every spin.
+At N = 5,791 no spill occurs. The weighted lane costs 4.77x at degree 20 and 8.68x at degree 40, so the reload adds a factor of 1.8.
+An independent reference supports the 4.8x level. The Advantage2 gate run (4,577 nodes, degree at most 20, 128 reads) shows 6.4x for weighted `i32` against unit (launch medians of 567.6 ms and 89.3 ms).
+At large N the weighted degree-20 lane costs only 1.4x to 1.5x of the unit lane, because memory traffic dominates both.
+The degree-40 lane still costs 6.3x to 6.6x there, so the reload adds a factor of 4.3 to 4.6 at 64,000 and 200,000 nodes.
+The reload is the main cost of weighted lanes at degree 40, and it appears at every size.
 A weighted degree-40 model at 200,000 nodes takes 91.8 s end to end, against 17.4 s for the unit lane.
+The degree-20 control was not timed end to end.
 
 ### Host parts at 200,000 nodes
 
@@ -245,8 +268,8 @@ Shuffled order at one model drops at 200,000 nodes: 2.34 to 1.87 G/s at degree 2
 The spill buffer is 3.1 MB at that size, and topology arrays compete for the same L2.
 This is the only L2 exit seen at one model, and it sits just under the predicted 250,000.
 
-**2. Cost of spill alone.** Moving the last 1,791 spins of a 5,791-node model out of shared memory costs 1.29x at one model and 2.03x at 48 models.
-Further reduction of K adds at most another 0.5x, within the cell-to-cell spread of this grid.
+**2. Cost of spill alone.** Moving the last 1,791 spins of a 5,791-node model out of shared memory costs 1.65x at one model (nine-repeat rerun, lowest repeats) and 2.03x at 48 models.
+Further reduction of K changes the one-model cost by at most 0.2x and in no monotonic order. At 48 models the three-repeat cells add up to 0.46x.
 
 **3. Spin traffic and topology traffic.** Compare 48 models at 200,000 nodes.
 Doubling the degree from 20 to 40 raises the per-sweep time from 22.1 ms to 54.4 ms, which is 2.46x for 2x the edges.
@@ -295,15 +318,15 @@ Weighted `i32` at 48 models uses 5.2 GB of the card's 16 GB, almost all in per-s
 - The graphs are synthetic circulant graphs with unit couplings and no fields. Real topologies have different locality.
 - One device ran the grid. Another A4000 or a different clock state may give other numbers.
 - Repeats use a fixed seed, so they test timing spread only.
-- Cell-to-cell spread at one model reaches about 30% (see the shared fraction table).
+- Three-repeat cells at one model can differ by 30% between runs of one configuration. The one-model K sweep uses nine repeats for that reason.
+- The 48-model shared fraction cells use three repeats.
 - `ncu` runs 16 sweeps, with serialized kernels and fixed clocks, so its hit rates apply to the profiled run only.
 - The grid does not test node counts between 5,791 and 8,000 or between 11,582 and 16,000.
-- No weighted run at degree 20 exists, so the weighted reload cost is not separated.
 
 ## Reproduction
 
 The evidence is under `/zfspool/quip-mining/bench-evidence/msa-dram-spill/` and stays outside the repository.
-The directory holds `grid.sh`, `ncu.sh`, `summarize.py`, `grid.log`, `summary.md`, `memory.csv`, `device.txt`, the raw `grid/` and `ncu/` outputs.
+The directory holds `grid.sh`, `ncu.sh`, `summarize.py`, `grid.log`, `followup.sh`, `followup.log`, `idle-followup.log`, `summary.md`, `memory.csv`, `device.txt`, the raw `grid/` and `ncu/` outputs.
 
 ```sh
 docker run --rm -e CI=1 -v "$PWD":/src -v quip-cuda-cargo:/root/.cargo/registry \
@@ -312,6 +335,7 @@ ev=/zfspool/quip-mining/bench-evidence/msa-dram-spill
 nvidia-smi --query-gpu=memory.used --format=csv -i 1 -lms 500   # optional sampler
 $ev/grid.sh "$PWD"
 $ev/ncu.sh "$PWD"
+$ev/followup.sh "$PWD"
 python3 -I $ev/summarize.py $ev > $ev/summary.md
 ```
 
