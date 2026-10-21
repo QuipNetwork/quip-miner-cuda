@@ -142,3 +142,16 @@ fn fold_into_without_ncu_or_per_sweep_leaves_those_untouched() {
         "no ncu rows supplied -> no metrics appended"
     );
 }
+
+#[test]
+fn parses_cache_and_dram_metrics_when_present() {
+    let csv = "\"ID\",\"Kernel Name\",\"Metric Name\",\"Metric Unit\",\"Metric Value\"\n\
+\"0\",\"cuda_msa_self_feeding\",\"gpu__time_duration.sum\",\"ns\",\"1000.0\"\n\
+\"0\",\"cuda_msa_self_feeding\",\"lts__t_sector_hit_rate.pct\",\"%\",\"42.5\"\n\
+\"0\",\"cuda_msa_self_feeding\",\"l1tex__t_sector_hit_rate.pct\",\"%\",\"80.0\"\n\
+\"0\",\"cuda_msa_self_feeding\",\"dram__throughput.avg.pct_of_peak_sustained_elapsed\",\"%\",\"61.0\"\n";
+    let rows = quip_solver_cuda::nsight::parse_ncu_csv(csv).unwrap();
+    assert_eq!(rows[0].l2_hit_rate_pct, Some(42.5));
+    assert_eq!(rows[0].l1_hit_rate_pct, Some(80.0));
+    assert_eq!(rows[0].dram_throughput_pct, Some(61.0));
+}

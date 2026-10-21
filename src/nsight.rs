@@ -54,6 +54,12 @@ pub struct NcuMetrics {
     pub sm_efficiency_pct: f64,
     /// `sm__warps_active.avg.pct_of_peak_sustained_active`, percent.
     pub achieved_occupancy_pct: f64,
+    /// `lts__t_sector_hit_rate.pct`, percent, when the report carries it.
+    pub l2_hit_rate_pct: Option<f64>,
+    /// `l1tex__t_sector_hit_rate.pct`, percent, when the report carries it.
+    pub l1_hit_rate_pct: Option<f64>,
+    /// `dram__throughput.avg.pct_of_peak_sustained_elapsed`, percent, when present.
+    pub dram_throughput_pct: Option<f64>,
 }
 
 /// Split one CSV line into unquoted fields, honoring `""`-escaped quotes.
@@ -143,17 +149,29 @@ pub fn parse_nsys_kern_sum(csv: &str) -> Result<Vec<KernSum>, NsightError> {
     Ok(out)
 }
 
-/// `(launch id, duration, sm-efficiency, achieved-occupancy)`, built up as
-/// the tracked metrics are seen for that launch in [`parse_ncu_csv`].
-type NcuRow = (String, Option<f64>, Option<f64>, Option<f64>);
+/// One launch's tracked metrics, built up as they are seen in
+/// [`parse_ncu_csv`].
+#[derive(Default)]
+struct NcuRow {
+    id: String,
+    duration: Option<f64>,
+    sm_efficiency: Option<f64>,
+    occupancy: Option<f64>,
+    l2_hit: Option<f64>,
+    l1_hit: Option<f64>,
+    dram: Option<f64>,
+}
 
 const METRIC_DURATION: &str = "gpu__time_duration.sum";
 const METRIC_SM_EFFICIENCY: &str = "sm__throughput.avg.pct_of_peak_sustained_elapsed";
 const METRIC_OCCUPANCY: &str = "sm__warps_active.avg.pct_of_peak_sustained_active";
+const METRIC_L2_HIT: &str = "lts__t_sector_hit_rate.pct";
+const METRIC_L1_HIT: &str = "l1tex__t_sector_hit_rate.pct";
+const METRIC_DRAM: &str = "dram__throughput.avg.pct_of_peak_sustained_elapsed";
 
 /// Parse an `ncu --csv` long-form report (one row per metric per launch),
 /// grouping by the `ID` column into one [`NcuMetrics`] per launch. Launch IDs
-/// whose rows carry none of the three tracked metrics are dropped.
+/// whose rows carry none of the tracked metrics are dropped.
 ///
 /// # Errors
 ///
@@ -173,37 +191,51 @@ pub fn parse_ncu_csv(csv: &str) -> Result<Vec<NcuMetrics>, NsightError> {
         let id = field(&fields, id_i, "ID")?.to_owned();
         let metric_name = field(&fields, metric_name_i, "Metric Name")?.to_owned();
         let value = parse_f64(field(&fields, metric_value_i, "Metric Value")?)?;
-        let entry = if let Some(e) = by_id.iter_mut().find(|(existing, ..)| *existing == id) {
+        let entry = if let Some(e) = by_id.iter_mut().find(|row| row.id == id) {
             e
         } else {
-            by_id.push((id, None, None, None));
+            by_id.push(NcuRow {
+                id,
+                ..NcuRow::default()
+            });
             let last = by_id.len() - 1;
             &mut by_id[last]
         };
         match metric_name.as_str() {
-            METRIC_DURATION => entry.1 = Some(value),
-            METRIC_SM_EFFICIENCY => entry.2 = Some(value),
-            METRIC_OCCUPANCY => entry.3 = Some(value),
+            METRIC_DURATION => entry.duration = Some(value),
+            METRIC_SM_EFFICIENCY => entry.sm_efficiency = Some(value),
+            METRIC_OCCUPANCY => entry.occupancy = Some(value),
+            METRIC_L2_HIT => entry.l2_hit = Some(value),
+            METRIC_L1_HIT => entry.l1_hit = Some(value),
+            METRIC_DRAM => entry.dram = Some(value),
             _ => {}
         }
     }
 
     let out: Vec<NcuMetrics> = by_id
         .into_iter()
-        .filter_map(|(_, dur, eff, occ)| {
-            if dur.is_none() && eff.is_none() && occ.is_none() {
-                return None;
-            }
+        .filter(|r| {
+            r.duration.is_some()
+                || r.sm_efficiency.is_some()
+                || r.occupancy.is_some()
+                || r.l2_hit.is_some()
+                || r.l1_hit.is_some()
+                || r.dram.is_some()
+        })
+        .map(|r| {
             // Round rather than truncate: ncu reports duration as an exact
             // float nanosecond count in practice, but round defends against
             // any sub-ns fractional noise in the source report.
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let duration_ns = dur.map_or(0, |d| d.max(0.0).round() as u64);
-            Some(NcuMetrics {
+            let duration_ns = r.duration.map_or(0, |d| d.max(0.0).round() as u64);
+            NcuMetrics {
                 duration_ns,
-                sm_efficiency_pct: eff.unwrap_or(0.0),
-                achieved_occupancy_pct: occ.unwrap_or(0.0),
-            })
+                sm_efficiency_pct: r.sm_efficiency.unwrap_or(0.0),
+                achieved_occupancy_pct: r.occupancy.unwrap_or(0.0),
+                l2_hit_rate_pct: r.l2_hit,
+                l1_hit_rate_pct: r.l1_hit,
+                dram_throughput_pct: r.dram,
+            }
         })
         .collect();
     if out.is_empty() {
@@ -272,6 +304,15 @@ pub fn fold_into(
             "%",
             Source::Ncu,
         ));
+        for (name, value) in [
+            ("l2_hit_rate", rows.l2_hit_rate_pct),
+            ("l1_hit_rate", rows.l1_hit_rate_pct),
+            ("dram_throughput", rows.dram_throughput_pct),
+        ] {
+            if let Some(v) = value {
+                record.metrics.push(Metric::new(name, v, "%", Source::Ncu));
+            }
+        }
     }
 }
 

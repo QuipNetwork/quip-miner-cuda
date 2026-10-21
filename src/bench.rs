@@ -26,8 +26,11 @@
 //! ncu --csv --target-processes all \
 //!     --metrics gpu__time_duration.sum,\
 //! sm__throughput.avg.pct_of_peak_sustained_elapsed,\
-//! sm__warps_active.avg.pct_of_peak_sustained_active \
-//!     --kernel-name regex:'cuda_(sa|gibbs)_self_feeding' \
+//! sm__warps_active.avg.pct_of_peak_sustained_active,\
+//! lts__t_sector_hit_rate.pct,\
+//! l1tex__t_sector_hit_rate.pct,\
+//! dram__throughput.avg.pct_of_peak_sustained_elapsed \
+//!     --kernel-name regex:'cuda_(sa|msa|gibbs)_self_feeding' \
 //!     quip-cuda-sa bench run --reads 8 --sweeps 1024 --sweeps-per-beta 4 \
 //!         --nodes 512 --repeats 3 --out out/ > ncu_bench.csv
 //!
@@ -42,7 +45,7 @@ use crate::corpus;
 use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
 use crate::schema::{BenchRecord, Metric, Part, Scope, Source};
-use crate::streaming::{bench_one, bench_plan, DeviceTimings};
+use crate::streaming::{bench_many, bench_plan, stream_width, DeviceTimings};
 use crate::{IsingGraph, KernelKind, SampleParams};
 use clap::{Args, Subcommand, ValueEnum};
 use quip_protocol::chacha8::ChaCha8Rng;
@@ -113,15 +116,29 @@ pub struct RunArgs {
     /// Sweeps per beta rung.
     #[arg(long, default_value_t = 4)]
     pub sweeps_per_beta: u64,
-    /// Node count of the synthetic ring (zero fields and unit couplings by default).
+    /// Node count of the synthetic circulant graph (zero fields and unit couplings by default).
     /// Ignored when `--source` is given (the real corpus topology's node
     /// count is used instead). Useful on its own for micro checks.
     #[arg(long, default_value_t = 64)]
     pub nodes: u64,
+    /// Neighbours per node of the synthetic circulant graph (even, at least 2).
+    /// Node i links to i+1 ..= i+degree/2 (mod n). The default 2 is a ring.
+    #[arg(long, default_value_t = 2)]
+    pub degree: u64,
+    /// Relabel the synthetic graph's nodes by a seeded random permutation. The
+    /// graph is the same; neighbours are no longer adjacent in memory.
+    #[arg(long)]
+    pub shuffle: bool,
+    /// Models annealed at once, one per SM, at most the device's stream width.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
+    pub nonces: u64,
+    /// msa only: hold at most this many spins in shared memory.
+    #[arg(long)]
+    pub msa_shared_spins: Option<usize>,
     /// Corpus JSONL to bench real models (one `{"nonce":"<64hex>", ...}`
     /// line per model, unknown fields ignored); requires `--topology`.
     /// Redraws each nonce's real `(h, J)` and benches that graph instead of
-    /// the synthetic ring.
+    /// the synthetic circulant graph.
     #[arg(long, requires = "topology")]
     pub source: Option<PathBuf>,
     /// Topology spec (`{nodes, edges, allowed_h_milli, allowed_j_milli}`)
@@ -322,22 +339,45 @@ pub fn assemble_record(
     rec
 }
 
-/// A deterministic synthetic ring Ising problem (`h=0`, `j=1`, ring edges),
-/// used when `bench run` is not given `--source`/`--topology`. Not
-/// timing-representative of the real corpus topology (degree 2 vs. ~18) —
-/// useful for micro checks only.
-#[allow(clippy::cast_possible_truncation)] // n bounded well under u32::MAX by CLI/kernel limits
-fn ring_graph(n: u64) -> IsingGraph {
+/// A deterministic synthetic circulant Ising problem (`h=0`, `j=1`): node i
+/// links to i+1 ..= i+degree/2 (mod n). Degree 2 is a ring. With `shuffle`,
+/// nodes are relabeled by a `ChaCha8` permutation of that seed, which keeps
+/// the graph and destroys index locality.
+#[allow(clippy::cast_possible_truncation)] // n bounded by MSA_MAX_NODES
+fn circulant_graph(n: u64, degree: u64, shuffle: Option<[u8; 32]>) -> IsingGraph {
     let n = n as usize;
-    let h = vec![0.0; n];
-    let j = vec![1.0; n];
-    let edges = (0..n).map(|i| (i, (i + 1) % n.max(1))).collect();
-    IsingGraph::new(h, j, edges)
+    let half = (degree / 2) as usize;
+    let mut label: Vec<usize> = (0..n).collect();
+    if let Some(seed) = shuffle {
+        let mut rng = ChaCha8Rng::from_seed(seed);
+        for i in (1..n).rev() {
+            let k = (rng.next_u32() as usize) % (i + 1);
+            label.swap(i, k);
+        }
+    }
+    let mut edges = Vec::with_capacity(n * half);
+    for i in 0..n {
+        for d in 1..=half {
+            edges.push((label[i], label[(i + d) % n.max(1)]));
+        }
+    }
+    let m = edges.len();
+    IsingGraph::new(vec![0.0; n], vec![1.0; m], edges)
 }
 
-/// One graph to bench in the grid: either the synthetic ring problem or a
+/// Refuse a synthetic degree the circulant cannot build.
+fn check_degree(degree: u64) -> Result<(), BenchError> {
+    if degree >= 2 && degree.is_multiple_of(2) {
+        return Ok(());
+    }
+    Err(BenchError::Args(format!(
+        "--degree {degree} must be even and at least 2"
+    )))
+}
+
+/// One graph to bench in the grid: either the synthetic circulant problem or a
 /// `--source` corpus record redrawn from its nonce. All models in one `bench
-/// run` invocation share a topology (the synthetic ring's `--nodes`, or
+/// run` invocation share a topology (the synthetic circulant graph's `--nodes`, or
 /// `--topology`'s node/edge set), so [`run_cell`] can name its output file
 /// from the first model alone.
 struct BenchModel {
@@ -350,11 +390,16 @@ struct BenchModel {
 }
 
 impl BenchModel {
-    /// The synthetic ring model, tagged with `--nonce`/`--topology-hash`
+    /// The synthetic circulant model, tagged with `--nonce`/`--topology-hash`
     /// metadata passthrough (synthetic problems have no real identity).
     fn synthetic(args: &RunArgs) -> Self {
         Self {
-            graph: ring_graph(args.nodes),
+            graph: circulant_graph(
+                args.nodes,
+                args.degree,
+                args.shuffle
+                    .then(|| nonce_seed(args.nonce.as_deref().unwrap_or(""))),
+            ),
             nonce: args.nonce.clone().unwrap_or_else(|| "0x0".to_owned()),
             topology_hash: args
                 .topology_hash
@@ -365,12 +410,13 @@ impl BenchModel {
 }
 
 /// Build the bench grid's models: a `--source` corpus (redrawn per nonce
-/// against `--topology`) when given, else the single synthetic ring problem.
+/// against `--topology`) when given, else the single synthetic circulant problem.
 fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
     if args.weights == 0 {
         return Err(BenchError::Args("--weights must be at least 1".into()));
     }
     let Some(source) = &args.source else {
+        check_degree(args.degree)?;
         let mut model = BenchModel::synthetic(args);
         reweight_model(&mut model, args.weights);
         return Ok(vec![model]);
@@ -399,15 +445,10 @@ fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
         .collect())
 }
 
-/// Use the corpus nonce as the `ChaCha8` seed, or the default all-zero seed
-/// for a synthetic model without a 64-hex nonce. Draw fields before couplings,
-/// using the protocol draw's word-modulo-range convention.
-fn reweight_model(model: &mut BenchModel, weights: u32) {
-    if weights == 1 {
-        return;
-    }
-    let bytes: Option<Vec<u8>> = model
-        .nonce
+/// Decode a 64-hex nonce as a `ChaCha8` seed, or the all-zero seed for any
+/// other string.
+fn nonce_seed(nonce: &str) -> [u8; 32] {
+    let bytes: Option<Vec<u8>> = nonce
         .as_bytes()
         .chunks_exact(2)
         .map(|pair| {
@@ -416,10 +457,20 @@ fn reweight_model(model: &mut BenchModel, weights: u32) {
             u8::try_from(high * 16 + low).ok()
         })
         .collect();
-    let seed = bytes
-        .filter(|_| model.nonce.len() == 64)
+    bytes
+        .filter(|_| nonce.len() == 64)
         .and_then(|bytes| bytes.try_into().ok())
-        .unwrap_or([0; 32]);
+        .unwrap_or([0; 32])
+}
+
+/// Use the corpus nonce as the `ChaCha8` seed, or the default all-zero seed
+/// for a synthetic model without a 64-hex nonce. Draw fields before couplings,
+/// using the protocol draw's word-modulo-range convention.
+fn reweight_model(model: &mut BenchModel, weights: u32) {
+    if weights == 1 {
+        return;
+    }
+    let seed = nonce_seed(&model.nonce);
     let mut rng = ChaCha8Rng::from_seed(seed);
     let field_range = 2 * u64::from(weights) + 1;
     for h in &mut model.graph.h {
@@ -465,9 +516,9 @@ fn best_energy_metric(reads: &[crate::SamplerResult]) -> Option<Metric> {
 struct SpanStart(Instant);
 
 /// `tracing_subscriber::Layer` that sums span busy-time by name into a shared
-/// map. `run_bench` reads (and drains) this between measured `bench_one`
+/// map. `run_bench` reads (and drains) this between measured `bench_many`
 /// calls to build each cell's [`HostSpans`] from the Task-2 seam spans,
-/// without threading extra return values out of `bench_one`/`sample_one`.
+/// without threading extra return values out of `bench_many`/`sample_one`.
 struct SpanAggregator {
     totals: Arc<Mutex<HashMap<String, u64>>>,
 }
@@ -516,6 +567,7 @@ fn take_cell(totals: &Arc<Mutex<HashMap<String, u64>>>) -> HashMap<String, u64> 
 struct BenchContext<'a> {
     device: &'a CudaDevice,
     kernel: KernelKind,
+    nonces: usize,
     backend: &'static str,
     device_name: String,
     totals: Arc<Mutex<HashMap<String, u64>>>,
@@ -525,7 +577,7 @@ struct BenchContext<'a> {
 ///
 /// # Errors
 ///
-/// [`BenchError::Device`] if the device fails to open or a `bench_one` call
+/// [`BenchError::Device`] if the device fails to open or a `bench_many` call
 /// fails; [`BenchError::Io`] for any output file/directory failure;
 /// [`BenchError::Fold`] if a Nsight report fails to parse; [`BenchError::Corpus`]
 /// if `--source`/`--topology` fail to load or a nonce fails to redraw.
@@ -541,7 +593,7 @@ pub fn run_bench(
     }
 }
 
-/// Refuse a `--reads` the kernel would silently clamp. `bench_one` caps reads
+/// Refuse a `--reads` the kernel would silently clamp. `bench_many` caps reads
 /// per nonce at `streaming::max_reads(kernel)`, and a clamped run would
 /// report the requested count against the clamped timing.
 fn check_reads(kernel: KernelKind, reads: u64) -> Result<(), BenchError> {
@@ -564,6 +616,11 @@ fn run_run(
     if args.msa_path.is_some() && kernel != KernelKind::Msa {
         return Err(BenchError::Args(
             "--msa-path requires the MSA kernel".into(),
+        ));
+    }
+    if args.msa_shared_spins.is_some() && kernel != KernelKind::Msa {
+        return Err(BenchError::Args(
+            "--msa-shared-spins requires the MSA kernel".into(),
         ));
     }
     std::fs::create_dir_all(&args.out).map_err(|e| BenchError::Io(e.to_string()))?;
@@ -592,9 +649,17 @@ fn run_run(
         // Open for the kernel actually being benched, at the requested
         // capacity: the defaulting `open` would compile SA at 5000 and reject
         // any larger graph regardless of which binary is running.
-        let device = CudaDevice::open_with_nodes(device_index, kernel, max_nodes)
+        let mut device = CudaDevice::open_with_nodes(device_index, kernel, max_nodes)
             .map_err(|e| BenchError::Device(e.to_string()))?;
+        device.msa_shared_spins_cap = args.msa_shared_spins;
         check_reads(kernel, args.reads)?;
+        let width = stream_width(&device, kernel);
+        let nonces = usize::try_from(args.nonces).unwrap_or(usize::MAX);
+        if nonces > width {
+            return Err(BenchError::Args(format!(
+                "--nonces {nonces} exceeds the device's stream width of {width}"
+            )));
+        }
         let device_name = device
             .name()
             .unwrap_or_else(|_| format!("cuda-{device_index}"));
@@ -604,6 +669,7 @@ fn run_run(
         let ctx = BenchContext {
             device: &device,
             kernel,
+            nonces,
             backend: backend_name(kernel),
             device_name,
             totals,
@@ -624,7 +690,7 @@ fn run_run(
 /// per (model, measured repeat) to a single
 /// `<out>/<backend>_n<nodes>_s<num_sweeps>.jsonl` file. `nodes` is read off
 /// the first model: every model in a `bench run` invocation shares one
-/// topology (the synthetic ring's `--nodes`, or `--topology`'s node set).
+/// topology (the synthetic circulant graph's `--nodes`, or `--topology`'s node set).
 fn run_cell(
     ctx: &BenchContext<'_>,
     args: &RunArgs,
@@ -687,7 +753,7 @@ fn run_model(
     for i in 0..(args.warmup + args.repeats) {
         take_cell(&ctx.totals); // clear stale totals before the measured call
         let model_start = Instant::now();
-        let (reads, dev) = bench_one(ctx.device, graph, &params, ctx.kernel, msa_lane)
+        let (reads, dev) = bench_many(ctx.device, graph, &params, ctx.kernel, msa_lane, ctx.nonces)
             .map_err(|e| BenchError::Device(e.to_string()))?;
         let model_total_ns = u64::try_from(model_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let spans = take_cell(&ctx.totals);
@@ -711,6 +777,24 @@ fn run_model(
             model_total_ns,
         );
         record.metrics.extend(best_energy_metric(&reads));
+        #[allow(clippy::cast_precision_loss)] // counts far below 2^53
+        record.metrics.push(Metric::new(
+            "concurrent_models",
+            ctx.nonces as f64,
+            "count",
+            Source::Tracing,
+        ));
+        if ctx.kernel == KernelKind::Msa {
+            let layout =
+                crate::streaming::msa_layout(ctx.device, graph.num_nodes(), params.num_reads);
+            #[allow(clippy::cast_precision_loss)] // counts far below 2^53
+            record.metrics.push(Metric::new(
+                "shared_spins",
+                layout.shared_spins as f64,
+                "spins",
+                Source::Tracing,
+            ));
+        }
         let line = serde_json::to_string(&record).map_err(|e| BenchError::Io(e.to_string()))?;
         writeln!(file, "{line}").map_err(|e| BenchError::Io(e.to_string()))?;
     }
@@ -785,7 +869,10 @@ fn fold_per_sweep(args: &FoldArgs) -> Result<Option<u64>, BenchError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_record, check_reads, CellConfig, HostSpans, SpanAggregator};
+    use super::{
+        assemble_record, check_degree, check_reads, circulant_graph, CellConfig, HostSpans,
+        SpanAggregator,
+    };
     use crate::schema::Scope;
     use crate::streaming::DeviceTimings;
     use crate::KernelKind;
@@ -800,13 +887,44 @@ mod tests {
     }
 
     #[test]
+    fn circulant_degree_two_is_the_old_ring() {
+        let g = circulant_graph(5, 2, None);
+        assert_eq!(&*g.edges, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)]);
+    }
+
+    #[test]
+    fn circulant_degree_forty_has_n_times_twenty_edges_and_degree_forty() {
+        let g = circulant_graph(1000, 40, None);
+        assert_eq!(g.edges.len(), 20_000);
+        let topo = crate::topology::SelfFeedingTopology::build(&g);
+        assert_eq!(topo.max_degree(), 40);
+    }
+
+    #[test]
+    fn shuffle_relabels_without_changing_the_degree_sequence() {
+        let plain = circulant_graph(500, 20, None);
+        let shuffled = circulant_graph(500, 20, Some([7; 32]));
+        assert_eq!(plain.edges.len(), shuffled.edges.len());
+        assert_ne!(plain.edges, shuffled.edges);
+        let topo = crate::topology::SelfFeedingTopology::build(&shuffled);
+        assert_eq!(topo.max_degree(), 20);
+    }
+
+    #[test]
+    fn odd_degree_is_refused() {
+        assert!(check_degree(3).is_err());
+        assert!(check_degree(0).is_err());
+        assert!(check_degree(40).is_ok());
+    }
+
+    #[test]
     fn weights_one_preserves_synthetic_graph() {
         use clap::Parser as _;
         let args = RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "1"])
             .unwrap()
             .args;
         let models = super::load_models(&args).unwrap();
-        let original = super::ring_graph(args.nodes);
+        let original = super::circulant_graph(args.nodes, 2, None);
         assert_eq!(models[0].graph.h, original.h);
         assert_eq!(models[0].graph.j, original.j);
         assert_eq!(models[0].graph.edges, original.edges);

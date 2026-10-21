@@ -134,3 +134,28 @@ fn bench_one_msa_scores_and_reports_positive_kernel_time() {
     assert_eq!(reads.len(), 8);
     assert!(timings.kernel_ns > 0);
 }
+
+/// Nonce 0's reads must not depend on how many other nonces share the spill
+/// buffer: a wrong per-nonce offset would let them overwrite it.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[serial]
+fn nonce_zero_reads_ignore_concurrent_spilled_nonces() {
+    use quip_solver_cuda::streaming::{bench_many, stream_width};
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 5000).unwrap();
+    let graph = ring(3000);
+    let params = SampleParams {
+        num_reads: 128,
+        num_sweeps: 32,
+        sweeps_per_beta: 4,
+        seed: 5,
+        ..SampleParams::default()
+    };
+    let (alone, _) = bench_many(&device, &graph, &params, KernelKind::Msa, None, 1).unwrap();
+    device.msa_shared_spins_cap = Some(64);
+    let width = stream_width(&device, KernelKind::Msa);
+    let (crowded, _) = bench_many(&device, &graph, &params, KernelKind::Msa, None, width).unwrap();
+    let a: Vec<_> = alone.iter().map(|r| r.spins.clone()).collect();
+    let c: Vec<_> = crowded.iter().map(|r| r.spins.clone()).collect();
+    assert_eq!(a, c);
+}

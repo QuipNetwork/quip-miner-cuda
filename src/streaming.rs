@@ -1739,16 +1739,18 @@ fn timing_event(device: &CudaDevice) -> Result<CudaEvent, SampleError> {
         .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?)
 }
 
-/// Poll `sess`'s slot-0 ctrl mailbox until `SLOT_COMPLETE`, returning the host
-/// wall time spent waiting. Extracted from [`bench_one`] to keep it under the
+/// Poll `sess`'s first `num_nonces` ctrl mailboxes until all are `SLOT_COMPLETE`, returning the host
+/// wall time spent waiting. Extracted from [`bench_many`] to keep it under the
 /// crate's complexity cap.
 fn poll_until_complete(
     sess: &SelfFeedingSession<'_>,
+    num_nonces: usize,
     deadline: Instant,
 ) -> Result<u64, SampleError> {
     let poll_start = Instant::now();
     loop {
-        if sess.poll_ctrl()?[0] == SLOT_COMPLETE {
+        let ctrl = sess.poll_ctrl()?;
+        if (0..num_nonces).all(|n| ctrl[n * CTRL_STRIDE] == SLOT_COMPLETE) {
             return Ok(u64::try_from(poll_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
         if Instant::now() > deadline {
@@ -1784,6 +1786,33 @@ pub fn bench_one(
     kernel: KernelKind,
     msa_lane: Option<MsaLane>,
 ) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
+    bench_many(device, graph, params, kernel, msa_lane, 1)
+}
+
+/// [`bench_one`] with `num_nonces` blocks annealing the same model at once,
+/// one per SM, the way a mining session fills the device. Only nonce 0's
+/// reads are downloaded and scored, so host time does not grow with
+/// `num_nonces`.
+///
+/// # Errors
+///
+/// Those of [`bench_one`], plus [`SampleError::Unsupported`] when
+/// `num_nonces` exceeds the device's stream width.
+pub fn bench_many(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: KernelKind,
+    msa_lane: Option<MsaLane>,
+    num_nonces: usize,
+) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
+    let num_nonces = num_nonces.max(1);
+    let width = stream_width(device, kernel);
+    if num_nonces > width {
+        return Err(SampleError::Unsupported(format!(
+            "{num_nonces} concurrent models exceed the device's stream width of {width}"
+        )));
+    }
     let plan = bench_plan(device, graph, kernel, msa_lane)?;
     let n = graph.num_nodes();
     if n == 0 {
@@ -1811,7 +1840,7 @@ pub fn bench_one(
         device,
         kernel,
         topology,
-        1,
+        num_nonces,
         reads_per_nonce,
         beta.len(),
         SessionArithmetic {
@@ -1825,8 +1854,10 @@ pub fn bench_one(
     let up1 = timing_event(device)?;
     up0.record(&sess.stream_transfer)?;
     sess.upload_beta_schedule(&beta)?;
-    sess.upload_slot(0, 0, graph)?;
-    sess.set_exit_now(0)?;
+    for nonce in 0..num_nonces {
+        sess.upload_slot(nonce, 0, graph)?;
+        sess.set_exit_now(nonce)?;
+    }
     up1.record(&sess.stream_transfer)?;
     sess.stream_transfer.synchronize()?; // commit setup before timing the launch
     let upload_ns = ms_to_ns(up0.elapsed_ms(&up1)?);
@@ -1836,12 +1867,12 @@ pub fn bench_one(
     let k1 = timing_event(device)?;
     let seed = kernel_seed(params.seed);
     k0.record(&sess.stream_compute)?;
-    sess.launch(1, beta.len(), sweeps_per_beta, seed)?;
+    sess.launch(num_nonces, beta.len(), sweeps_per_beta, seed)?;
     k1.record(&sess.stream_compute)?;
 
     // --- Poll to completion (host wall), then timed download. ---
-    let deadline = Instant::now() + Duration::from_mins(2);
-    let poll_wait_ns = poll_until_complete(&sess, deadline)?;
+    let deadline = Instant::now() + Duration::from_mins(10);
+    let poll_wait_ns = poll_until_complete(&sess, num_nonces, deadline)?;
     let kernel_ns = ms_to_ns(k0.elapsed_ms(&k1)?);
 
     let dl0 = timing_event(device)?;

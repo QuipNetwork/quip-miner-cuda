@@ -139,6 +139,35 @@ mod cli_tests {
     }
 
     #[test]
+    fn parses_dense_bench_flags() {
+        let cli = Cli::parse_from([
+            "quip-cuda-msa",
+            "bench",
+            "run",
+            "--nodes",
+            "200000",
+            "--degree",
+            "40",
+            "--shuffle",
+            "--nonces",
+            "48",
+            "--msa-shared-spins",
+            "0",
+            "--sweeps",
+            "64",
+            "--out",
+            "/tmp/x",
+        ]);
+        let Some(Command::Bench(BenchAction::Run(args))) = cli.command else {
+            panic!("expected a parsed `bench run`");
+        };
+        assert_eq!(args.degree, 40);
+        assert!(args.shuffle);
+        assert_eq!(args.nonces, 48);
+        assert_eq!(args.msa_shared_spins, Some(0));
+    }
+
+    #[test]
     fn parses_bench_run_subcommand() {
         let cli = Cli::parse_from([
             "quip-cuda-msa",
