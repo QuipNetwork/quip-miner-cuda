@@ -1,9 +1,10 @@
 # Spill measurements on the A4000
 
 The MSA kernel keeps all spins in shared memory up to N = 5,791 nodes at 128 reads.
-Past that size, throughput falls in two steps.
+Past that size, throughput falls immediately.
+A second step follows at 48 models with shuffled labels.
 At degree 20 in natural index order, one model drops 30% between 5,791 and 8,000 nodes, and 48 models drop 40%.
-At 48 models the second step comes near 11,600 nodes, as the L2 estimate predicts, but only when the node labels are in shuffled order.
+That second step comes between 8,000 and 11,582 nodes, consistent with the L2 estimate of about 11,000, but only when the node labels are in shuffled order.
 At 200,000 nodes and 4,000,000 edges (degree 40), 48 models run at 22.6 G lane-updates/s.
 That is 21% of the all-shared degree-40 peak of 106.5 G lane-updates/s.
 The hypothesis that DRAM traffic at the ceiling comes mainly from topology is not supported (see Breakdown).
@@ -18,7 +19,7 @@ The hypothesis that DRAM traffic at the ceiling comes mainly from topology is no
 | Image | `quip-solver-cuda-ci`, `sha256:294450ef352cdc40a04dff7ccc1f7f1eaffc9cf10f6d7b6e61206edbd1e9573c` |
 | Commit | `0cdfa73` (branch `feat/msa-dram-spill`), binary built from this commit |
 | Run | October 21, 2026, 16:34 to 17:16 Eastern time |
-| Idle check | GPU 1 showed 0% load and 9 MiB used before the `ncu` slice and after the grid |
+| Idle check | GPU 1 showed 0% load and 9 MiB used at the start of the session, before the build, and after the grid, just before the `ncu` slice |
 
 GPU 0 took no part in the runs.
 The idle check for the main grid start ran in the same step as a blocked command, so no reading exists from the instant before its first cell.
@@ -152,7 +153,7 @@ The 48-model rows use three repeats per cell.
 | 48 | 0 | 381.3 | 2.32x |
 
 The first run of the one-model rows used three repeats and showed a spread of about 30%.
-The same configuration (K = 5,791) measured 123.5 µs in the node sweep and 160.7 µs there.
+The all-shared configuration (K = 5,791) measured 123.5 µs in the node sweep and 160.7 µs in that first K sweep, a 30% difference.
 A rerun used nine repeats and two passes in opposite K orders (5,791, 0, 4,000, 1,000, 2,000, then the reverse).
 Times are medians in microseconds. The last two columns use the lowest repeat of the two passes.
 
@@ -189,11 +190,15 @@ Plain order, same bench settings as the unit cells. The control at degree 20 fol
 In the Task 4b design, a spin of degree over 20 on the weighted lanes reloads its neighbour words once per 8-lane group.
 Degree 20 never triggers that path, so the degree-20 rows show the cost of 4-byte coefficients and weighted arithmetic alone.
 Degree 40 triggers the path for every spin.
-At N = 5,791 no spill occurs. The weighted lane costs 4.77x at degree 20 and 8.68x at degree 40, so the reload adds a factor of 1.8.
-An independent reference supports the 4.8x level. The Advantage2 gate run (4,577 nodes, degree at most 20, 128 reads) shows 6.4x for weighted `i32` against unit (launch medians of 567.6 ms and 89.3 ms).
+At N = 5,791 no spill occurs. The weighted lane costs 4.77x at degree 20 and 8.68x at degree 40, so the reload adds an inferred factor of 1.8 (8.68 divided by 4.77).
+The Advantage2 gate run gives a reference of the same order. It uses 4,577 nodes, degree at most 20, and 128 reads, and shows 6.4x for weighted `i32` against unit (launch medians of 567.6 ms and 89.3 ms).
+That graph and run differ from this grid, so the ratio does not confirm 4.8x. It shows only that weighted lanes cost a multiple of the unit lane at degree 20 or less.
 At large N the weighted degree-20 lane costs only 1.4x to 1.5x of the unit lane, because memory traffic dominates both.
-The degree-40 lane still costs 6.3x to 6.6x there, so the reload adds a factor of 4.3 to 4.6 at 64,000 and 200,000 nodes.
-The reload is the main cost of weighted lanes at degree 40, and it appears at every size.
+The degree-40 lane still costs 6.3x to 6.6x there, so the inferred reload factor is 4.3 to 4.6 at 64,000 and 200,000 nodes (6.57 divided by 1.51, and 6.31 divided by 1.38).
+At N = 5,791 the coefficient and arithmetic cost (4.8x) exceeds the inferred reload cost (1.8x).
+At 64,000 and 200,000 nodes the inferred reload cost exceeds the coefficient cost (1.4x to 1.5x).
+No run isolates the reload. The split comes from the ratio of the degree-40 and degree-20 weighted ratios and from the kernel design.
+Degree 40 also doubles the edge count, but each ratio divides by the unit lane at the same degree, which removes most of that factor.
 A weighted degree-40 model at 200,000 nodes takes 91.8 s end to end, against 17.4 s for the unit lane.
 The degree-20 control was not timed end to end.
 
@@ -241,7 +246,7 @@ With 48 models, the L2 hit rate falls from 93.2% to 59.7% and DRAM use rises fro
 DRAM use then levels off. At 200,000 nodes about 75% of DRAM bandwidth is idle.
 Warps active is 16.7% of the peak at 48 models and 200,000 nodes.
 One model leaves DRAM close to idle at every size (below 1%) and still falls to 66% L2 hits at 200,000 nodes.
-Both observations point to latency-bound access, not a bandwidth limit.
+Both observations suggest latency-bound access, not a bandwidth limit.
 
 ## Breakdown
 
@@ -251,7 +256,7 @@ Both observations point to latency-bound access, not a bandwidth limit.
 | --- | --- | --- |
 | All shared | N up to 5,791 | N up to 5,791 |
 | Spilled, within L2 | 5,791 to about 250,000 (estimate) | 5,791 to about 11,000 (estimate) |
-| Spilled, to DRAM | not reached by the 200,000 ceiling | beyond about 11,000 |
+| Spilled, to DRAM | beyond about 250,000 (estimate), past the 200,000 ceiling | beyond about 11,000 (estimate) |
 
 The first transition shows in throughput between 5,791 and 8,000 nodes in every series.
 The drop is 25% to 30% at one model and 40% to 45% at 48 models, in plain order.
@@ -261,12 +266,14 @@ The second transition appears at 48 models between 8,000 and 11,582 nodes with s
 Degree-20 shuffled throughput halves from 130.2 to 64.1 G/s, and degree 40 drops from 54.5 to 33.0 G/s.
 The spill footprint is 1.7 MB at 8,000 nodes and 4.4 MB at 11,582 nodes with 48 models, on either side of the 4 MB L2.
 In plain order the same step is mild (118.0 to 96.6 G/s at degree 20) and no separate cliff appears.
-Neighbours in plain order sit close in index, so spilled spin words reuse cache lines.
+A possible cause is that neighbours in plain order sit close in index, so spilled spin words share cache lines. The grid does not measure this.
 
-At one model, plain order shows no L2 exit up to 200,000 nodes. Throughput is flat from 100,000 to 200,000.
+At one model, plain-order throughput shows no step up to 200,000 nodes and is flat from 100,000 to 200,000.
+The cache profile shows the L2 hit rate at one model falling from 96.8% to 66.2% over the same range, while DRAM stays below 1% of peak.
+The L2 hit rate falls without a throughput step.
 Shuffled order at one model drops at 200,000 nodes: 2.34 to 1.87 G/s at degree 20 and 1.34 to 1.00 G/s at degree 40.
 The spill buffer is 3.1 MB at that size, and topology arrays compete for the same L2.
-This is the only L2 exit seen at one model, and it sits just under the predicted 250,000.
+This is the only throughput drop at one model that suggests L2 pressure, and it sits just under the predicted 250,000.
 
 **2. Cost of spill alone.** Moving the last 1,791 spins of a 5,791-node model out of shared memory costs 1.65x at one model (nine-repeat rerun, lowest repeats) and 2.03x at 48 models.
 Further reduction of K changes the one-model cost by at most 0.2x and in no monotonic order. At 48 models the three-repeat cells add up to 0.46x.
