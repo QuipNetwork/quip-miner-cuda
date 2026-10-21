@@ -6,7 +6,7 @@
 use quip_solver_cuda::capacity::MSA_DEFAULT_NODES;
 use quip_solver_cuda::cuda_device::{CudaDevice, MsaLane};
 use quip_solver_cuda::sampler::sample_ising;
-use quip_solver_cuda::streaming::bench_one;
+use quip_solver_cuda::streaming::{bench_one, msa_layout};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams, SamplerResult};
 use serial_test::serial;
 
@@ -56,6 +56,7 @@ fn unit_spill_matches_all_shared_at_every_cap() {
     let shared = spins(&sample_ising(&device, &graph, &params(), KernelKind::Msa).unwrap());
     for cap in [0, 1, n - 1, n, n + 5] {
         device.msa_shared_spins_cap = Some(cap);
+        assert_eq!(msa_layout(&device, n, 128).shared_spins, cap.min(n));
         let spilled = sample_ising(&device, &graph, &params(), KernelKind::Msa).unwrap();
         assert_eq!(spins(&spilled), shared, "unit samples differ at cap {cap}");
     }
@@ -74,6 +75,7 @@ fn weighted_spill_matches_all_shared_on_both_lanes() {
             bench_one(&device, &graph, &params(), KernelKind::Msa, Some(lane)).unwrap();
         for cap in [0, 1, n - 1, n] {
             device.msa_shared_spins_cap = Some(cap);
+            assert_eq!(msa_layout(&device, n, 128).shared_spins, cap.min(n));
             let (spilled, _) =
                 bench_one(&device, &graph, &params(), KernelKind::Msa, Some(lane)).unwrap();
             assert_eq!(

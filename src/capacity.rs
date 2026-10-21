@@ -619,9 +619,6 @@ mod tests {
         assert_eq!(advertised_nodes(KernelKind::Gibbs, 64), GIBBS_DEFAULT_NODES);
     }
 
-    /// An A4000 opts in to 101376 bytes (99 KB) per block. Less the two
-    /// static ints and the 8704-byte threshold structures, two 8-byte
-    /// words per spin fit 5791 spins.
     #[test]
     fn msa_spill_words_covers_every_nonce_past_the_shared_spins() {
         assert_eq!(msa_spill_words(5000, 5000, 2, 48), 0);
@@ -633,6 +630,9 @@ mod tests {
         assert_eq!(msa_spill_words(10, 0, 1, 1), 10);
     }
 
+    /// An A4000 opts in to 101376 bytes (99 KB) per block. Less the two
+    /// static ints and the 8704-byte threshold structures, two 8-byte
+    /// words per spin fit 5791 spins.
     #[test]
     fn msa_budget_on_a_99_kb_optin() {
         assert_eq!(msa_dynamic_shared_bytes(101_376), 101_360);

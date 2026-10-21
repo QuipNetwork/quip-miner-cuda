@@ -1032,8 +1032,10 @@ impl<'a> SelfFeedingSession<'a> {
         // SAFETY: the 23 `b.arg` calls above mirror `cuda_msa_self_feeding` in
         // `kernels/msa.cu` in order, type and count; every buffer is sized by
         // `build` from the same `dims` the kernel receives, and the colour
-        // buffers are bounded by `num_colors` / `dims.n`. `d_spill` holds
-        // `msa_spill_words` u64 for every nonce of this launch.
+        // buffers are bounded by `num_colors` / `dims.n`. `msa_layout` keeps
+        // `shared_spins` within the shared budget by construction, and
+        // `d_spill` holds `msa_spill_words` u64 for every nonce of this
+        // launch.
         unsafe { b.launch(cfg) }?;
         Ok(())
     }
@@ -1120,9 +1122,10 @@ impl<'a> SelfFeedingSession<'a> {
         // `cuda_msa_self_feeding` compiled with QUIP_MSA_WEIGHTED and its lane
         // define, in order, type and count. J and h are i32. `build` sizes
         // every slot and colouring buffer from these same dimensions, and
-        // checks both the degree and shared spin-state budget. The three I32
-        // buffers hold num_betas, num_betas and NEGLOG_LEN entries. `d_spill`
-        // holds `msa_spill_words` u64 for every nonce of this launch. `Drop`
+        // checks the degree. `msa_layout` keeps `shared_spins` within the
+        // shared budget by construction. The three I32 buffers hold
+        // num_betas, num_betas and NEGLOG_LEN entries. `d_spill` holds
+        // `msa_spill_words` u64 for every nonce of this launch. `Drop`
         // signals exit and synchronizes the compute stream before freeing them.
         unsafe { b.launch(cfg) }?;
         Ok(())
