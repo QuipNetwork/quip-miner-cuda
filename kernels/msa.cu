@@ -21,7 +21,7 @@
 // field h_i in {-1, 0, +1} is one more bond to a spin pinned at +1.
 //
 // Preconditions the host enforces (streaming::build_msa_state): every spin
-// has at most MSA_MAX_DEG neighbours. The unit build reads couplings and
+// has at most MSA_MAX_DEG (62) neighbours, counted MSA_CHUNK at a time. The unit build reads couplings and
 // fields by sign, and the host sends it unit models only. Weighted builds
 // read them at full width, and the host bounds the local field at 2^24 - 1
 // scale units.
@@ -72,7 +72,7 @@
 // Multi-spin constants
 // ==============================================================================
 // Bit planes of the satisfied-bond counter. MSA_MAX_DEG neighbours plus one
-// field bond need a count up to 21; six planes hold up to 63.
+// field bond need a count up to 63; six planes hold exactly that.
 #define MSA_PLANES    6
 #define MSA_MAX_COUNT 63
 // Acceptance thresholds per rung: cut[m] for m in 0..=MSA_MAX_FIELD.
@@ -81,9 +81,14 @@
 // is a mask.
 #define MSA_ROW       8192
 #define MSA_ROW_MASK  (MSA_ROW - 1)
-// Neighbours prefetched and counted per spin: Zephyr's degree bound. The
-// host refuses a denser topology (capacity::MSA_MAX_DEGREE mirrors this).
-#define MSA_MAX_DEG   20
+// Neighbours per counting pass: one popcount21 tree takes MSA_CHUNK
+// neighbours plus the field bond. A spin of degree <= MSA_CHUNK takes one
+// pass with the inputs the single-pass kernel used.
+#define MSA_CHUNK     20
+// Most neighbours per spin. With the field bond the count reaches 63, the
+// most MSA_PLANES planes hold. The host refuses a denser topology
+// (capacity::MSA_MAX_DEGREE mirrors this).
+#define MSA_MAX_DEG   62
 
 // Coefficient width. The default build is the unit-weight kernel every
 // mining job runs, and its preprocessed source is byte-for-byte today's.
@@ -188,6 +193,20 @@ __device__ __forceinline__ u64 le_constant(const u64* planes, int limit) {
     return ~ge;
 }
 
+// acc += add per lane, MSA_PLANES-bit ripple add. The host bounds every
+// count at MSA_MAX_COUNT, so the final carry is always zero.
+__device__ __forceinline__ void add_planes(u64* acc, const u64* add) {
+    u64 carry = 0ull;
+    #pragma unroll
+    for (int k = 0; k < MSA_PLANES; ++k) {
+        u64 a = acc[k];
+        u64 b = add[k];
+        u64 t = a ^ b;
+        acc[k] = t ^ carry;
+        carry = (a & b) | (t & carry);
+    }
+}
+
 // ==============================================================================
 // Spin storage
 // ==============================================================================
@@ -239,6 +258,133 @@ struct MsaModel {
     const long long* neglog_table;
 #endif
 };
+
+#ifndef QUIP_MSA_WEIGHTED
+// Satisfied-bond count of spin `var` across the 64 lanes of word `w`, into
+// MSA_PLANES bit planes, and the bond count d (field included). The field
+// rides in the first pass's 21st input; later passes leave it zero.
+template <bool SPILL>
+__device__ __forceinline__ int count_satisfied(
+    const MsaModel& mdl, const SpinStore<SPILL>& st,
+    u64 bi, int w, int pstart, int pend, int h, u64* planes) {
+    int d = 0;
+    bool first = true;
+    for (int base = pstart; first || base < pend; base += MSA_CHUNK) {
+        int nb[MSA_CHUNK];
+        int jj[MSA_CHUNK];
+        #pragma unroll
+        for (int q = 0; q < MSA_CHUNK; ++q) {
+            int p = base + q;
+            bool ok = p < pend;
+            nb[q] = ok ? __ldg(&mdl.csr_col_ind[p]) : 0;
+            jj[q] = ok ? (int)__ldg(&mdl.J[p]) : 0;
+        }
+        u64 x[MSA_CHUNK + 1];
+        #pragma unroll
+        for (int q = 0; q < MSA_CHUNK; ++q) {
+            int J = jj[q];
+            u64 sj = st.at(nb[q], w);
+            u64 l = ((J < 0) ? ~0ull : 0ull) ^ bi ^ sj;
+            x[q] = (J != 0) ? l : 0ull;
+            d += (J != 0);
+        }
+        if (first) {
+            x[MSA_CHUNK] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0ull;
+            d += (h != 0);
+            popcount21(x, planes);
+            first = false;
+        } else {
+            x[MSA_CHUNK] = 0ull;
+            u64 part[MSA_PLANES];
+            popcount21(x, part);
+            add_planes(planes, part);
+        }
+    }
+    return d;
+}
+#else
+// Per-lane Metropolis test of the weighted kernel, with this spin's draw.
+struct LaneTest {
+#ifdef QUIP_MSA_LANE_I32
+    long long rung_beta;
+    int rung_cut;
+    long long bound;
+#else
+    float beta;
+    float u;
+#endif
+
+    __device__ __forceinline__ bool ok(int field, u64 bi, int lane) const {
+        const int de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
+#ifdef QUIP_MSA_LANE_I32
+        return de <= 0 || (de <= rung_cut && (long long)de * rung_beta < bound);
+#else
+        return de <= 0 || u < __expf(-beta * (float)de);
+#endif
+    }
+};
+
+// Accept mask of spin `var`, word `w`. A spin of degree <= MSA_CHUNK keeps
+// its neighbour words in registers, as the single-pass kernel did. A denser
+// spin sums per-lane fields chunk by chunk into a local array; integer sums
+// are exact in any order, so the result does not depend on the chunking.
+template <bool SPILL>
+__device__ __forceinline__ u64 weighted_accept(
+    const MsaModel& mdl, const SpinStore<SPILL>& st,
+    u64 bi, int w, int pstart, int pend, int h, const LaneTest& test) {
+    u64 accept = 0ull;
+    if (pend - pstart <= MSA_CHUNK) {
+        int jj[MSA_CHUNK];
+        u64 sw[MSA_CHUNK];
+        #pragma unroll
+        for (int q = 0; q < MSA_CHUNK; ++q) {
+            int p = pstart + q;
+            bool ok = p < pend;
+            int nb = ok ? __ldg(&mdl.csr_col_ind[p]) : 0;
+            jj[q] = ok ? (int)__ldg(&mdl.J[p]) : 0;
+            sw[q] = st.at(nb, w);
+        }
+        for (int lane = 0; lane < 64; ++lane) {
+            int field = h;
+            #pragma unroll
+            for (int q = 0; q < MSA_CHUNK; ++q) {
+                // Spin bit 1 is -1. Missing neighbours have J = 0.
+                field += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
+            }
+            accept |= (u64)test.ok(field, bi, lane) << lane;
+        }
+        return accept;
+    }
+    int field[64];
+    for (int lane = 0; lane < 64; ++lane) {
+        field[lane] = h;
+    }
+    for (int base = pstart; base < pend; base += MSA_CHUNK) {
+        int jj[MSA_CHUNK];
+        u64 sw[MSA_CHUNK];
+        #pragma unroll
+        for (int q = 0; q < MSA_CHUNK; ++q) {
+            int p = base + q;
+            bool ok = p < pend;
+            int nb = ok ? __ldg(&mdl.csr_col_ind[p]) : 0;
+            jj[q] = ok ? (int)__ldg(&mdl.J[p]) : 0;
+            sw[q] = st.at(nb, w);
+        }
+        for (int lane = 0; lane < 64; ++lane) {
+            int sum = 0;
+            #pragma unroll
+            for (int q = 0; q < MSA_CHUNK; ++q) {
+                sum += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
+            }
+            field[lane] += sum;
+        }
+    }
+    for (int lane = 0; lane < 64; ++lane) {
+        accept |= (u64)test.ok(field[lane], bi, lane) << lane;
+    }
+    return accept;
+}
+#endif
 
 // Anneal one model and pack its reads. Returns true when the host aborted the
 // model (EXIT_ABORT); the caller then never publishes the slot. `cut`, `row`
@@ -322,72 +468,27 @@ __device__ __forceinline__ bool anneal_model(
                     int pend = __ldg(&mdl.csr_row_ptr[var + 1]);
                     int h = __ldg(&mdl.h[var]);
 
-                    // Prefetch every neighbour index and coupling before
-                    // touching spin state.
-                    int nb[MSA_MAX_DEG];
-                    int jj[MSA_MAX_DEG];
-                    #pragma unroll
-                    for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                        int p = pstart + q;
-                        bool ok = p < pend;
-                        nb[q] = ok ? __ldg(&mdl.csr_col_ind[p]) : 0;
-                        jj[q] = ok ? (int)__ldg(&mdl.J[p]) : 0;
-                    }
-
 #ifdef QUIP_MSA_WEIGHTED
                     u64 bi = st.at(var, w);
-                    u64 sw[MSA_MAX_DEG];
-                    #pragma unroll
-                    for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                        sw[q] = st.at(nb[q], w);
-                    }
                     const u64 draw = splitmix64(
                         mdl.slot_seed ^ ((u64)beta_idx << 40)
                         ^ ((u64)sweep << 20) ^ (u64)var);
+                    LaneTest test;
 #ifdef QUIP_MSA_LANE_I32
-                    const long long bound = __ldg(&mdl.neglog_table[draw & NEGLOG_MASK]);
+                    test.rung_beta = rung_beta;
+                    test.rung_cut = rung_cut;
+                    test.bound = __ldg(&mdl.neglog_table[draw & NEGLOG_MASK]);
 #else
+                    test.beta = beta;
                     // 23 bits keep k + 0.5f exact, so u never reaches 1.0f.
-                    const float u = ((float)(draw >> 41) + 0.5f) * 1.1920929e-7f;
+                    test.u = ((float)(draw >> 41) + 0.5f) * 1.1920929e-7f;
 #endif
-                    u64 accept = 0ull;
-                    for (int lane = 0; lane < 64; ++lane) {
-                        int field = h;
-                        #pragma unroll
-                        for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                            // Spin bit 1 is -1. Missing neighbours have J = 0.
-                            field += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
-                        }
-                        const int de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
-#ifdef QUIP_MSA_LANE_I32
-                        const bool ok = de <= 0
-                            || (de <= rung_cut && (long long)de * rung_beta < bound);
+                    st.at(var, w) = bi ^ weighted_accept(mdl, st, bi, w, pstart, pend, h, test);
 #else
-                        const bool ok = de <= 0 || u < __expf(-beta * (float)de);
-#endif
-                        accept |= (u64)ok << lane;
-                    }
-                    st.at(var, w) = bi ^ accept;
-#else
-                    // Satisfied-bond bits per neighbour, plus the field as a
-                    // ghost bond to a spin pinned at +1.
                     u64 bi = st.at(var, w);
-                    u64 x[MSA_MAX_DEG + 1];
-                    int d = 0;
-                    #pragma unroll
-                    for (int q = 0; q < MSA_MAX_DEG; ++q) {
-                        int J = jj[q];
-                        u64 sj = st.at(nb[q], w);
-                        u64 l = ((J < 0) ? ~0ull : 0ull) ^ bi ^ sj;
-                        x[q] = (J != 0) ? l : 0ull;
-                        d += (J != 0);
-                    }
-                    x[MSA_MAX_DEG] = (h != 0) ? ((h < 0) ? ~bi : bi) : 0ull;
-                    d += (h != 0);
-
-                    // Metropolis: accept where L <= (d + M) / 2.
                     u64 planes[MSA_PLANES];
-                    popcount21(x, planes);
+                    int d = count_satisfied(mdl, st, bi, w, pstart, pend, h, planes);
+                    // Metropolis: accept where L <= (d + M) / 2.
                     int m = row[(var + off) & MSA_ROW_MASK];
                     int limit = (d + m) >> 1;
                     u64 accept = (limit >= d) ? ~0ull : le_constant(planes, limit);

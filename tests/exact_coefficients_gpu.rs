@@ -184,11 +184,66 @@ fn weighted_msa_requires_an_msa_device_open() {
     );
 }
 
+/// Ferromagnetic `K_n` with every field -1: all spins +1 is the unique ground
+/// state, at -(n(n-1)/2) * `scale_j` - n * `scale_h`.
+fn ferro_complete(n: usize, scale_j: f64, scale_h: f64) -> IsingGraph {
+    let mut edges = Vec::new();
+    for a in 0..n {
+        for b in a + 1..n {
+            edges.push((a, b));
+        }
+    }
+    let j = vec![-scale_j; edges.len()];
+    IsingGraph::new(vec![-scale_h; n], j, edges)
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn ferro_ground_milli(n: usize, scale_j: i64, scale_h: i64) -> i64 {
+    let n = n as i64;
+    -1000 * (n * (n - 1) / 2 * scale_j + n * scale_h)
+}
+
+/// Degree 21 is the first two-pass spin and degree 62 the ceiling. Every
+/// lane must reach the ground state, which a wrong carry in the chunked
+/// counter or the chunked weighted field would miss.
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
-fn msa_refuses_k22_on_unit_and_weighted_paths() {
-    let graph = complete_pm1(22);
+fn msa_reaches_ground_states_at_degree_21_and_62_on_every_lane() {
+    let p = SampleParams {
+        num_reads: 64,
+        num_sweeps: 512,
+        seed: 3,
+        ..SampleParams::default()
+    };
+    for n in [22, 63] {
+        let unit = ferro_complete(n, 1.0, 1.0);
+        let (reads, _) =
+            bench_one(device(KernelKind::Msa), &unit, &p, KernelKind::Msa, None).unwrap();
+        let best = reads.iter().map(|r| r.energy_milli).min().unwrap();
+        assert_eq!(best, ferro_ground_milli(n, 1, 1), "unit K_{n}");
+
+        let weighted = ferro_complete(n, 2.0, 3.0);
+        for lane in [MsaLane::I32, MsaLane::F32] {
+            let (reads, _) = bench_one(
+                device(KernelKind::Msa),
+                &weighted,
+                &p,
+                KernelKind::Msa,
+                Some(lane),
+            )
+            .unwrap();
+            let best = reads.iter().map(|r| r.energy_milli).min().unwrap();
+            assert_eq!(best, ferro_ground_milli(n, 2, 3), "{lane:?} K_{n}");
+        }
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU; run with make test-gpu"]
+fn msa_refuses_k64_on_unit_and_weighted_paths() {
+    let graph = complete_pm1(64);
     for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
         let err = bench_one(
             device(KernelKind::Msa),
@@ -200,7 +255,7 @@ fn msa_refuses_k22_on_unit_and_weighted_paths() {
         .unwrap_err();
         assert!(matches!(err, SampleError::Unsupported(_)), "{err}");
         assert!(
-            err.to_string().contains("21") && err.to_string().contains("20-neighbour"),
+            err.to_string().contains("63") && err.to_string().contains("62-neighbour"),
             "{err}"
         );
     }

@@ -542,7 +542,7 @@ impl AlgoState {
 /// Device buffers for the multi-spin kernel: the colour classes plus the
 /// dynamic shared-memory footprint the launch asks for.
 ///
-/// The kernel unrolls a fixed neighbour budget (`MSA_MAX_DEG` in
+/// The kernel counts a fixed neighbour budget (`MSA_MAX_DEG` in
 /// `kernels/msa.cu`). A denser topology cannot run on it and is refused per
 /// job as `Unsupported`. This maps to `Capacity` on the wire: permanent
 /// for this graph, harmless to the session.

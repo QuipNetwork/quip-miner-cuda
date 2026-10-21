@@ -59,7 +59,7 @@ The local field bound is the largest of these sums.
   The wide kernel cannot accept a move whose Metropolis probability is below about 7.6e-6.
 - **Gibbs:** accepts models whose absolute coefficients are at most 127 times the model's GCD step.
   Gibbs refuses models that need a wide path.
-- **MSA:** accepts models of degree at most 20.
+- **MSA:** accepts models of degree at most 62.
   Models with `h` in {-1, 0, 1} and `J` in {-1, 1} use the unit-weight kernel.
   Other models use the weighted kernel at the model's GCD step.
   Its local field bound is 16,777,215 times that step, or 16,777,215 milli at scale 1.
@@ -124,7 +124,7 @@ The unit kernel uses couplings and fields by sign. Consensus problems have
 `J` in {-1, 1} and `h` in {-1, 0, 1}, which it represents exactly.
 Other supported whole-milli models use the weighted kernel at their own scale.
 The miner refuses any model that exceeds the coefficient or local field bounds.
-A spin with more than 20 neighbors cannot run on either MSA kernel.
+A spin with more than 62 neighbors cannot run on either MSA kernel.
 The miner rejects such a job as `TooLarge`.
 
 Node capacity comes from the device. The spin state uses `dynamic shared memory`,

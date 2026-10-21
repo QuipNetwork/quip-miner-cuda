@@ -490,23 +490,23 @@ mod tests {
     #[test]
     fn capacity_check_uses_full_msa_degree_and_opened_node_limits() {
         let mut topology = TopologyView {
-            num_nodes: 22,
-            edges: (1..22).map(|node| (0, node)).collect(),
+            num_nodes: 64,
+            edges: (1..64).map(|node| (0, node)).collect(),
             allowed_h_milli: vec![0],
             allowed_j_milli: vec![-1000, 1000],
         };
         assert!(matches!(
-            check_capacity(&topology, 22),
+            check_capacity(&topology, 64),
             Err(SampleError::Capacity)
         ));
         topology.edges.pop();
-        assert!(check_capacity(&topology, 22).is_ok());
+        assert!(check_capacity(&topology, 64).is_ok());
         assert!(matches!(
-            check_capacity(&topology, 21),
+            check_capacity(&topology, 63),
             Err(SampleError::Capacity)
         ));
-        topology.num_nodes = 21;
-        assert!(check_capacity(&topology, 21).is_ok());
+        topology.num_nodes = 63;
+        assert!(check_capacity(&topology, 63).is_ok());
     }
 
     #[test]

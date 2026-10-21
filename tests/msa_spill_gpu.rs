@@ -86,3 +86,30 @@ fn weighted_spill_matches_all_shared_on_both_lanes() {
         }
     }
 }
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn degree_40_spill_matches_all_shared() {
+    let mut device = open();
+    let n = 800;
+    let graph = signed_circulant(n, 40);
+    let shared = spins(&sample_ising(&device, &graph, &params(), KernelKind::Msa).unwrap());
+    for cap in [0, n / 2] {
+        device.msa_shared_spins_cap = Some(cap);
+        let spilled = sample_ising(&device, &graph, &params(), KernelKind::Msa).unwrap();
+        assert_eq!(
+            spins(&spilled),
+            shared,
+            "degree-40 samples differ at cap {cap}"
+        );
+    }
+    for lane in [MsaLane::I32, MsaLane::F32] {
+        device.msa_shared_spins_cap = None;
+        let (all, _) = bench_one(&device, &graph, &params(), KernelKind::Msa, Some(lane)).unwrap();
+        device.msa_shared_spins_cap = Some(0);
+        let (spilled, _) =
+            bench_one(&device, &graph, &params(), KernelKind::Msa, Some(lane)).unwrap();
+        assert_eq!(spins(&spilled), spins(&all), "{lane:?} degree 40");
+    }
+}

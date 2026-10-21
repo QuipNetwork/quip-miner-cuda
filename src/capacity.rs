@@ -192,10 +192,11 @@ pub fn msa_max_reads(words: usize) -> usize {
 /// launch as the block size.
 pub const MSA_THREADS_PER_NONCE: u32 = 256;
 
-/// Neighbours per spin the msa kernel unrolls (`MSA_MAX_DEG` in
-/// `kernels/msa.cu`). Zephyr's degree is 20. A denser topology is refused
-/// per job.
-pub const MSA_MAX_DEGREE: usize = 20;
+/// Neighbours per spin the msa kernel counts (`MSA_MAX_DEG` in
+/// `kernels/msa.cu`), 20 per pass. With the field bond the count reaches 63,
+/// the most the kernel's six bit planes hold, and the same ceiling as
+/// `quip-cpu-msa`. A denser topology is refused per job.
+pub const MSA_MAX_DEGREE: usize = 62;
 
 /// Static `__shared__` members of the msa kernel: `s_active_slot` and
 /// `s_abort`, one `int` each (8 bytes of variables). The compiled function
