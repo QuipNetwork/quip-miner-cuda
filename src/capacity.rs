@@ -285,8 +285,8 @@ impl std::fmt::Display for BudgetResource {
 pub enum CapacityError {
     /// Above what this device can hold. `resource` names which limit bound
     /// it, because SA is bounded by device memory, Gibbs by shared memory and
-    /// msa by its own ceiling or by the memory its spill needs, and a message naming the wrong resource
-    /// sends the reader to the wrong knob.
+    /// msa by its own ceiling or by the memory its spill needs, and a message
+    /// naming the wrong resource sends the reader to the wrong knob.
     #[error("requested {requested} nodes exceeds the device {resource} budget of {budget}")]
     AboveDeviceBudget {
         /// Nodes asked for.

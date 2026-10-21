@@ -331,6 +331,29 @@ async fn missing_target_and_topology_mismatch_reject_with_refunds() {
     assert_eq!(s.log.refunds(), 2);
 }
 
+/// Degree 21 is within msa capacity but beyond the screen's 20, so the lease
+/// runs in Direct mode and completes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires CUDA device 0"]
+async fn degree_twenty_one_lease_runs_direct() {
+    let mut s = start("").await;
+    let (mut topology, _) = ring(22, RING_A);
+    topology.edges = Some(EdgeList {
+        u: vec![0; 21],
+        v: (1..22).collect(),
+    });
+    s.send(coord_msg::Msg::Topology(topology)).await;
+    s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 32)))
+        .await;
+    s.send(coord_msg::Msg::Job(lease(b"degree-21", 3, RING_A, 0, 8)))
+        .await;
+    finish(&mut s, b"degree-21").await;
+    assert!(s.log.done(b"degree-21").unwrap().salts_done > 0);
+    assert!(!s.log.results_for(b"degree-21").is_empty());
+    assert_eq!(s.shutdown(2000).await, 0);
+    assert!(s.log.fatal.is_none());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires CUDA device 0"]
 async fn degree_sixty_three_lease_returns_capacity_without_faulting() {
