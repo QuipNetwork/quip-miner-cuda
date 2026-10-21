@@ -255,26 +255,21 @@ pub const fn cuda_msa_adapt(max_reads: u32) -> quip_solver_core::adapt::AdaptBou
     }
 }
 
-/// Backend identity for `quip-cuda-msa` at a resolved capacity and read count.
+/// Backend identity for `quip-cuda-msa` at a resolved capacity.
 ///
-/// `max_nodes` is the shared-memory ceiling `capacity::msa_budget` derived at
-/// open: the kernel keeps its spin state in dynamic shared memory, so a job
-/// over this cannot be launched and must reject `TooLarge` rather than clamp.
-///
-/// `max_reads` is `capacity::msa_max_reads` at the replica words the device
-/// holds, which the binary probes with
-/// `cuda_device::probe_msa_replica_words` before this identity is built. The
-/// envelope is declared before the device opens, so a card that can only serve
-/// 64 reads must say so here rather than accept 128-read jobs it would clamp.
+/// `max_nodes` is at most `capacity::MSA_MAX_NODES`. Spins past the
+/// device's shared-memory budget spill to global memory, so every device
+/// serves `capacity::MSA_MAX_READS` reads at every size up to that ceiling,
+/// and `max_edges` is `capacity::MSA_MAX_EDGES`.
 #[must_use]
-pub fn cuda_msa_identity(max_nodes: usize, max_reads: u32) -> BackendIdentity {
+pub fn cuda_msa_identity(max_nodes: usize) -> BackendIdentity {
     BackendIdentity {
         backend: Backend::Cuda,
         algorithm: KernelKind::Msa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
-        max_edges: DEFAULT_MAX_EDGES,
+        max_edges: u32::try_from(capacity::MSA_MAX_EDGES).unwrap_or(u32::MAX),
         features: FEATURES,
-        adapt: cuda_msa_adapt(max_reads),
+        adapt: cuda_msa_adapt(u32::try_from(capacity::MSA_MAX_READS).unwrap_or(u32::MAX)),
         // Unit models run the unit-weight kernel (by sign, 64 lanes per word).
         // Other models run the weighted kernel at the model's own scale, up to a
         // local field of 2^24 - 1 milli at scale 1, the worst case.
@@ -380,7 +375,7 @@ impl Sampler for CudaSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        streaming::max_reads(self.kernel, self.device.msa_replica_words)
+        streaming::max_reads(self.kernel)
     }
 
     fn apply_config(&self, backend_toml: &str) {

@@ -143,7 +143,7 @@ fn msa_weighted_f32_reaches_quarter_and_scaled_ground_states() {
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
 fn msa_forced_weighted_lanes_solve_unit_models_at_supported_read_counts() {
     let dev = device(KernelKind::Msa);
-    let read_cap = max_reads(KernelKind::Msa, dev.msa_replica_words);
+    let read_cap = max_reads(KernelKind::Msa);
     let graph = IsingGraph::new(
         vec![0.0; 12],
         vec![1.0; 12],

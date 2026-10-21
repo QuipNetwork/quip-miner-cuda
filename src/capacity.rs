@@ -2,7 +2,8 @@
 //!
 //! The sa and gibbs kernels size their state arrays from a `QUIP_MAX_NODES`
 //! macro that `cuda_device` supplies at NVRTC compile time. The msa kernel
-//! keeps its state in dynamic shared memory sized per launch. This module
+//! keeps its hot spin state in dynamic shared memory sized per launch and
+//! spills the rest to a global buffer. This module
 //! owns every bound on those values so the binaries, the device, and the
 //! backend identities cannot disagree.
 
@@ -159,33 +160,27 @@ pub const GIBBS_FIXED_SHARED_BYTES: usize = 8;
 
 /// Capacity used when `--max-nodes` is absent for `quip-cuda-msa`. The same
 /// floor as SA so the three binaries default alike. The msa kernel has no
-/// compiled-in array: its spin state is dynamic shared memory sized per
-/// session, so this floor only says what a device must hold to open.
+/// compiled-in array: its spin state is dynamic shared memory with a global
+/// spill buffer, so this floor only sets what `--max-nodes` defaults to.
 pub const MSA_DEFAULT_NODES: usize = 5000;
+
+/// Most nodes `quip-cuda-msa` accepts. Spins past the shared-memory budget
+/// spill to global memory, so this is a policy ceiling, not a device one:
+/// the size the spill path is measured at (docs/perf/2026-10-msa-dram-spill-a4000.md).
+pub const MSA_MAX_NODES: usize = 200_000;
+
+/// Most edges `quip-cuda-msa` accepts: 200,000 nodes at an average degree of 40.
+pub const MSA_MAX_EDGES: usize = 4_000_000;
 
 /// Reads packed into one 64-bit word by the msa kernel (`kernels/msa.cu`).
 pub const MSA_LANES: usize = 64;
 
-/// Most replica words per spin an msa session allocates for. Two words is 128
-/// reads, which a 99 KB opt-in holds at Zephyr scale. Four words would need
-/// 146 KB for 4577 spins.
-///
-/// This is a ceiling, not a fixed shape. A device whose opt-in shared memory
-/// cannot hold the resolved nodes at two words falls back to one, at half the
-/// reads; see [`msa_replica_words`]. Turing is the case that forces this: its
-/// 64 KB opt-in holds 4577 spins at one word and nothing near it at two.
+/// Replica words per spin an msa session allocates at 128 reads. Shared memory
+/// no longer bounds this: spins that do not fit spill to global memory.
 pub const MSA_REPLICA_WORDS: usize = 2;
 
-/// Read cap for the msa kernel at [`MSA_REPLICA_WORDS`]. A device resolved to
-/// fewer words caps lower; see [`msa_max_reads`].
+/// Read cap for the msa kernel at [`MSA_REPLICA_WORDS`].
 pub const MSA_MAX_READS: usize = MSA_LANES * MSA_REPLICA_WORDS;
-
-/// Reads an msa session serves at `words` replica words per spin. Each word
-/// carries [`MSA_LANES`] replicas in its bits.
-#[must_use]
-pub fn msa_max_reads(words: usize) -> usize {
-    MSA_LANES.saturating_mul(words)
-}
 
 /// Threads per block the msa kernel launches. Measured faster than 512 and
 /// 1024 on an RTX 5090 (MR !26). `streaming::algo_limits` carries it to the
@@ -231,10 +226,10 @@ pub fn msa_shared_bytes(nodes: usize, words: usize) -> usize {
         .saturating_add(MSA_FIXED_SHARED_BYTES)
 }
 
-/// Largest node count whose msa state fits `dynamic_shared_bytes` at `words`
-/// replica words per spin.
+/// Most spins whose msa state fits `dynamic_shared_bytes` at `words` replica
+/// words per spin. Spins past this spill to global memory.
 #[must_use]
-pub fn msa_budget(dynamic_shared_bytes: usize, words: usize) -> usize {
+pub fn msa_shared_spins(dynamic_shared_bytes: usize, words: usize) -> usize {
     let per_node = words.saturating_mul(8).max(1);
     dynamic_shared_bytes.saturating_sub(MSA_FIXED_SHARED_BYTES) / per_node
 }
@@ -249,30 +244,30 @@ pub fn msa_spill_words(nodes: usize, shared_spins: usize, words: usize, nonces: 
         .saturating_mul(nonces)
 }
 
-/// Replica words per spin an msa session on this device uses for `nodes`
-/// spins: the most it can hold, down to one.
-///
-/// The bits are irreducible — one per replica per spin — so a device that
-/// cannot hold `nodes` at [`MSA_REPLICA_WORDS`] serves half the reads rather
-/// than refusing. Turing's 64 KB opt-in is the case in hand: 4577 spins need
-/// 73232 bytes at two words and 36616 at one.
-///
-/// `None` when even one word does not fit, which [`resolve`] refuses at open.
+/// Largest node count whose worst-case msa spill fits this device's usable
+/// memory: every spin spilled, at [`MSA_REPLICA_WORDS`] words, for each of the
+/// `sm_count` nonces (msa runs one nonce per SM).
 #[must_use]
-pub fn msa_replica_words(dynamic_shared_bytes: usize, nodes: usize) -> Option<usize> {
-    (1..=MSA_REPLICA_WORDS)
-        .rev()
-        .find(|&words| msa_shared_bytes(nodes, words) <= dynamic_shared_bytes)
+pub fn msa_spill_budget(limits: &DeviceLimits) -> usize {
+    let per_node = MSA_REPLICA_WORDS
+        .saturating_mul(8)
+        .saturating_mul(limits.sm_count)
+        .max(1);
+    limits.usable_bytes() / per_node
 }
 
 /// Which device limit bounds a kernel's capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetResource {
-    /// Gibbs and msa hold their spin state in shared memory, per block.
+    /// Gibbs holds its spin state in shared memory, per block.
     SharedMemory,
     /// SA holds its state in per-thread local memory, which the driver backs
-    /// with device memory reserved for full occupancy.
+    /// with device memory reserved for full occupancy. msa spills spins past
+    /// its shared-memory budget to a per-nonce global buffer, so its worst
+    /// case is bounded by device memory too.
     DeviceMemory,
+    /// A policy ceiling of the kernel, independent of the device.
+    KernelCeiling,
 }
 
 impl std::fmt::Display for BudgetResource {
@@ -280,6 +275,7 @@ impl std::fmt::Display for BudgetResource {
         match self {
             Self::SharedMemory => write!(f, "shared-memory"),
             Self::DeviceMemory => write!(f, "memory"),
+            Self::KernelCeiling => write!(f, "kernel-ceiling"),
         }
     }
 }
@@ -288,8 +284,8 @@ impl std::fmt::Display for BudgetResource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CapacityError {
     /// Above what this device can hold. `resource` names which limit bound
-    /// it, because SA is bounded by device memory while msa and Gibbs are
-    /// bounded by shared memory, and a message naming the wrong resource
+    /// it, because SA is bounded by device memory, Gibbs by shared memory and
+    /// msa by its own ceiling or by the memory its spill needs, and a message naming the wrong resource
     /// sends the reader to the wrong knob.
     #[error("requested {requested} nodes exceeds the device {resource} budget of {budget}")]
     AboveDeviceBudget {
@@ -322,18 +318,17 @@ pub fn default_nodes(kernel: KernelKind) -> usize {
 /// Capacity to advertise in `--capabilities`, which must answer without
 /// opening the device.
 ///
-/// Applies the floor and every bound knowable without a device. Every
-/// kernel is now bounded by device properties rather than a static
-/// ceiling, so the request passes through and `open_with_nodes` is what
-/// refuses. SA is clamped to the per-thread local-memory cap here; msa and
-/// Gibbs are bounded by device shared memory, so their requests pass
-/// through.
+/// Applies the floor and every bound knowable without a device. SA is
+/// clamped to the per-thread local-memory cap here and msa to
+/// [`MSA_MAX_NODES`]. Gibbs is bounded by device shared memory, so its
+/// request passes through and `open_with_nodes` is what refuses.
 #[must_use]
 pub fn advertised_nodes(kernel: KernelKind, requested: usize) -> usize {
     let want = requested.max(default_nodes(kernel));
     match kernel {
         KernelKind::Sa => want.min(LOCAL_MEM_BYTES_PER_THREAD * 8 / 9),
-        KernelKind::Msa | KernelKind::Gibbs => want,
+        KernelKind::Msa => want.min(MSA_MAX_NODES),
+        KernelKind::Gibbs => want,
     }
 }
 
@@ -345,7 +340,10 @@ pub fn advertised_nodes(kernel: KernelKind, requested: usize) -> usize {
 /// # Errors
 ///
 /// [`CapacityError::AboveDeviceBudget`] when the request exceeds
-/// [`sa_budget`], [`msa_budget`] or [`gibbs_budget`] for this device.
+/// [`sa_budget`] or [`gibbs_budget`] for this device, [`MSA_MAX_NODES`]
+/// (`KernelCeiling`), or for msa [`msa_spill_budget`] (`DeviceMemory`), the
+/// nodes whose worst-case spill fits device memory. The kernel ceiling is
+/// checked first.
 pub fn resolve(
     kernel: KernelKind,
     requested: usize,
@@ -355,16 +353,8 @@ pub fn resolve(
     let want = requested.max(floor);
     let (budget, resource) = match kernel {
         KernelKind::Sa => (sa_budget(limits), BudgetResource::DeviceMemory),
-        // Against the one-word budget, the most permissive shape. A device
-        // that holds the nodes only at one word opens and serves half the
-        // reads; `msa_replica_words` is what picks the shape at open.
-        KernelKind::Msa => (
-            msa_budget(
-                msa_dynamic_shared_bytes(limits.shared_bytes_per_block_optin),
-                1,
-            ),
-            BudgetResource::SharedMemory,
-        ),
+        KernelKind::Msa if want > MSA_MAX_NODES => (MSA_MAX_NODES, BudgetResource::KernelCeiling),
+        KernelKind::Msa => (msa_spill_budget(limits), BudgetResource::DeviceMemory),
         KernelKind::Gibbs => (
             gibbs_budget(limits.shared_bytes_per_block),
             BudgetResource::SharedMemory,
@@ -635,9 +625,9 @@ mod tests {
     /// static ints and the 8704-byte threshold structures, two 8-byte
     /// words per spin fit 5791 spins.
     #[test]
-    fn msa_budget_on_a_99_kb_optin() {
+    fn msa_shared_spins_on_a_99_kb_optin() {
         assert_eq!(msa_dynamic_shared_bytes(101_376), 101_360);
-        assert_eq!(msa_budget(101_360, MSA_REPLICA_WORDS), 5791);
+        assert_eq!(msa_shared_spins(101_360, MSA_REPLICA_WORDS), 5791);
         assert!(msa_shared_bytes(5791, MSA_REPLICA_WORDS) <= 101_360);
         assert!(msa_shared_bytes(5792, MSA_REPLICA_WORDS) > 101_360);
     }
@@ -646,96 +636,95 @@ mod tests {
     /// Ampere datacenter (163 KB) and Hopper (227 KB) hold the default at two
     /// words. Turing (64 KB) does not.
     #[test]
-    fn msa_budget_across_the_supported_optin_sizes() {
+    fn msa_shared_spins_across_the_supported_optin_sizes() {
         let two = MSA_REPLICA_WORDS;
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(98_304), two), 5599);
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(166_912), two), 9887);
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(232_448), two), 13_983);
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(65_536), two), 3551);
+        assert_eq!(
+            msa_shared_spins(msa_dynamic_shared_bytes(98_304), two),
+            5599
+        );
+        assert_eq!(
+            msa_shared_spins(msa_dynamic_shared_bytes(166_912), two),
+            9887
+        );
+        assert_eq!(
+            msa_shared_spins(msa_dynamic_shared_bytes(232_448), two),
+            13_983
+        );
+        assert_eq!(
+            msa_shared_spins(msa_dynamic_shared_bytes(65_536), two),
+            3551
+        );
     }
 
     /// One word doubles the node budget, because the spin state is the only
     /// term that scales with the word count.
     #[test]
-    fn msa_budget_at_one_word_doubles_the_turing_ceiling() {
-        assert_eq!(msa_budget(msa_dynamic_shared_bytes(65_536), 1), 7102);
-    }
-
-    /// Turing holds Advantage2 at one word and nowhere near it at two, so
-    /// the resolved shape is one word and the reads halve to 64.
-    #[test]
-    fn msa_replica_words_falls_back_to_one_on_turing() {
-        let turing = msa_dynamic_shared_bytes(65_536);
-        assert_eq!(msa_replica_words(turing, 4577), Some(1));
-        assert_eq!(msa_replica_words(turing, MSA_DEFAULT_NODES), Some(1));
-        assert_eq!(msa_max_reads(1), 64);
-    }
-
-    /// A 99 KB opt-in keeps both words, so nothing changes for the cards
-    /// that already ran msa.
-    #[test]
-    fn msa_replica_words_keeps_two_words_on_a_99_kb_optin() {
-        let a4000 = msa_dynamic_shared_bytes(101_376);
-        assert_eq!(msa_replica_words(a4000, MSA_DEFAULT_NODES), Some(2));
-        assert_eq!(msa_replica_words(a4000, 5791), Some(2));
-        assert_eq!(msa_max_reads(MSA_REPLICA_WORDS), MSA_MAX_READS);
-    }
-
-    /// Above even the one-word budget there is no shape to fall back to, and
-    /// `resolve` is what turns this into the refusal at open.
-    #[test]
-    fn msa_replica_words_is_none_above_the_one_word_budget() {
-        let turing = msa_dynamic_shared_bytes(65_536);
-        assert_eq!(msa_replica_words(turing, 7102), Some(1));
-        assert_eq!(msa_replica_words(turing, 7103), None);
+    fn msa_shared_spins_at_one_word_doubles_the_turing_ceiling() {
+        assert_eq!(msa_shared_spins(msa_dynamic_shared_bytes(65_536), 1), 7102);
     }
 
     #[test]
-    fn resolve_msa_accepts_at_the_budget_and_rejects_above_it() {
-        let limits = a4000(A4000_FREE);
-        let dynamic = msa_dynamic_shared_bytes(limits.shared_bytes_per_block_optin);
-        // Two words up to 5791, then one word up to 11582: past the two-word
-        // ceiling an A4000 keeps mining at 64 reads instead of refusing.
-        assert_eq!(resolve(KernelKind::Msa, 5791, &limits), Ok(5791));
-        assert_eq!(msa_replica_words(dynamic, 5791), Some(MSA_REPLICA_WORDS));
-        assert_eq!(resolve(KernelKind::Msa, 5792, &limits), Ok(5792));
-        assert_eq!(msa_replica_words(dynamic, 5792), Some(1));
+    fn resolve_msa_is_bounded_by_the_kernel_ceiling_not_shared_memory() {
+        // A Turing-sized opt-in holds 3551 spins at two words; the rest spill.
+        let turing = DeviceLimits {
+            shared_bytes_per_block_optin: 65_536,
+            ..a4000(16 << 30)
+        };
+        assert_eq!(resolve(KernelKind::Msa, 8000, &turing), Ok(8000));
         assert_eq!(
-            resolve(KernelKind::Msa, 11_583, &limits),
+            resolve(KernelKind::Msa, MSA_MAX_NODES, &turing),
+            Ok(MSA_MAX_NODES)
+        );
+        assert_eq!(
+            resolve(KernelKind::Msa, MSA_MAX_NODES + 1, &turing),
             Err(CapacityError::AboveDeviceBudget {
-                requested: 11_583,
-                budget: 11_582,
-                resource: BudgetResource::SharedMemory,
+                requested: MSA_MAX_NODES + 1,
+                budget: MSA_MAX_NODES,
+                resource: BudgetResource::KernelCeiling,
             })
         );
     }
 
-    /// Turing cannot hold the default at 128 reads, but it holds it at 64,
-    /// so the open succeeds at one replica word (quip-miner-cuda-9p5).
+    /// Worst case is every spin spilled, one nonce per SM, so a card short of
+    /// memory is refused with the node count its spill would fit.
     #[test]
-    fn resolve_accepts_msa_on_a_turing_sized_optin() {
-        let mut limits = a4000(A4000_FREE);
-        limits.shared_bytes_per_block_optin = 65_536;
+    fn resolve_msa_refuses_a_spill_that_does_not_fit_device_memory() {
+        let limits = a4000(64 << 20);
+        let fits = |nodes: usize| {
+            msa_spill_words(nodes, 0, MSA_REPLICA_WORDS, limits.sm_count) * 8
+                <= limits.usable_bytes()
+        };
+        let Err(CapacityError::AboveDeviceBudget {
+            requested,
+            budget,
+            resource,
+        }) = resolve(KernelKind::Msa, MSA_MAX_NODES, &limits)
+        else {
+            panic!("64 MiB cannot hold the worst-case spill at 200k nodes");
+        };
+        assert_eq!(requested, MSA_MAX_NODES);
+        assert_eq!(resource, BudgetResource::DeviceMemory);
+        assert!(fits(budget), "budget {budget} must fit");
+        assert!(!fits(budget + 1), "budget {budget} must be the largest");
+        assert_eq!(resolve(KernelKind::Msa, budget, &limits), Ok(budget));
+    }
+
+    #[test]
+    fn resolve_msa_accepts_the_ceiling_on_a_16_gib_card() {
         assert_eq!(
-            resolve(KernelKind::Msa, MSA_DEFAULT_NODES, &limits),
-            Ok(MSA_DEFAULT_NODES)
+            resolve(KernelKind::Msa, MSA_MAX_NODES, &a4000(A4000_FREE)),
+            Ok(MSA_MAX_NODES)
         );
     }
 
-    /// Above the one-word budget there is nothing left to fall back to, and
-    /// the refusal names the one-word ceiling rather than the two-word one.
     #[test]
-    fn resolve_refuses_msa_above_the_one_word_budget() {
-        let mut limits = a4000(A4000_FREE);
-        limits.shared_bytes_per_block_optin = 65_536;
-        assert_eq!(
-            resolve(KernelKind::Msa, 7103, &limits),
-            Err(CapacityError::AboveDeviceBudget {
-                requested: 7103,
-                budget: 7102,
-                resource: BudgetResource::SharedMemory,
-            })
-        );
+    fn advertised_msa_is_clamped_to_the_kernel_ceiling() {
+        assert_eq!(advertised_nodes(KernelKind::Msa, 1_000_000), MSA_MAX_NODES);
+    }
+
+    #[test]
+    fn kernel_ceiling_names_itself() {
+        assert_eq!(BudgetResource::KernelCeiling.to_string(), "kernel-ceiling");
     }
 
     #[test]
@@ -743,9 +732,8 @@ mod tests {
         assert_eq!(MSA_MAX_READS, 128);
     }
 
-    /// msa has no static ceiling either; the device budget is what refuses.
     #[test]
-    fn advertised_passes_msa_through_above_the_default() {
+    fn advertised_passes_msa_through_between_the_default_and_the_ceiling() {
         assert_eq!(advertised_nodes(KernelKind::Msa, 8192), 8192);
         assert_eq!(advertised_nodes(KernelKind::Msa, 64), MSA_DEFAULT_NODES);
     }

@@ -8,8 +8,8 @@
 use clap::{Parser, Subcommand};
 use quip_solver_core::{run, CommonArgs, OpenError};
 use quip_solver_cuda::bench::{run_bench, BenchAction};
-use quip_solver_cuda::capacity::{self, advertised_nodes, MSA_DEFAULT_NODES, MSA_REPLICA_WORDS};
-use quip_solver_cuda::cuda_device::{device_label_mismatch, probe_msa_replica_words, CudaDevice};
+use quip_solver_cuda::capacity::{advertised_nodes, MSA_DEFAULT_NODES};
+use quip_solver_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
 use quip_solver_cuda::{cuda_msa_identity, KernelKind, MsaSampler};
 use std::process::ExitCode;
@@ -35,8 +35,9 @@ struct Cli {
     yielding: bool,
     /// Largest node count to accept. The miner opens its device before the
     /// coordinator sends a topology, so this cannot come from the wire. Values
-    /// below the default are raised to it; a value above the device's opt-in
-    /// shared-memory budget is an error at open, never a silent clamp.
+    /// below the default are raised to it; a value above
+    /// `capacity::MSA_MAX_NODES` (200,000) is an error at open, never a silent
+    /// clamp.
     #[arg(long, default_value_t = MSA_DEFAULT_NODES)]
     max_nodes: usize,
 }
@@ -98,15 +99,8 @@ fn main() -> ExitCode {
             cli.device
         );
     }
-    // The identity is built before the device opens, so probe the one device
-    // attribute that decides the read count. A device that cannot be inspected
-    // — no driver, no such ordinal — declares the two-word ceiling and is
-    // refused at open if it really cannot hold it (quip-miner-cuda-9p5).
     let nodes = advertised_nodes(KernelKind::Msa, cli.max_nodes);
-    let words = probe_msa_replica_words(cli.device, nodes).unwrap_or(MSA_REPLICA_WORDS);
-    let msa_max_reads = u32::try_from(capacity::msa_max_reads(words))
-        .expect("msa read cap is at most MSA_LANES * MSA_REPLICA_WORDS");
-    run(cuda_msa_identity(nodes, msa_max_reads), &cli.common, || {
+    run(cuda_msa_identity(nodes), &cli.common, || {
         let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, cli.max_nodes)
             .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
         // The governor binds by PCI bus id, not by ordinal: NVML's index

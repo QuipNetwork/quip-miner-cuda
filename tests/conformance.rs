@@ -145,7 +145,7 @@ fn capabilities_advertise_the_schedule_feature_and_limits() {
     ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
     for (bin, degree, field) in [
         ("quip-cuda-sa", 0, Some(536_870_910)),
-        ("quip-cuda-msa", 20, Some(16_777_215)),
+        ("quip-cuda-msa", 62, Some(16_777_215)),
         ("quip-cuda-gibbs", 0, None),
     ] {
         let out = Command::new(profile_bin(bin))

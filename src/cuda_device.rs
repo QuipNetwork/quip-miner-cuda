@@ -290,72 +290,6 @@ fn configure_msa_shared_memory(
     Ok(msa_dynamic_shared_bytes)
 }
 
-/// Replica words per spin msa sessions on this device may allocate, at
-/// `msa_nodes` spins.
-///
-/// When this process runs msa, [`capacity::resolve`] already refused anything
-/// above the one-word budget, so `None` from
-/// [`capacity::msa_replica_words`] means those two derivations drifted apart;
-/// refusing here keeps the launch from sizing a session the device cannot
-/// hold. When the process runs SA or Gibbs the word count is unused, and a
-/// device too small for the msa default must not fail their open — those get
-/// one word and never read it.
-///
-/// Kept out of [`CudaDevice::open_with_nodes`] to stay under the crate's
-/// function-length cap.
-fn resolve_msa_replica_words(
-    msa_dynamic_shared_bytes: usize,
-    msa_nodes: usize,
-    kernel: KernelKind,
-) -> Result<usize, CudaError> {
-    match capacity::msa_replica_words(msa_dynamic_shared_bytes, msa_nodes) {
-        Some(words) => Ok(words),
-        None if kernel == KernelKind::Msa => Err(CudaError::Capacity(
-            capacity::CapacityError::AboveDeviceBudget {
-                requested: msa_nodes,
-                budget: capacity::msa_budget(msa_dynamic_shared_bytes, 1),
-                resource: capacity::BudgetResource::SharedMemory,
-            },
-        )),
-        None => Ok(1),
-    }
-}
-
-/// Replica words per spin `device_index` would hold for an msa session at
-/// `requested_nodes`, without compiling a kernel or opening a session.
-///
-/// The adapt envelope in [`crate::cuda_msa_identity`] is built before
-/// [`CudaDevice::open_with_nodes`] runs, and it must declare a read count the
-/// device can actually serve: a Turing card holds one replica word where a
-/// 99 KB card holds two, which is 64 reads against 128. Reading the one
-/// attribute that decides it is cheap enough to do first.
-///
-/// `None` when the device cannot be inspected at all — no driver, no such
-/// ordinal, an unreadable attribute — or when it cannot hold `requested_nodes`
-/// at even one word. Callers declare [`capacity::MSA_REPLICA_WORDS`] in that
-/// case: `--capabilities` must answer on a machine with no GPU, and a device
-/// that truly cannot hold the request is refused at open with a message that
-/// names the budget.
-#[must_use]
-pub fn probe_msa_replica_words(device_index: usize, requested_nodes: usize) -> Option<usize> {
-    // cudarc panics on the first driver call when libcuda cannot be loaded,
-    // so a machine with no driver must be caught before `CudaContext::new`.
-    // SAFETY: `is_culib_present` only attempts to `dlopen` the CUDA driver
-    // library by its standard names and drops the handle. Loading it runs the
-    // driver's own initializers, which every later driver call in this process
-    // runs anyway through cudarc's loader; no pointer or state crosses the call.
-    if !unsafe { cudarc::driver::sys::is_culib_present() } {
-        return None;
-    }
-    let ctx = CudaContext::new(device_index).ok()?;
-    let optin = usize::try_from(
-        ctx.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
-            .ok()?,
-    )
-    .ok()?;
-    capacity::msa_replica_words(capacity::msa_dynamic_shared_bytes(optin), requested_nodes)
-}
-
 /// Loaded kernels + streams bound to a single device.
 ///
 /// Every handle field is `pub(crate)`: `open` switches cudarc's per-`CudaSlice`
@@ -394,17 +328,8 @@ pub struct CudaDevice {
     pub(crate) msa_weighted: Option<MsaWeightedKernels>,
     /// Dynamic shared memory one msa block may request: the device's opt-in
     /// ceiling less the kernel's static members. `streaming` sizes msa
-    /// sessions against it; `capacity::msa_budget` derives `max_nodes` from
-    /// it when the process runs msa.
+    /// sessions against it.
     pub(crate) msa_dynamic_shared_bytes: usize,
-    /// Replica words per spin msa sessions on this device may allocate, from
-    /// [`capacity::msa_replica_words`] at [`Self::max_nodes`]. Two on a card
-    /// whose opt-in shared memory holds the state at 128 reads, one on a card
-    /// that only holds 64. Meaningless when the process runs SA or Gibbs.
-    ///
-    /// `streaming::algo_limits` reads it for the per-nonce read cap, so the
-    /// envelope this miner declares matches what the device can hold.
-    pub msa_replica_words: usize,
     /// Hold at most this many spins in shared memory per msa block, spilling
     /// the rest to global memory. `None` uses the full opt-in budget. Tests
     /// and `bench run --msa-shared-spins` set it; the miner never does.
@@ -588,8 +513,6 @@ impl CudaDevice {
             configure_msa_shared_memory(&weighted.i32, shared_per_block_optin)?;
             configure_msa_shared_memory(&weighted.f32, shared_per_block_optin)?;
         }
-        let msa_replica_words =
-            resolve_msa_replica_words(msa_dynamic_shared_bytes, msa_nodes, kernel)?;
 
         // Read before the struct is built so an unreadable attribute fails the
         // open rather than leaving a device whose governor can never bind.
@@ -612,7 +535,6 @@ impl CudaDevice {
             msa,
             msa_weighted,
             msa_dynamic_shared_bytes,
-            msa_replica_words,
             msa_shared_spins_cap: None,
             max_sms: max_sms.max(1),
             max_nodes: resolved,

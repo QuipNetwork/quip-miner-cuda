@@ -113,3 +113,46 @@ fn degree_40_spill_matches_all_shared() {
         assert_eq!(spins(&spilled), spins(&all), "{lane:?} degree 40");
     }
 }
+
+/// The ceiling: 200,000 nodes at degree 40 is 4,000,000 edges. Every read
+/// must come back, and the host-scored energy must equal consensus scoring.
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn samples_200k_nodes_at_degree_40() {
+    use quip_protocol::scoring::energy_milli;
+    use quip_solver_cuda::capacity::{MSA_MAX_EDGES, MSA_MAX_NODES};
+    let device =
+        CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_MAX_NODES).expect("msa at the ceiling");
+    let graph = signed_circulant(MSA_MAX_NODES, 40);
+    assert_eq!(graph.edges.len(), MSA_MAX_EDGES);
+    let p = SampleParams {
+        num_reads: 128,
+        num_sweeps: 16,
+        sweeps_per_beta: 4,
+        seed: 11,
+        ..SampleParams::default()
+    };
+    let reads = sample_ising(&device, &graph, &p, KernelKind::Msa).expect("sample at the ceiling");
+    assert_eq!(reads.len(), 128);
+    for r in reads.iter().take(2) {
+        assert_eq!(
+            r.energy_milli,
+            energy_milli(&r.spins, &graph.h, &graph.j, &graph.edges)
+        );
+    }
+}
+
+/// Above the shared budget with no cap: spill happens naturally, and it still
+/// matches a run with a much smaller shared part.
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn natural_spill_matches_a_smaller_shared_part() {
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 20_000).expect("msa at 20000");
+    let graph = signed_circulant(20_000, 20);
+    let natural = spins(&sample_ising(&device, &graph, &params(), KernelKind::Msa).unwrap());
+    device.msa_shared_spins_cap = Some(1000);
+    let small = spins(&sample_ising(&device, &graph, &params(), KernelKind::Msa).unwrap());
+    assert_eq!(small, natural);
+}

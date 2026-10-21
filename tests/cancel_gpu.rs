@@ -124,7 +124,7 @@ fn sa_cancel_aborts_the_active_model_and_the_next_session_completes() {
     cancel_then_complete(&device, KernelKind::Sa, 64);
 }
 
-/// msa at 128 reads, two replica words. Skips on a one-word device.
+/// msa at 128 reads, two replica words.
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
@@ -135,10 +135,6 @@ fn msa_cancel_aborts_the_active_model_and_the_next_session_completes() {
     }
     let device =
         CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES).expect("open msa");
-    if device.msa_replica_words < 2 {
-        eprintln!("device holds one msa replica word; 128 reads not servable, skipping");
-        return;
-    }
     cancel_then_complete(&device, KernelKind::Msa, 128);
 }
 

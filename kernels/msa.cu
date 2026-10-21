@@ -32,10 +32,11 @@
 // spins t / words, t / words + blockDim.x / words, and so on.
 //
 // Spin state: spins 0..k_shared-1 live in dynamic shared memory, spins
-// k_shared..N-1 in this nonce's slice of a global spill buffer. The host
-// sets k_shared to the most spins the opt-in shared memory holds
-// (streaming::msa_layout), so a graph that fits never touches the spill
-// buffer. Placement does not change the RNG stream or the update order: a
+// k_shared..N-1 in this nonce's slice of a global spill buffer.
+// capacity::MSA_MAX_NODES bounds N; shared memory only sets how many spins
+// stay on chip. The host sets k_shared to the most spins the opt-in shared
+// memory holds (streaming::msa_layout), so a graph that fits never touches
+// the spill buffer. Placement does not change the RNG stream or the update order: a
 // spilled run returns the same samples as an all-shared run of the same seed.
 // Energies are not computed on the device; the host rescores every sample
 // with energy_milli.

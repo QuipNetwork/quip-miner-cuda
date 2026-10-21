@@ -61,10 +61,8 @@ an sm_70+ instruction); the ceiling comes from NVRTC 12.9, which the
 kernel for every entry (`make test-archs`). Changing card support is a
 reviewed edit to that list, never a side effect of a toolkit bump.
 
-`quip-cuda-msa` keeps its spin state in dynamic shared memory, so the opt-in
-shared memory per block sets both the node ceiling and the read count. A device
-with at least 96 KB holds two 64-lane replica words per spin and serves 128
-reads. Turing (sm_75, 64 KB) holds one word and serves 64. The binary probes
-the device before it builds its identity, so the adapt envelope declares the
-count the device can serve. A device that cannot hold the resolved capacity at
-even one word still refuses to open, with a message that names the budget.
+`quip-cuda-msa` keeps the first spins in shared memory and spills the rest to
+a per-nonce global buffer. The opt-in shared memory per block sets how many
+spins stay on chip. It does not set the node ceiling or the read count. Every
+supported device serves 128 reads up to 200,000 nodes, 4,000,000 edges and
+degree 62.

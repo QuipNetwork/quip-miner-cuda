@@ -6,7 +6,7 @@ use quip_solver_core::adapt::adapt_params;
 use quip_solver_core::{
     CancelToken, IsingGraph, SampleParams, StreamJob, StreamOutcome, StreamResult, TopologyView,
 };
-use quip_solver_cuda::capacity::{msa_max_reads, MSA_DEFAULT_NODES};
+use quip_solver_cuda::capacity::MSA_DEFAULT_NODES;
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::nvml_gov::UtilGovernor;
 use quip_solver_cuda::screen::{Screen, ScreenDomain, ScreenParams};
@@ -245,8 +245,7 @@ fn main() -> Result<()> {
     let topo = topology()?;
     let nonces = nonces(args.n)?;
     let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES)?;
-    let reads = u32::try_from(msa_max_reads(device.msa_replica_words))?;
-    let identity = cuda_msa_identity(device.max_nodes, reads);
+    let identity = cuda_msa_identity(device.max_nodes);
     let adapted = adapt_params(
         args.target_milli,
         1,
@@ -262,11 +261,10 @@ fn main() -> Result<()> {
     };
     let setup_seconds = start.elapsed().as_secs_f64();
     eprintln!(
-        "{}: {} reads, {} sweeps, {} replica words",
+        "{}: {} reads, {} sweeps",
         device.name()?,
         params.num_reads,
-        params.num_sweeps,
-        device.msa_replica_words
+        params.num_sweeps
     );
     let (probe, phases) = probes(&device, &topo, &nonces)?;
     let mut full = Vec::new();
@@ -294,8 +292,7 @@ fn main() -> Result<()> {
     let metadata = json!({
         "commit": commit, "n": args.n, "energy_units": "exact milli",
         "device": { "name": device.name()?, "index": 0, "pci_bus_id": device.pci_bus_id,
-            "sms": device.max_sms, "max_nodes": device.max_nodes,
-            "msa_replica_words": device.msa_replica_words },
+            "sms": device.max_sms, "max_nodes": device.max_nodes },
         "lease": { "last_proof_block_hash": hex(&LAST_PROOF), "miner_account": hex(&MINER),
             "base_salt": hex(&BASE_SALT), "counter": "index in salt[0..8], little-endian, starting at 0" },
         "topology": { "nodes": topo.num_nodes, "edges": topo.edges.len(),
