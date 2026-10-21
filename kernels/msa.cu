@@ -21,10 +21,10 @@
 // field h_i in {-1, 0, +1} is one more bond to a spin pinned at +1.
 //
 // Preconditions the host enforces (streaming::build_msa_state): every spin
-// has at most MSA_MAX_DEG (62) neighbours, counted MSA_CHUNK at a time. The unit build reads couplings and
-// fields by sign, and the host sends it unit models only. Weighted builds
-// read them at full width, and the host bounds the local field at 2^24 - 1
-// scale units.
+// has at most MSA_MAX_DEG (62) neighbours, counted MSA_CHUNK at a time. The
+// unit build reads couplings and fields by sign, and the host sends it unit
+// models only. Weighted builds read them at full width, and the host bounds
+// the local field at 2^24 - 1 scale units.
 //
 // Spins are updated one colour class at a time (the host's greedy colouring,
 // as gibbs.cu uses), so no two spins updated together interact. Each thread
@@ -91,7 +91,7 @@
 #define MSA_MAX_DEG   62
 
 // Coefficient width. The default build is the unit-weight kernel every
-// mining job runs, and its preprocessed source is byte-for-byte today's.
+// mining job runs, and it contains no weighted code.
 // -DQUIP_MSA_WEIGHTED builds the weighted kernel (QUI-1641, after the CPU
 // design in QUI-1398): i32 coefficients and a per-lane local field. Exactly
 // one lane arithmetic is chosen: QUIP_MSA_LANE_I32 (integer-only Metropolis

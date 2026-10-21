@@ -197,9 +197,8 @@ fn ferro_complete(n: usize, scale_j: f64, scale_h: f64) -> IsingGraph {
     IsingGraph::new(vec![-scale_h; n], j, edges)
 }
 
-#[allow(clippy::cast_possible_wrap)]
 fn ferro_ground_milli(n: usize, scale_j: i64, scale_h: i64) -> i64 {
-    let n = n as i64;
+    let n = i64::try_from(n).unwrap();
     -1000 * (n * (n - 1) / 2 * scale_j + n * scale_h)
 }
 

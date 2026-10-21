@@ -116,7 +116,8 @@ impl From<SampleError> for quip_solver_core::SampleError {
 /// - [`SampleError::GraphTooLarge`] if `graph` has more nodes than the chosen
 ///   kernel's fixed-size state supports. Permanent — retrying cannot help.
 /// - [`SampleError::Unsupported`] if no path holds the coefficients exactly,
-///   or the msa topology has a spin with more than 20 neighbours. Permanent.
+///   or the msa topology has a spin with more than
+///   [`crate::capacity::MSA_MAX_DEGREE`] (62) neighbours. Permanent.
 /// - [`SampleError::KernelTimeout`] if the persistent kernel never marks the
 ///   slot complete before the driver's deadline.
 /// - [`SampleError::Cuda`] if opening the device or compiling its kernels failed.
