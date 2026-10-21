@@ -192,7 +192,7 @@ Degree 20 never triggers that path, so the degree-20 rows show the cost of 4-byt
 Degree 40 triggers the path for every spin.
 At N = 5,791 no spill occurs. The weighted lane costs 4.77x at degree 20 and 8.68x at degree 40, so the reload adds an inferred factor of 1.8 (8.68 divided by 4.77).
 The Advantage2 gate run gives a reference of the same order. It uses 4,577 nodes, degree at most 20, and 128 reads, and shows 6.4x for weighted `i32` against unit (launch medians of 567.6 ms and 89.3 ms).
-That graph and run differ from this grid, so the ratio does not confirm 4.8x. It shows only that weighted lanes cost a multiple of the unit lane at degree 20 or less.
+That graph and run differ from this grid, so the ratio does not confirm 4.8x. It shows only that weighted lanes cost more than the unit lane at degree 20 or less.
 At large N the weighted degree-20 lane costs only 1.4x to 1.5x of the unit lane, because memory traffic dominates both.
 The degree-40 lane still costs 6.3x to 6.6x there, so the inferred reload factor is 4.3 to 4.6 at 64,000 and 200,000 nodes (6.57 divided by 1.51, and 6.31 divided by 1.38).
 At N = 5,791 the coefficient and arithmetic cost (4.8x) exceeds the inferred reload cost (1.8x).
