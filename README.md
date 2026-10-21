@@ -28,6 +28,10 @@ lower architecture and loads through the driver's forward-compatible PTX JIT.
 block and spills the rest to a per-nonce buffer in device memory. Every
 supported device serves 128 reads at every size up to 200,000 nodes and
 4,000,000 edges. Shared memory sets only how many spins stay on chip.
+A session whose buffers do not fit device memory is refused. At 200,000 nodes
+and 4,000,000 edges with 48 models, the A4000 measured about 2 GiB for unit
+models and 5.2 GiB for weighted i32 models (see the
+[A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)).
 
 ## Binaries
 
@@ -117,7 +121,7 @@ in `quip-solver-cpu`'s `quip-cpu-msa` (Isakov, Zintchenko, Rønnow, Troyer,
 two words. The Metropolis test is an integer comparison against a per-rung
 threshold table. Spins update one color class at a time, with the same greedy
 coloring the Gibbs kernel uses. One block anneals one problem in shared
-memory. The full MSA kernel computes no energies. The host rescores every sample with
+memory with a global spill buffer. The full MSA kernel computes no energies. The host rescores every sample with
 `energy_milli`, so results are consensus-scored like the other kernels.
 
 The unit kernel uses couplings and fields by sign. Consensus problems have
@@ -128,8 +132,8 @@ A spin with more than 62 neighbors cannot run on either MSA kernel.
 The miner rejects such a job as `TooLarge`.
 
 The first K spins live in shared memory, where K is the opt-in shared
-memory per block less 8720 bytes, divided by 16 (two replica words): 5791 on a
-99 KB part, 3551 on Turing. Spins past K live in a per-nonce global buffer,
+memory per block less 8720 bytes, divided by 8 times the replica words (two
+words at 128 reads, so 16): 5791 on a 99 KB part, 3551 on Turing. Spins past K live in a per-nonce global buffer,
 which reaches L2 and then DRAM as the graph grows. Placement does not change
 the samples: a spilled run returns the same reads as an all-shared run of the
 same seed. `--max-nodes` above 200,000 is an error at open, never a silent

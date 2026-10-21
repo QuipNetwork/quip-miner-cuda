@@ -1,6 +1,6 @@
 //! Real-corpus loading for `bench run --source/--topology`.
 //!
-//! The synthetic ring problem (`bench::ring_graph`) has degree 2 and is not
+//! The synthetic ring problem (`bench::circulant_graph`) has degree 2 and is not
 //! timing-representative of the real corpus topology (thousands of nodes,
 //! degree ~18). This module redraws the real `(h, J)` the coordinator would
 //! have sent a miner for a given nonce, from the same two files the
