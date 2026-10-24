@@ -1,7 +1,9 @@
 //! GPU allocation measurements for the MSA capacity estimate.
 
 use cudarc::driver::{sys::CUdevice_attribute, CudaContext};
-use quip_solver_cuda::capacity::{msa_footprint, DeviceLimits, ModelShape, MsaStorage, Precision};
+use quip_solver_cuda::capacity::{
+    msa_device_reads, msa_footprint, DeviceLimits, ModelShape, MsaStorage, Precision,
+};
 use quip_solver_cuda::coefficients;
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::sampler::{sample_ising, SampleError};
@@ -45,7 +47,7 @@ fn oversized_model_refused_before_allocation() {
     let ctx = CudaContext::new(device.device_index).expect("session device context");
     let graph = circulant(nodes, 60, Precision::Binary);
     let params = SampleParams {
-        num_reads: 128,
+        num_reads: msa_device_reads(&device.limits),
         num_sweeps: 1,
         ..SampleParams::default()
     };
@@ -140,7 +142,7 @@ fn footprint_matches_measured_allocation() {
                 ),
             };
             let params = SampleParams {
-                num_reads: 128,
+                num_reads: msa_device_reads(&device.limits),
                 num_sweeps: 1,
                 ..SampleParams::default()
             };
@@ -252,6 +254,7 @@ fn measure_dense_allocation(
     precision: Precision,
 ) {
     let nodes = graph.num_nodes();
+    let num_reads = msa_device_reads(&device.limits);
     ctx.synchronize().unwrap();
     let (free_before, _) = ctx.mem_get_info().unwrap();
     let footprint = msa_footprint(
@@ -262,7 +265,7 @@ fn measure_dense_allocation(
         },
         precision,
         MsaStorage::Dense,
-        128,
+        num_reads,
         1,
         &device.limits,
     );
@@ -272,7 +275,7 @@ fn measure_dense_allocation(
         free: Arc::clone(&free),
     };
     let p = SampleParams {
-        num_reads: 128,
+        num_reads,
         num_sweeps: 1,
         sweeps_per_beta: 1,
         seed: 19,
@@ -312,12 +315,13 @@ fn dense_timing(
 }
 
 // Subtract one-sweep from five-sweep CUDA event times to remove initialization
-// and packing. Use the median of three pairs at one instance and 128 reads.
+// and packing. Use three pairs at one instance and the device-selected reads.
 fn measure_dense_sweeps(device: &CudaDevice, graph: &IsingGraph, precision: Precision) {
+    let num_reads = msa_device_reads(&device.limits);
     let mut differences = Vec::new();
     for _ in 0..3 {
         let mut p = SampleParams {
-            num_reads: 128,
+            num_reads,
             num_sweeps: 1,
             sweeps_per_beta: 1,
             beta_range: Some((0.1, 0.1)),
@@ -339,7 +343,7 @@ fn measure_dense_sweeps(device: &CudaDevice, graph: &IsingGraph, precision: Prec
     }
     differences.sort_unstable();
     eprintln!(
-        "dense {precision:?} timing N={} replicas=128 instances=1 median_per_sweep_ns={}",
+        "dense {precision:?} timing N={} replicas={num_reads} instances=1 median_per_sweep_ns={}",
         graph.num_nodes(),
         differences[1]
     );
@@ -356,7 +360,7 @@ fn dense_oversized_model_refused_before_allocation() {
     let device = device.with_limits_for_test(limits);
     let graph = circulant(2_000, 60, Precision::Binary);
     let p = SampleParams {
-        num_reads: 128,
+        num_reads: msa_device_reads(&device.limits),
         num_sweeps: 1,
         ..SampleParams::default()
     };
@@ -392,7 +396,7 @@ fn dense_oversized_model_refused_before_allocation() {
 fn degree_62_sparse_63_dense() {
     let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 128).unwrap();
     let p = SampleParams {
-        num_reads: 8,
+        num_reads: msa_device_reads(&device.limits),
         num_sweeps: 64,
         ..SampleParams::default()
     };
@@ -447,7 +451,7 @@ fn probe_limit_runs_and_one_above_refuses() {
     };
     let device = device.with_limits_for_test(limits);
     let p = SampleParams {
-        num_reads: 128,
+        num_reads: msa_device_reads(&device.limits),
         num_sweeps: 64,
         sweeps_per_beta: 1,
         seed: 19,
@@ -483,11 +487,17 @@ fn shared_spin_cap_is_counted_before_allocation() {
         free_bytes: 64 << 20,
         ..device.limits
     };
-    let shape = msa_max_model(Connectivity::Degree(20), Precision::Binary, 128, &limits);
+    let num_reads = msa_device_reads(&device.limits);
+    let shape = msa_max_model(
+        Connectivity::Degree(20),
+        Precision::Binary,
+        num_reads,
+        &limits,
+    );
     let mut device = device.with_limits_for_test(limits);
     device.msa_shared_spins_cap = Some(0);
     let p = SampleParams {
-        num_reads: 128,
+        num_reads,
         num_sweeps: 64,
         ..SampleParams::default()
     };

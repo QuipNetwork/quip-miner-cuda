@@ -1,7 +1,7 @@
 //! Dense MSA correctness and cancellation on a real GPU.
 
 use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
-use quip_solver_cuda::capacity::{MsaStorage, Precision};
+use quip_solver_cuda::capacity::{msa_device_reads, MsaStorage, Precision};
 use quip_solver_cuda::coefficients::{self, CoefficientPath};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::nvml_gov::UtilGovernor;
@@ -59,9 +59,9 @@ fn sample_one(
         .collect())
 }
 
-fn params(sweeps: usize) -> SampleParams {
+fn params(device: &CudaDevice, sweeps: usize) -> SampleParams {
     SampleParams {
-        num_reads: 128,
+        num_reads: msa_device_reads(&device.limits),
         num_sweeps: sweeps,
         sweeps_per_beta: (sweeps / 64).max(1),
         seed: 42,
@@ -111,8 +111,8 @@ fn dense_unit_finds_brute_force_ground_state() {
     for seed in 1..=10 {
         let graph = sk(20, seed);
         let ground = ground_energy(&graph);
-        let reads = sample_one(&device, &graph, &params(4_096), KernelKind::Msa).unwrap();
-        assert_eq!(reads.len(), 128);
+        let reads = sample_one(&device, &graph, &params(&device, 4_096), KernelKind::Msa).unwrap();
+        assert_eq!(reads.len(), msa_device_reads(&device.limits));
         assert_eq!(
             reads.iter().map(|r| r.energy_milli).min(),
             Some(ground),
@@ -135,8 +135,8 @@ fn dense_energies_match_host() {
             _ => 1.0,
         };
     }
-    let reads = sample_one(&device, &graph, &params(64), KernelKind::Msa).unwrap();
-    assert_eq!(reads.len(), 128);
+    let reads = sample_one(&device, &graph, &params(&device, 64), KernelKind::Msa).unwrap();
+    assert_eq!(reads.len(), msa_device_reads(&device.limits));
     for read in reads {
         assert_eq!(read.spins.len(), 500);
         assert!(read.spins.iter().all(|s| *s == -1 || *s == 1));
@@ -153,8 +153,9 @@ fn dense_energies_match_host() {
 fn dense_seed_is_deterministic() {
     let device = open();
     let graph = sk(100, 9);
-    for count in [1, 64, 65, 128] {
-        let mut p = params(64);
+    let num_reads = msa_device_reads(&device.limits);
+    for count in [1, num_reads / 2, num_reads / 2 + 1, num_reads] {
+        let mut p = params(&device, 64);
         p.num_reads = count;
         let a = sample_one(&device, &graph, &p, KernelKind::Msa).unwrap();
         let b = sample_one(&device, &graph, &p, KernelKind::Msa).unwrap();
@@ -194,7 +195,7 @@ fn dense_cancel_aborts() {
             .blocking_send(StreamJob {
                 job_id: vec![1],
                 graph: graph.clone(),
-                params: params(20_000_000),
+                params: params(&device, 20_000_000),
                 watermark: Some(1),
             })
             .unwrap();
@@ -207,7 +208,7 @@ fn dense_cancel_aborts() {
             .blocking_send(StreamJob {
                 job_id: vec![2],
                 graph,
-                params: params(1),
+                params: params(&device, 1),
                 watermark: Some(2),
             })
             .unwrap();
@@ -225,7 +226,7 @@ fn dense_cancel_aborts() {
                     let StreamOutcome::Completed(Ok(reads)) = result.outcome else {
                         panic!("next session did not complete");
                     };
-                    assert_eq!(reads.len(), 128);
+                    assert_eq!(reads.len(), msa_device_reads(&device.limits));
                     completed = true;
                 }
                 _ => panic!("unexpected job"),
@@ -253,7 +254,7 @@ fn dense_stream_rotates_slots_with_distinct_matrices() {
             .blocking_send(StreamJob {
                 job_id: id.to_le_bytes().to_vec(),
                 graph: model,
-                params: params(64),
+                params: params(&device, 64),
                 watermark: Some(1),
             })
             .unwrap();
@@ -276,7 +277,7 @@ fn dense_stream_rotates_slots_with_distinct_matrices() {
             panic!("slot job failed");
         };
         let ground = if id % 2 == 0 { -2_080_000 } else { -32_000 };
-        assert_eq!(reads.len(), 128);
+        assert_eq!(reads.len(), msa_device_reads(&device.limits));
         assert_eq!(
             reads.iter().map(|r| r.energy_milli).min(),
             Some(ground),
@@ -300,10 +301,10 @@ fn dense_masks_absent_edges_and_constant_diagonal() {
         .collect();
     h[0] = 1.0;
     let graph = IsingGraph::new(h, vec![1.0], vec![(0, 0)]);
-    let mut p = params(1);
+    let mut p = params(&device, 1);
     p.beta_range = Some((20.0, 20.0));
     let reads = sample_one(&device, &graph, &p, KernelKind::Msa).unwrap();
-    assert_eq!(reads.len(), 128);
+    assert_eq!(reads.len(), p.num_reads);
     // 43 nonzero fields contribute -43. The diagonal adds the constant +1.
     for read in reads {
         assert_eq!(read.energy_milli, -42_000);
@@ -406,8 +407,8 @@ fn weighted_ground_states(path: CoefficientPath) {
         let graph = weighted_graph(20, seed, path);
         if path == CoefficientPath::Float32 {
             let ground = ground_real_energy(&graph);
-            let reads = sample_one_real(&device, &graph, &params(4_096)).unwrap();
-            assert_eq!(reads.len(), 128);
+            let reads = sample_one_real(&device, &graph, &params(&device, 4_096)).unwrap();
+            assert_eq!(reads.len(), msa_device_reads(&device.limits));
             let best = reads.iter().map(|r| r.energy).fold(f64::INFINITY, f64::min);
             assert!(
                 (best - ground).abs() <= 1e-4 * ground.abs(),
@@ -415,8 +416,9 @@ fn weighted_ground_states(path: CoefficientPath) {
             );
         } else {
             let ground = ground_energy(&graph);
-            let reads = sample_one(&device, &graph, &params(4_096), KernelKind::Msa).unwrap();
-            assert_eq!(reads.len(), 128);
+            let reads =
+                sample_one(&device, &graph, &params(&device, 4_096), KernelKind::Msa).unwrap();
+            assert_eq!(reads.len(), msa_device_reads(&device.limits));
             assert_eq!(
                 reads.iter().map(|r| r.energy_milli).min(),
                 Some(ground),
@@ -448,8 +450,8 @@ fn dense_f32_real_finds_brute_force_ground_state() {
 }
 
 fn check_weighted_energies(device: &CudaDevice, graph: &IsingGraph, storage: MsaStorage) {
-    let reads = sample_one_real_forced(device, graph, &params(64), storage).unwrap();
-    assert_eq!(reads.len(), 128);
+    let reads = sample_one_real_forced(device, graph, &params(device, 64), storage).unwrap();
+    assert_eq!(reads.len(), msa_device_reads(&device.limits));
     for read in reads {
         assert_eq!(read.spins.len(), graph.num_nodes());
         assert!(read.spins.iter().all(|&s| s == -1 || s == 1));
@@ -523,7 +525,8 @@ fn dense_weighted_planted_mattis_multi_tile() {
             assert_eq!(Precision::from_plan(plan, false), precision);
         }
         let reads =
-            sample_one_real_forced(&device, &graph, &params(1_024), MsaStorage::Dense).unwrap();
+            sample_one_real_forced(&device, &graph, &params(&device, 1_024), MsaStorage::Dense)
+                .unwrap();
         assert_eq!(last_storage(&device), Some(MsaStorage::Dense));
         if precision == Precision::Float32 {
             let ground = -graph.j.iter().map(|v| v.abs()).sum::<f64>();
