@@ -356,9 +356,10 @@ async fn degree_twenty_one_lease_runs_direct() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires CUDA device 0"]
-async fn degree_sixty_three_lease_returns_capacity_without_faulting() {
+async fn degree_sixty_three_lease_runs_dense_direct() {
     let mut s = start("").await;
-    let (mut topology, _) = ring(64, RING_A);
+    let (mut topology, mut view) = ring(64, RING_A);
+    view.edges = (1..64).map(|v| (0, v)).collect();
     topology.edges = Some(EdgeList {
         u: vec![0; 63],
         v: (1..64).collect(),
@@ -366,20 +367,20 @@ async fn degree_sixty_three_lease_returns_capacity_without_faulting() {
     s.send(coord_msg::Msg::Topology(topology)).await;
     s.send(coord_msg::Msg::SetTarget(target(i64::MAX, 32)))
         .await;
-    s.send(coord_msg::Msg::Job(lease(b"degree-63", 3, RING_A, 0, 8)))
-        .await;
-    // Core 0.0.3 closes non-fatal backend lease errors with a zero-salt
-    // summary and one refund, rather than sending a Reject frame.
+    let job = lease(b"degree-63", 3, RING_A, 0, 8);
+    let spec = generator(&job);
+    s.send(coord_msg::Msg::Job(job)).await;
     finish(&mut s, b"degree-63").await;
-    assert_eq!(s.log.done(b"degree-63").unwrap().salts_done, 0);
-    assert!(s.log.results.is_empty());
+    verify(&s, b"degree-63", &spec, &view, 8);
+    assert_eq!(s.log.results_for(b"degree-63").len(), 8);
     assert_eq!(s.log.refunds(), 1);
-    assert_eq!(s.jobs_done().await, 0);
+    assert_eq!(s.jobs_done().await, 8);
     assert_eq!(s.shutdown(2000).await, 0);
     assert_eq!(s.log.done_count(b"degree-63"), 1);
     assert_eq!(s.log.refunds(), 1);
     assert!(s.log.rejects.is_empty());
     assert!(s.log.fatal.is_none());
+    assert!(s.stderr().contains("Direct"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

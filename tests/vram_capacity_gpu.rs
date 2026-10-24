@@ -195,7 +195,7 @@ fn footprint_matches_measured_allocation() {
 }
 
 fn dense_allocation_cases(device: CudaDevice, ctx: &Arc<CudaContext>) {
-    let mut device = device.with_dense_msa_for_test();
+    let mut device = device;
     for nodes in [2_000usize, 8_000] {
         for precision in [
             Precision::Binary,
@@ -353,9 +353,7 @@ fn dense_oversized_model_refused_before_allocation() {
         free_bytes: 64 << 20,
         ..device.limits
     };
-    let device = device
-        .with_limits_for_test(limits)
-        .with_dense_msa_for_test();
+    let device = device.with_limits_for_test(limits);
     let graph = circulant(2_000, 60, Precision::Binary);
     let p = SampleParams {
         num_reads: 128,
@@ -365,7 +363,9 @@ fn dense_oversized_model_refused_before_allocation() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.synchronize().unwrap();
     let (before, _) = ctx.mem_get_info().unwrap();
-    let error = sample_ising(&device, &graph, &p, KernelKind::Msa).unwrap_err();
+    let error =
+        quip_solver_cuda::streaming::sample_one_real_forced(&device, &graph, &p, MsaStorage::Dense)
+            .unwrap_err();
     let SampleError::ModelExceedsDeviceMemory {
         nodes,
         couplers,
@@ -385,4 +385,119 @@ fn dense_oversized_model_refused_before_allocation() {
     ctx.synchronize().unwrap();
     let (after, _) = ctx.mem_get_info().unwrap();
     assert!(before.saturating_sub(after) <= 2 << 20);
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn degree_62_sparse_63_dense() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 128).unwrap();
+    let p = SampleParams {
+        num_reads: 8,
+        num_sweeps: 64,
+        ..SampleParams::default()
+    };
+    let graph = circulant(128, 62, Precision::Binary);
+    sample_ising(&device, &graph, &p, KernelKind::Msa).unwrap();
+    assert_eq!(
+        quip_solver_cuda::streaming::last_storage(&device),
+        Some(MsaStorage::Sparse)
+    );
+    let mut graph = graph;
+    let mut edges = graph.edges.to_vec();
+    edges.push((0, 64));
+    graph.edges = edges.into();
+    graph.j.push(-1.0);
+    sample_ising(&device, &graph, &p, KernelKind::Msa).unwrap();
+    assert_eq!(
+        quip_solver_cuda::streaming::last_storage(&device),
+        Some(MsaStorage::Dense)
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn probe_capacity_json_parses() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-msa"))
+        .args(["--probe-capacity", "--json", "--device", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["cells"].as_array().unwrap().len(), 9);
+    assert_eq!(value["betas"], 64);
+    assert!(value["reads"] == 128 || value["reads"] == 64);
+    for cell in value["cells"].as_array().unwrap() {
+        assert!(["shared", "spill", "dense"].contains(&cell["tier"].as_str().unwrap()));
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn probe_limit_runs_and_one_above_refuses() {
+    use quip_solver_cuda::capacity::{msa_max_model, Connectivity};
+    use quip_solver_cuda::streaming::sample_one_real;
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 5000).unwrap();
+    let limits = DeviceLimits {
+        free_bytes: 64 << 20,
+        ..device.limits
+    };
+    let device = device.with_limits_for_test(limits);
+    let p = SampleParams {
+        num_reads: 128,
+        num_sweeps: 64,
+        sweeps_per_beta: 1,
+        seed: 19,
+        ..SampleParams::default()
+    };
+    for conn in [Connectivity::Degree(20), Connectivity::Complete] {
+        for precision in [Precision::Binary, Precision::Float32] {
+            let shape = msa_max_model(conn, precision, p.num_reads, &limits);
+            assert!(shape.nodes > 63);
+            let graph = |n| match conn {
+                Connectivity::Degree(d) => circulant(n, d, precision),
+                Connectivity::Complete => dense_graph(n, precision),
+            };
+            let reads = sample_one_real(&device, &graph(shape.nodes), &p).unwrap();
+            assert_eq!(reads.len(), p.num_reads);
+            assert!(
+                matches!(
+                    sample_one_real(&device, &graph(shape.nodes + 1), &p),
+                    Err(SampleError::ModelExceedsDeviceMemory { .. })
+                ),
+                "{conn:?} {precision:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn shared_spin_cap_is_counted_before_allocation() {
+    use quip_solver_cuda::capacity::{msa_max_model, Connectivity};
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 5000).unwrap();
+    let limits = DeviceLimits {
+        free_bytes: 64 << 20,
+        ..device.limits
+    };
+    let shape = msa_max_model(Connectivity::Degree(20), Precision::Binary, 128, &limits);
+    let mut device = device.with_limits_for_test(limits);
+    device.msa_shared_spins_cap = Some(0);
+    let p = SampleParams {
+        num_reads: 128,
+        num_sweeps: 64,
+        ..SampleParams::default()
+    };
+    assert!(matches!(
+        sample_ising(
+            &device,
+            &circulant(shape.nodes, 20, Precision::Binary),
+            &p,
+            KernelKind::Msa
+        ),
+        Err(SampleError::ModelExceedsDeviceMemory { .. })
+    ));
 }

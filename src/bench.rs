@@ -125,6 +125,9 @@ pub struct RunArgs {
     /// Real-valued `.qmodel` file. Uses the MSA f32 coefficient path.
     #[arg(long, conflicts_with_all = ["source", "degree", "shuffle", "precision"])]
     pub model: Option<PathBuf>,
+    /// Complete synthetic graph with N nodes and the selected precision.
+    #[arg(long, conflicts_with_all = ["degree", "shuffle", "source", "model"])]
+    pub complete: Option<usize>,
     /// Reads per model, at most the kernel's cap (256 for sa and gibbs, 128 for msa).
     #[arg(long, default_value_t = 8)]
     pub reads: u64,
@@ -432,12 +435,19 @@ impl BenchModel {
     fn synthetic(args: &RunArgs) -> Self {
         Self {
             offset: 0.0,
-            graph: circulant_graph(
-                args.nodes,
-                args.degree,
-                args.shuffle
-                    .then(|| nonce_seed(args.nonce.as_deref().unwrap_or(""))),
-            ),
+            graph: if let Some(n) = args.complete {
+                let edges: Vec<_> = (0..n)
+                    .flat_map(|u| (u + 1..n).map(move |v| (u, v)))
+                    .collect();
+                IsingGraph::new(vec![0.0; n], vec![1.0; edges.len()], edges)
+            } else {
+                circulant_graph(
+                    args.nodes,
+                    args.degree,
+                    args.shuffle
+                        .then(|| nonce_seed(args.nonce.as_deref().unwrap_or(""))),
+                )
+            },
             nonce: args.nonce.clone().unwrap_or_else(|| "0x0".to_owned()),
             topology_hash: args
                 .topology_hash
@@ -461,7 +471,9 @@ fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
         }]);
     }
     let Some(source) = &args.source else {
-        check_degree(args.degree, args.nodes)?;
+        if args.complete.is_none() {
+            check_degree(args.degree, args.nodes)?;
+        }
         let mut model = BenchModel::synthetic(args);
         reweight_model(&mut model, args.precision.unwrap_or(BenchPrecision::Binary));
         return Ok(vec![model]);
@@ -982,6 +994,38 @@ mod tests {
     struct RunCli {
         #[command(flatten)]
         args: super::RunArgs,
+    }
+
+    #[test]
+    fn complete_graph_uses_selected_precision_and_rejects_conflicts() {
+        use clap::Parser;
+        for precision in ["binary", "int8", "int32", "float"] {
+            let parsed = RunCli::try_parse_from([
+                "bench",
+                "--complete",
+                "64",
+                "--precision",
+                precision,
+                "--out",
+                "/tmp/x",
+            ])
+            .expect("complete graph CLI")
+            .args;
+            let models = super::load_models(&parsed).unwrap();
+            assert_eq!(models[0].graph.num_nodes(), 64);
+            assert_eq!(models[0].graph.edges.len(), 64 * 63 / 2);
+            assert_eq!(super::uses_real(&parsed), precision == "float");
+        }
+        for extra in [
+            vec!["--degree", "2"],
+            vec!["--shuffle"],
+            vec!["--source", "x", "--topology", "y"],
+            vec!["--model", "x"],
+        ] {
+            let mut args = vec!["bench", "--complete", "64", "--out", "/tmp/x"];
+            args.extend(extra);
+            assert!(RunCli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]

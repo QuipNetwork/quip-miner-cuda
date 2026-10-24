@@ -362,7 +362,7 @@ pub struct CudaDevice {
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
     pub(crate) msa_dense: CudaFunction,
-    pub(crate) force_dense_msa: bool,
+    pub(crate) last_msa_storage: std::sync::Mutex<Option<capacity::MsaStorage>>,
     /// Weighted storage/lane variants, available only on MSA opens.
     pub(crate) msa_weighted: Option<MsaWeightedKernels>,
     /// Dynamic shared memory one msa block may request: the device's opt-in
@@ -404,14 +404,6 @@ impl fmt::Debug for CudaDevice {
 }
 
 impl CudaDevice {
-    /// Force dense MSA sessions for integration tests until routing exists.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn with_dense_msa_for_test(mut self) -> Self {
-        self.force_dense_msa = true;
-        self
-    }
-
     /// Create a context on `device_index` and NVRTC-compile the kernels.
     ///
     /// Precreates 64 session stream pairs. Additional concurrent sessions wait
@@ -592,7 +584,7 @@ impl CudaDevice {
             gibbs,
             msa,
             msa_dense,
-            force_dense_msa: false,
+            last_msa_storage: std::sync::Mutex::new(None),
             msa_weighted,
             msa_dynamic_shared_bytes,
             msa_shared_spins_cap: None,

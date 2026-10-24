@@ -1,10 +1,11 @@
 //! Dense MSA correctness and cancellation on a real GPU.
 
 use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
+use quip_solver_cuda::capacity::{MsaStorage, Precision};
 use quip_solver_cuda::coefficients::{self, CoefficientPath};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::nvml_gov::UtilGovernor;
-use quip_solver_cuda::streaming::{run_stream, sample_one, sample_one_real};
+use quip_solver_cuda::streaming::{last_storage, run_stream, sample_one_real_forced};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serial_test::serial;
 use std::time::{Duration, Instant};
@@ -26,9 +27,36 @@ fn sk(n: usize, mut seed: u64) -> IsingGraph {
 }
 
 fn open() -> CudaDevice {
-    CudaDevice::open_with_nodes(0, KernelKind::Msa, 8_000)
-        .unwrap()
-        .with_dense_msa_for_test()
+    CudaDevice::open_with_nodes(0, KernelKind::Msa, 8_000).unwrap()
+}
+
+fn sample_one_real(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+) -> Result<quip_solver_cuda::SampleSet, quip_solver_cuda::sampler::SampleError> {
+    sample_one_real_forced(device, graph, params, MsaStorage::Dense)
+}
+
+fn sample_one(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: KernelKind,
+) -> Result<Vec<quip_solver_cuda::SamplerResult>, quip_solver_cuda::sampler::SampleError> {
+    assert_eq!(kernel, KernelKind::Msa);
+    Ok(sample_one_real(device, graph, params)?
+        .into_iter()
+        .map(|read| quip_solver_cuda::SamplerResult {
+            energy_milli: quip_protocol::scoring::energy_milli(
+                &read.spins,
+                &graph.h,
+                &graph.j,
+                &graph.edges,
+            ),
+            spins: read.spins,
+        })
+        .collect())
 }
 
 fn params(sweeps: usize) -> SampleParams {
@@ -419,26 +447,13 @@ fn dense_f32_real_finds_brute_force_ground_state() {
     weighted_ground_states(CoefficientPath::Float32);
 }
 
-fn check_weighted_energies(device: &CudaDevice, graph: &IsingGraph, path: CoefficientPath) {
-    if path == CoefficientPath::Float32 {
-        let reads = sample_one_real(device, graph, &params(64)).unwrap();
-        assert_eq!(reads.len(), 128);
-        for read in reads {
-            assert_eq!(read.spins.len(), graph.num_nodes());
-            assert!(read.spins.iter().all(|&s| s == -1 || s == 1));
-            assert!((read.energy - host_real_energy(&read.spins, graph)).abs() < 1e-8);
-        }
-    } else {
-        let reads = sample_one(device, graph, &params(64), KernelKind::Msa).unwrap();
-        assert_eq!(reads.len(), 128);
-        for read in reads {
-            assert_eq!(read.spins.len(), graph.num_nodes());
-            assert!(read.spins.iter().all(|&s| s == -1 || s == 1));
-            assert_eq!(
-                read.energy_milli,
-                quip_protocol::scoring::energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges)
-            );
-        }
+fn check_weighted_energies(device: &CudaDevice, graph: &IsingGraph, storage: MsaStorage) {
+    let reads = sample_one_real_forced(device, graph, &params(64), storage).unwrap();
+    assert_eq!(reads.len(), 128);
+    for read in reads {
+        assert_eq!(read.spins.len(), graph.num_nodes());
+        assert!(read.spins.iter().all(|&s| s == -1 || s == 1));
+        assert!((read.energy - host_real_energy(&read.spins, graph)).abs() < 1e-8);
     }
 }
 
@@ -452,7 +467,7 @@ fn dense_weighted_energies_match_host() {
         CoefficientPath::Wide,
         CoefficientPath::Float32,
     ] {
-        check_weighted_energies(&device, &weighted_graph(500, 99, path), path);
+        check_weighted_energies(&device, &weighted_graph(500, 99, path), MsaStorage::Dense);
     }
 }
 
@@ -468,7 +483,71 @@ fn dense_and_sparse_weighted_energies_match_host() {
         CoefficientPath::Float32,
     ] {
         let graph = weighted_graph(20, 99, path);
-        check_weighted_energies(&sparse, &graph, path);
-        check_weighted_energies(&dense, &graph, path);
+        check_weighted_energies(&sparse, &graph, MsaStorage::Sparse);
+        check_weighted_energies(&dense, &graph, MsaStorage::Dense);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_weighted_planted_mattis_multi_tile() {
+    let device = open();
+    let n = 600;
+    for precision in [Precision::Int8, Precision::Int32, Precision::Float32] {
+        let mut seed = 0x1234_5678_9abc_def0;
+        let xi: Vec<i8> = (0..n)
+            .map(|_| if random(&mut seed) & 1 == 0 { -1 } else { 1 })
+            .collect();
+        let mut edges = Vec::with_capacity(n * (n - 1) / 2);
+        let mut j = Vec::with_capacity(edges.capacity());
+        for u in 0..n {
+            for v in u + 1..n {
+                let draw = random(&mut seed);
+                let magnitude = match precision {
+                    Precision::Int8 => f64::from(u32::try_from(draw % 127 + 1).unwrap()),
+                    Precision::Int32 => f64::from(u32::try_from(draw % 1000 + 1).unwrap()) / 1000.0,
+                    Precision::Float32 => {
+                        0.5 + f64::from(u32::try_from(draw >> 32).unwrap()) / 4_294_967_296.0
+                    }
+                    Precision::Binary => unreachable!(),
+                };
+                edges.push((u, v));
+                // E = sum J_ij s_i s_j, so every planted bond contributes -w.
+                j.push(-magnitude * f64::from(xi[u]) * f64::from(xi[v]));
+            }
+        }
+        let graph = IsingGraph::new(vec![0.0; n], j, edges);
+        if precision != Precision::Float32 {
+            let plan = coefficients::plan(KernelKind::Msa, &graph, device.max_nodes).unwrap();
+            assert_eq!(Precision::from_plan(plan, false), precision);
+        }
+        let reads =
+            sample_one_real_forced(&device, &graph, &params(1_024), MsaStorage::Dense).unwrap();
+        assert_eq!(last_storage(&device), Some(MsaStorage::Dense));
+        if precision == Precision::Float32 {
+            let ground = -graph.j.iter().map(|v| v.abs()).sum::<f64>();
+            assert!(
+                reads
+                    .iter()
+                    .any(|r| (r.energy - ground).abs() <= ground.abs() * 1e-6),
+                "{precision:?}: planted ground {ground}"
+            );
+        } else {
+            let ground = -graph
+                .j
+                .iter()
+                .map(|&v| coefficients::to_milli(v).unwrap().abs())
+                .sum::<i64>();
+            assert!(
+                reads.iter().any(|r| quip_protocol::scoring::energy_milli(
+                    &r.spins,
+                    &graph.h,
+                    &graph.j,
+                    &graph.edges
+                ) == ground),
+                "{precision:?}: planted ground {ground}"
+            );
+        }
     }
 }

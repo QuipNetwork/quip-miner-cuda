@@ -20,18 +20,6 @@ fn check_capacity(topology: &TopologyView, max_nodes: usize) -> Result<(), Sampl
     if topology.num_nodes > max_nodes {
         return Err(SampleError::Capacity);
     }
-    // Use the full solver's CSR degree calculation. Coefficients do not
-    // affect admission, and the field vector supplies only the node count.
-    let graph = IsingGraph::new(
-        vec![0.0; topology.num_nodes],
-        Vec::new(),
-        topology.edges.clone(),
-    );
-    if crate::topology::SelfFeedingTopology::build(&graph).max_degree()
-        > crate::capacity::MSA_MAX_DEGREE
-    {
-        return Err(SampleError::Capacity);
-    }
     Ok(())
 }
 
@@ -488,17 +476,14 @@ mod tests {
     use quip_solver_core::Sampler;
 
     #[test]
-    fn capacity_check_uses_full_msa_degree_and_opened_node_limits() {
+    fn capacity_check_admits_dense_degrees_within_opened_node_limits() {
         let mut topology = TopologyView {
             num_nodes: 64,
             edges: (1..64).map(|node| (0, node)).collect(),
             allowed_h_milli: vec![0],
             allowed_j_milli: vec![-1000, 1000],
         };
-        assert!(matches!(
-            check_capacity(&topology, 64),
-            Err(SampleError::Capacity)
-        ));
+        assert!(check_capacity(&topology, 64).is_ok());
         topology.edges.pop();
         assert!(check_capacity(&topology, 64).is_ok());
         assert!(matches!(

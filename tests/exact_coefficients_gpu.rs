@@ -206,7 +206,7 @@ fn assert_all_ground(reads: &[quip_solver_cuda::SamplerResult], ground: i64, wha
     }
 }
 
-/// Degree 21 is the first two-pass spin and degree 62 the ceiling. Every
+/// Degree 21 is the first two-pass spin and degree 62 the sparse ceiling. Every
 /// lane must reach the ground state, which a wrong carry in the chunked
 /// counter or the chunked weighted field would miss.
 #[test]
@@ -247,22 +247,31 @@ fn msa_reaches_ground_states_at_degree_21_and_62_on_every_lane() {
 #[test]
 #[serial]
 #[ignore = "requires CUDA GPU; run with make test-gpu"]
-fn msa_refuses_k64_on_unit_and_weighted_paths() {
-    let graph = complete_pm1(64);
-    for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
-        let err = bench_one(
-            device(KernelKind::Msa),
-            &graph,
-            &params(),
-            KernelKind::Msa,
-            lane,
-        )
-        .unwrap_err();
-        assert!(matches!(err, SampleError::Unsupported(_)), "{err}");
-        assert!(
-            err.to_string().contains("63") && err.to_string().contains("62-neighbour"),
-            "{err}"
-        );
+fn msa_routes_k64_on_unit_and_weighted_paths() {
+    for weighted in [false, true] {
+        let graph = if weighted {
+            ferro_complete(64, 2.0, 3.0)
+        } else {
+            ferro_complete(64, 1.0, 1.0)
+        };
+        let ground = if weighted {
+            ferro_ground_milli(64, 2, 3)
+        } else {
+            ferro_ground_milli(64, 1, 1)
+        };
+        for lane in [None, Some(MsaLane::I32), Some(MsaLane::F32)] {
+            let dev = device(KernelKind::Msa);
+            let (reads, _) = bench_one(dev, &graph, &params(), KernelKind::Msa, lane).unwrap();
+            assert_eq!(
+                reads.iter().map(|r| r.energy_milli).min(),
+                Some(ground),
+                "dense K64 {lane:?}, weighted={weighted}"
+            );
+            assert_eq!(
+                quip_solver_cuda::streaming::last_storage(dev),
+                Some(quip_solver_cuda::capacity::MsaStorage::Dense)
+            );
+        }
     }
 }
 

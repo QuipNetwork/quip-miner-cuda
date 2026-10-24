@@ -67,7 +67,7 @@ fn msa_identity_declares_the_resolved_limits() {
     assert_eq!(id.max_nodes, 1_234_567);
     assert_eq!(id.max_edges, 7_654_321);
     assert_eq!(id.adapt.max_reads, 128);
-    assert_eq!(id.limits.max_degree, Some(62));
+    assert_eq!(id.limits.max_degree, None);
 }
 
 /// Exercise `SelfFeedingTopology::build` + `fill_coefficients` via the public API only.

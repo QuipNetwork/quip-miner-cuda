@@ -33,6 +33,7 @@ mod lease_turn;
 pub mod model_file;
 pub mod nsight;
 pub mod nvml_gov;
+pub mod probe;
 pub mod sampler;
 pub mod schema;
 pub mod screen;
@@ -275,7 +276,7 @@ pub fn cuda_msa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity 
         // Other models run the weighted kernel at the model's own scale, up to a
         // local field of 2^24 - 1 milli at scale 1, the worst case.
         limits: ModelLimits {
-            max_degree: Some(u32::try_from(capacity::MSA_MAX_DEGREE).unwrap_or(u32::MAX)),
+            max_degree: None,
             max_local_field_milli: Some(
                 u32::try_from(coefficients::MSA_WEIGHTED_MAX_FIELD).unwrap_or(u32::MAX),
             ),
@@ -376,7 +377,11 @@ impl Sampler for CudaSampler {
     }
 
     fn max_reads(&self) -> u32 {
-        streaming::max_reads(self.kernel)
+        if self.kernel == KernelKind::Msa {
+            u32::try_from(capacity::msa_device_reads(&self.device.limits)).unwrap_or(128)
+        } else {
+            streaming::max_reads(self.kernel)
+        }
     }
 
     fn apply_config(&self, backend_toml: &str) {

@@ -91,12 +91,7 @@ async fn quip_cuda_msa_passes_conformance() {
 async fn quip_cuda_msa_passes_solve_conformance() {
     assert_passes_solve_gate(
         "quip-cuda-msa",
-        &[
-            "degree-limit-inside",
-            "degree-limit-outside",
-            "field-limit-inside",
-            "field-limit-outside",
-        ],
+        &["field-limit-inside", "field-limit-outside"],
     )
     .await;
 }
@@ -212,17 +207,13 @@ fn msa_capabilities_report_probed_device_limits() {
         String::from_utf8_lossy(&out.stderr)
     );
     let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(caps["maxDegree"], 62);
+    assert!(caps["maxDegree"].is_null());
     let nodes = caps["maxNodes"].as_u64().unwrap();
     let edges = caps["maxEdges"].as_u64().unwrap();
-    let degree = caps["maxDegree"].as_u64().unwrap();
+
     assert!(nodes > 0 && edges > 0, "{caps}");
-    // Both axes come from one memory snapshot. The smallest degree-bounded
-    // graph at the edge limit must fit within the uncoupled node limit.
-    assert!(
-        (edges * 2).div_ceil(degree).max(degree + 1) <= nodes,
-        "{caps}"
-    );
+    // A complete model at the edge limit still fits the independent node limit.
+    assert!(edges <= nodes * (nodes - 1) / 2, "{caps}");
     assert_eq!(caps["maxLocalFieldMilli"], 16_777_215);
     assert_eq!(caps["exactResolutionMilli"], 1);
     assert!(caps["features"]

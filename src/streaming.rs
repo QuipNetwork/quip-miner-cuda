@@ -174,6 +174,14 @@ fn algo_limits(kernel: KernelKind) -> AlgoLimits {
     }
 }
 
+fn device_algo_limits(device: &CudaDevice, kernel: KernelKind) -> AlgoLimits {
+    let mut limits = algo_limits(kernel);
+    if kernel == KernelKind::Msa {
+        limits.max_reads = capacity::msa_device_reads(&device.limits);
+    }
+    limits
+}
+
 /// Backend-facing read cap for `Sampler::max_reads`. `max_nodes` is not here:
 /// it is resolved per process from `--max-nodes` and the device, then carried
 /// on [`crate::cuda_device::CudaDevice::max_nodes`] and reported through
@@ -449,16 +457,15 @@ pub struct MsaLayout {
 /// budget holds, less if [`CudaDevice::msa_shared_spins_cap`] says so.
 #[must_use]
 pub fn msa_layout(device: &CudaDevice, n: usize, reads_per_nonce: usize) -> MsaLayout {
-    // A power of two, which the kernel's thread-to-word mask requires.
-    let words = reads_per_nonce
-        .max(1)
-        .div_ceil(capacity::MSA_LANES)
-        .next_power_of_two();
-    let budget = capacity::msa_shared_spins(device.msa_dynamic_shared_bytes, words);
-    let cap = device.msa_shared_spins_cap.unwrap_or(usize::MAX);
+    let (words, shared_spins) = capacity::msa_spin_layout(
+        n,
+        reads_per_nonce,
+        device.msa_dynamic_shared_bytes,
+        device.msa_shared_spins_cap,
+    );
     MsaLayout {
         words,
-        shared_spins: n.min(budget).min(cap),
+        shared_spins,
     }
 }
 
@@ -568,8 +575,31 @@ fn session_topology(
     device: &CudaDevice,
     kernel: KernelKind,
     graph: &IsingGraph,
+    forced: Option<capacity::MsaStorage>,
 ) -> Result<SelfFeedingTopology, SampleError> {
-    if kernel != KernelKind::Msa || !device.force_dense_msa {
+    let storage = if kernel == KernelKind::Msa {
+        forced.unwrap_or_else(|| {
+            let mut degrees = vec![0usize; graph.num_nodes()];
+            for &(u, v) in graph.edges.iter() {
+                if let Some(degree) = degrees.get_mut(u) {
+                    *degree += 1;
+                }
+                if v != u {
+                    if let Some(degree) = degrees.get_mut(v) {
+                        *degree += 1;
+                    }
+                }
+            }
+            if degrees.into_iter().max().unwrap_or(0) > capacity::MSA_MAX_DEGREE {
+                capacity::MsaStorage::Dense
+            } else {
+                capacity::MsaStorage::Sparse
+            }
+        })
+    } else {
+        capacity::MsaStorage::Sparse
+    };
+    if storage == capacity::MsaStorage::Sparse {
         return Ok(SelfFeedingTopology::build(graph));
     }
     let n = graph.num_nodes();
@@ -879,10 +909,10 @@ fn check_session_capacity(
     } else {
         capacity::Precision::from_plan(plan, true)
     };
-    let footprint = capacity::msa_footprint(
+    let footprint = capacity::msa_footprint_with_shared_cap(
         shape,
         precision,
-        if device.force_dense_msa {
+        if topology.row_ptr.is_empty() {
             capacity::MsaStorage::Dense
         } else {
             capacity::MsaStorage::Sparse
@@ -890,6 +920,7 @@ fn check_session_capacity(
         reads,
         betas,
         &device.limits,
+        device.msa_shared_spins_cap,
     );
     let required_bytes = footprint.total();
     let available_bytes = device.limits.usable_bytes();
@@ -918,7 +949,6 @@ impl<'a> SelfFeedingSession<'a> {
         let _span = trace_span!("problem_setup", n = topology.n, nnz = topology.nnz).entered();
         let arithmetic = arithmetic.normalized();
         let plan = arithmetic.coefficients;
-        let msa_lane = arithmetic.msa_lane;
         let n = topology.n;
         check_session_capacity(
             device,
@@ -965,7 +995,7 @@ impl<'a> SelfFeedingSession<'a> {
         let d_ctrl = stream_compute.alloc_zeros::<i32>(num_nonces * CTRL_STRIDE)?;
         let d_beta = stream_compute.alloc_zeros::<f32>(max_num_betas.max(1))?;
 
-        let algo_state = if kernel == KernelKind::Msa && device.force_dense_msa {
+        let algo_state = if kernel == KernelKind::Msa && topology.row_ptr.is_empty() {
             build_msa_dense_state(
                 &stream_compute,
                 n,
@@ -984,7 +1014,7 @@ impl<'a> SelfFeedingSession<'a> {
                 reads_per_nonce,
                 num_nonces,
                 max_num_betas,
-                msa_lane,
+                arithmetic.msa_lane,
             )?
         } else {
             build_algo_state(
@@ -1014,6 +1044,7 @@ impl<'a> SelfFeedingSession<'a> {
         // documented; only this one-time initialization needed ordering.
         stream_compute.synchronize()?;
 
+        record_storage(device, kernel, &topology);
         Ok(Self {
             device,
             kernel,
@@ -1926,9 +1957,8 @@ pub(crate) fn bench_plan(
 ///   ceiling this device opened with for the chosen kernel. This is
 ///   permanent for this session — the ceiling is fixed at open, so the
 ///   caller should reject the job rather than retry it.
-/// - [`SampleError::Unsupported`] if the chosen kernel cannot run this
-///   graph: for msa, a spin with more than `capacity::MSA_MAX_DEGREE`
-///   neighbours. Permanent for this graph.
+/// - [`SampleError::Unsupported`] if no exact coefficient path can run this graph.
+///   MSA routes degrees above `capacity::MSA_MAX_DEGREE` to dense storage.
 /// - [`SampleError::KernelTimeout`] if the kernel has not marked slot 0
 ///   COMPLETE within 120 seconds of launch.
 /// - [`SampleError::Cuda`] or [`SampleError::Driver`] for a CUDA driver
@@ -1964,10 +1994,12 @@ pub fn sample_one(
 ) -> Result<Vec<SamplerResult>, SampleError> {
     let plan = coefficients::plan(kernel, graph, wide_max_nodes(device, kernel))
         .map_err(SampleError::Unsupported)?;
-    Ok(sample_one_planned(device, graph, params, kernel, plan)?
-        .into_iter()
-        .map(|spins| score_spins(&spins, graph))
-        .collect())
+    Ok(
+        sample_one_planned(device, graph, params, kernel, plan, None)?
+            .into_iter()
+            .map(|spins| score_spins(&spins, graph))
+            .collect(),
+    )
 }
 
 fn sample_one_planned(
@@ -1976,16 +2008,17 @@ fn sample_one_planned(
     params: &SampleParams,
     kernel: KernelKind,
     plan: CoefficientPlan,
+    forced: Option<capacity::MsaStorage>,
 ) -> Result<Vec<Vec<i8>>, SampleError> {
     let n = graph.num_nodes();
     if n == 0 {
         return Ok(vec![Vec::new(); params.num_reads.max(1)]);
     }
 
-    let limits = algo_limits(kernel);
+    let limits = device_algo_limits(device, kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_planned_beta_schedule(graph, params, plan)?;
-    let topology = session_topology(device, kernel, graph)?;
+    let topology = session_topology(device, kernel, graph, forced)?;
 
     let mut sess = SelfFeedingSession::build(
         device,
@@ -2046,7 +2079,7 @@ pub fn sample_one_real(
     params: &SampleParams,
 ) -> Result<SampleSet, SampleError> {
     let plan = real_plan(device, graph)?;
-    let reads = sample_one_planned(device, graph, params, KernelKind::Msa, plan)?;
+    let reads = sample_one_planned(device, graph, params, KernelKind::Msa, plan, None)?;
     Ok(reads
         .into_iter()
         .map(|read| RealSample {
@@ -2054,6 +2087,59 @@ pub fn sample_one_real(
             spins: read,
         })
         .collect())
+}
+
+/// Sample with an explicit MSA storage tier, including dense zero-filled absent couplers.
+/// Exact graphs retain their coefficients and constant diagonal terms.
+///
+/// # Errors
+/// Returns the same coefficient, device, and capacity errors as [`sample_one_real`].
+#[doc(hidden)]
+pub fn sample_one_real_forced(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    storage: capacity::MsaStorage,
+) -> Result<SampleSet, SampleError> {
+    let plan = if graph.edges.iter().any(|&(u, v)| u == v) {
+        // Preserve the exact dense diagonal fixture, whose terms are constant.
+        coefficients::plan(KernelKind::Msa, graph, device.max_nodes)
+            .map_err(SampleError::Unsupported)?
+    } else {
+        real_plan(device, graph)?
+    };
+    let reads = sample_one_planned(device, graph, params, KernelKind::Msa, plan, Some(storage))?;
+    Ok(reads
+        .into_iter()
+        .map(|spins| RealSample {
+            energy: real_energy(&spins, graph),
+            spins,
+        })
+        .collect())
+}
+
+fn record_storage(device: &CudaDevice, kernel: KernelKind, topology: &SelfFeedingTopology) {
+    if kernel == KernelKind::Msa {
+        *device
+            .last_msa_storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(if topology.row_ptr.is_empty() {
+                capacity::MsaStorage::Dense
+            } else {
+                capacity::MsaStorage::Sparse
+            });
+    }
+}
+
+/// Storage tier of the most recently built MSA session on this device.
+#[doc(hidden)]
+#[must_use]
+pub fn last_storage(device: &CudaDevice) -> Option<capacity::MsaStorage> {
+    *device
+        .last_msa_storage
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn real_plan(device: &CudaDevice, graph: &IsingGraph) -> Result<CoefficientPlan, SampleError> {
@@ -2303,10 +2389,10 @@ fn bench_many_planned(
             DeviceTimings::default(),
         ));
     }
-    let limits = algo_limits(kernel);
+    let limits = device_algo_limits(device, kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_planned_beta_schedule(graph, params, plan)?;
-    let topology = session_topology(device, kernel, graph)?;
+    let topology = session_topology(device, kernel, graph, None)?;
     let mut sess = SelfFeedingSession::build(
         device,
         kernel,
@@ -3025,7 +3111,7 @@ fn run_session(
     ctx: &mut DriverContext<'_>,
 ) -> Option<StreamJob> {
     let watermark = seed.watermark;
-    let limits = algo_limits(kernel);
+    let limits = device_algo_limits(device, kernel);
     let reads_per_nonce = seed.params.num_reads.max(1).min(limits.max_reads);
     let key = match SessionKey::seed(
         &seed,
@@ -3069,7 +3155,7 @@ fn run_session(
         seed.params.schedule,
         key.plan.coefficients.beta_factor(),
     );
-    let topology = match session_topology(device, kernel, &seed.graph) {
+    let topology = match session_topology(device, kernel, &seed.graph, None) {
         Ok(topology) => topology,
         Err(error) => {
             send_reject(out, seed, error.into());

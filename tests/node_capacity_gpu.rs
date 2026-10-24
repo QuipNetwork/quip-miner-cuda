@@ -10,7 +10,7 @@
 use quip_solver_cuda::capacity::GIBBS_DEFAULT_NODES;
 use quip_solver_cuda::capacity::{msa_max_nodes, MSA_DEFAULT_NODES, MSA_MAX_READS};
 use quip_solver_cuda::cuda_device::CudaDevice;
-use quip_solver_cuda::sampler::{sample_ising, SampleError};
+use quip_solver_cuda::sampler::sample_ising;
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 
 /// Pegasus P16 has 5640 nodes, above both shipped defaults (5000 / 4800).
@@ -74,12 +74,11 @@ fn msa_opens_beyond_shared_memory_and_refuses_above_the_device_budget() {
     );
 }
 
-/// The msa kernel counts `capacity::MSA_MAX_DEGREE` neighbours per
-/// spin. A denser graph is refused per job as `Unsupported`, which the
-/// wire maps to `Capacity`, and the session stays usable.
+/// The sparse msa kernel counts `capacity::MSA_MAX_DEGREE` neighbours per
+/// spin. A denser graph uses dense storage and the session stays usable.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn msa_refuses_a_spin_with_more_than_sixty_two_neighbours() {
+fn msa_routes_a_spin_with_more_than_sixty_two_neighbours() {
     if CudaDevice::device_count().unwrap_or(0) == 0 {
         eprintln!("no CUDA device visible; skipping");
         return;
@@ -96,14 +95,11 @@ fn msa_refuses_a_spin_with_more_than_sixty_two_neighbours() {
         seed: 1,
         ..Default::default()
     };
-    let Err(SampleError::Unsupported(msg)) =
-        sample_ising(&device, &graph, &params, KernelKind::Msa)
-    else {
-        panic!("a degree-63 graph must be refused as Unsupported");
-    };
-    assert!(
-        msg.contains("max degree 63") && msg.contains("62-neighbour budget"),
-        "message must name the degree and the budget: {msg}"
+    let reads = sample_ising(&device, &graph, &params, KernelKind::Msa).unwrap();
+    assert_eq!(reads.len(), 8);
+    assert_eq!(
+        quip_solver_cuda::streaming::last_storage(&device),
+        Some(quip_solver_cuda::capacity::MsaStorage::Dense)
     );
 }
 

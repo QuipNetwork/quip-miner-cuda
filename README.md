@@ -28,7 +28,7 @@ lower architecture and loads through the driver's forward-compatible PTX JIT.
 block and spills the rest to a per-nonce buffer in device memory. Node and
 coupler limits come from device memory divided among instances,
 one per SM. With 15 GiB free, 48 SMs and 128 reads, the A4000 advertises
-3,987,504 uncoupled nodes or 32,139,292 sparse couplers at degree 62. These independent
+3,987,504 uncoupled nodes or 44,599,290 dense couplers at 9,445 complete nodes. These independent
 Binary limits use the default 64-beta schedule. A model near both limits can
 exceed memory. The miner checks each model before allocation, including its
 precision and schedule length. Shared memory sets how many spins stay on chip.
@@ -36,6 +36,13 @@ The miner refuses a session whose buffers exceed device memory. At 200,000 nodes
 and 4,000,000 edges with 48 models, the A4000 measured about 2 GiB for unit
 models and 5.2 GiB for weighted i32 models (see the
 [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)).
+
+Run `quip-cuda-msa --probe-capacity` to show the capacity grid for the selected device.
+Add `--device N` to select a GPU or `--json` for machine-readable output.
+The grid uses the mining read count and 64 beta entries.
+Each cell shows variables, couplers, and the shared, spill, or dense storage tier.
+Use `quip-cuda-msa bench run --complete N --precision int8 --out DIR` to benchmark a complete graph.
+The precision options are `binary`, `int8`, `int32`, and `float`.
 
 ## Binaries
 
@@ -67,7 +74,7 @@ The local field bound is the largest of these sums.
   The wide kernel cannot accept a move whose Metropolis probability is below about 7.6e-6.
 - **Gibbs:** accepts models whose absolute coefficients are at most 127 times the model's GCD step.
   Gibbs refuses models that need a wide path.
-- **MSA:** accepts models of degree at most 62.
+- **MSA:** uses sparse storage through degree 62 and dense storage for higher degrees.
   Models with `h` in {-1, 0, 1} and `J` in {-1, 1} use the unit-weight kernel.
   Other models use the weighted kernel at the model's GCD step.
   Its local field bound is 16,777,215 times that step, or 16,777,215 milli at scale 1.
@@ -132,12 +139,13 @@ The unit kernel uses couplings and fields by sign. Consensus problems have
 `J` in {-1, 1} and `h` in {-1, 0, 1}, which it represents exactly.
 Other supported whole-milli models use the weighted kernel at their own scale.
 The miner refuses any model that exceeds the coefficient or local field bounds.
-A spin with more than 62 neighbors cannot run on either MSA kernel.
-The miner rejects such a job as `TooLarge`.
+The CUDA MSA solver uses dense storage for spins with more than 62 neighbors.
 
 The first K spins live in shared memory, where K is the opt-in shared
 memory per block less 8720 bytes, divided by 8 times the replica words (two
-words at 128 reads, so 16): 5791 on a 99 KB part, 3551 on Turing. Spins past K live in a per-nonce global buffer,
+words at 128 reads, so 16): 5791 on a 99 KB part.
+Turing uses 64 reads and holds 7102 spins in shared memory.
+Spins past K live in a per-nonce global buffer,
 which reaches L2 and then DRAM as the graph grows. Placement does not change
 the samples: a spilled run returns the same reads as an all-shared run of the
 same seed. Without `--max-nodes`, the miner uses its device-derived node limit.

@@ -9,7 +9,8 @@ use clap::{Parser, Subcommand};
 use quip_solver_core::{run, CommonArgs};
 use quip_solver_cuda::bench::{run_bench, BenchAction};
 use quip_solver_cuda::capacity::{
-    advertised_nodes, msa_max_couplers, resolve, MSA_DEFAULT_NODES, MSA_MAX_READS,
+    instances, msa_device_reads, msa_max_couplers, msa_max_nodes, msa_per_instance_budget, resolve,
+    Connectivity, MsaStorage, MSA_DEFAULT_BETAS, MSA_DEFAULT_NODES,
 };
 use quip_solver_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
@@ -40,6 +41,12 @@ struct Cli {
     /// is an error at open. Without this flag the full device limit applies.
     #[arg(long)]
     max_nodes: Option<usize>,
+    /// Print the device capacity grid and exit without starting a session.
+    #[arg(long)]
+    probe_capacity: bool,
+    /// Emit the capacity grid as a single JSON object.
+    #[arg(long, requires = "probe_capacity")]
+    json: bool,
 }
 
 /// Top-level subcommands. Absent → the ordinary coordinator-driven miner
@@ -109,20 +116,24 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    let reads = msa_device_reads(&device.limits);
+    if cli.probe_capacity {
+        print_probe(&device, reads, cli.json);
+        return ExitCode::SUCCESS;
+    }
     if let Some(cap) = cli.max_nodes {
         if let Err(e) = resolve(KernelKind::Msa, cap, &device.limits) {
             tracing::error!("device {}: {e}", cli.device);
             return ExitCode::FAILURE;
         }
     }
-    let nodes = advertised_nodes(
-        KernelKind::Msa,
-        cli.max_nodes.unwrap_or(usize::MAX),
-        Some(&device.limits),
-    );
-    let edges = msa_max_couplers(&device.limits, MSA_MAX_READS);
+    let nodes = msa_max_nodes(&device.limits, reads)
+        .min(cli.max_nodes.unwrap_or(usize::MAX).max(MSA_DEFAULT_NODES));
+    let edges = msa_max_couplers(&device.limits, reads);
     device.max_nodes = nodes;
-    run(cuda_msa_identity(nodes, edges), &cli.common, || {
+    let mut identity = cuda_msa_identity(nodes, edges);
+    identity.adapt = quip_solver_cuda::cuda_msa_adapt(u32::try_from(reads).unwrap_or(128));
+    run(identity, &cli.common, || {
         // The governor binds by PCI bus id, not by ordinal: NVML's index
         // space is PCI-ordered and does not track the CUDA ordinal this
         // process opened. Taking it from the opened device means both
@@ -132,10 +143,94 @@ fn main() -> ExitCode {
     })
 }
 
+fn print_probe(device: &CudaDevice, reads: usize, json: bool) {
+    let limits = &device.limits;
+    let cells = quip_solver_cuda::probe::probe(limits, reads);
+    let name = device
+        .name()
+        .unwrap_or_else(|_| format!("cuda-{}", device.device_index));
+    let connectivity = |conn| match conn {
+        Connectivity::Degree(d) => format!("degree {d}"),
+        Connectivity::Complete => "complete".to_owned(),
+    };
+    if json {
+        let cells: Vec<_> = cells.iter().map(|cell| serde_json::json!({
+            "connectivity": connectivity(cell.connectivity),
+            "precision": format!("{:?}", cell.precision),
+            "storage": match cell.storage { MsaStorage::Sparse => "Sparse", MsaStorage::Dense => "Dense" },
+            "tier": cell.tier(), "spill": cell.spill,
+            "nodes": cell.nodes, "couplers": cell.couplers,
+            "per_instance_bytes": cell.per_instance_bytes,
+            "expected_slowdown": cell.expected_slowdown,
+        })).collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "device_name": name, "sm_count": limits.sm_count,
+                "free_bytes": limits.free_bytes, "usable_bytes": limits.usable_bytes(),
+                "instances": instances(KernelKind::Msa, limits.sm_count),
+                "per_instance_budget": msa_per_instance_budget(limits),
+                "reads": reads, "betas": MSA_DEFAULT_BETAS, "cells": cells,
+            })
+        );
+        return;
+    }
+    println!("{name}: SMs={} free_bytes={} usable_bytes={} instances={} per_instance_budget={} reads={reads} betas={MSA_DEFAULT_BETAS}",
+        limits.sm_count, limits.free_bytes, limits.usable_bytes(),
+        instances(KernelKind::Msa, limits.sm_count), msa_per_instance_budget(limits));
+    println!(
+        "{:<12} | {:<48} | {:<48} | {:<48}",
+        "Connectivity", "Binary", "Int8", "Float32"
+    );
+    for row in cells.chunks(3) {
+        print!("{:<12}", connectivity(row[0].connectivity));
+        for cell in row {
+            print!(
+                " | {:<48}",
+                format!(
+                    "{} vars, {} couplers, {}, slowdown unknown",
+                    cell.nodes,
+                    cell.couplers,
+                    cell.tier()
+                )
+            );
+        }
+        println!();
+    }
+    println!("Bytes per instance:");
+    println!(
+        "{:<12} | {:<16} | {:<16} | {:<16}",
+        "Connectivity", "Binary", "Int8", "Float32"
+    );
+    for row in cells.chunks(3) {
+        println!(
+            "{:<12} | {:<16} | {:<16} | {:<16}",
+            connectivity(row[0].connectivity),
+            row[0].per_instance_bytes,
+            row[1].per_instance_bytes,
+            row[2].per_instance_bytes
+        );
+    }
+    println!("Int32 has the Float32 capacity. Slowdown is unavailable until calibration.");
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::{BenchAction, Cli, Command};
     use clap::Parser;
+
+    #[test]
+    fn parses_probe_capacity_flags() {
+        assert!(Cli::try_parse_from([
+            "quip-cuda-msa",
+            "--probe-capacity",
+            "--device",
+            "0",
+            "--json"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["quip-cuda-msa", "--json"]).is_err());
+    }
 
     #[test]
     fn parses_max_nodes() {

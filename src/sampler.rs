@@ -135,9 +135,8 @@ impl From<SampleError> for quip_solver_core::SampleError {
 ///   kernel's fixed-size state supports. Permanent — retrying cannot help.
 /// - [`SampleError::ModelExceedsDeviceMemory`] if an msa session exceeds the
 ///   usable device memory read at open. Refused before device allocation.
-/// - [`SampleError::Unsupported`] if no path holds the coefficients exactly,
-///   or the msa topology has a spin with more than
-///   [`crate::capacity::MSA_MAX_DEGREE`] (62) neighbours. Permanent.
+/// - [`SampleError::Unsupported`] if no path holds the coefficients exactly.
+///   MSA routes degrees above [`crate::capacity::MSA_MAX_DEGREE`] to dense storage.
 /// - [`SampleError::KernelTimeout`] if the persistent kernel never marks the
 ///   slot complete before the driver's deadline.
 /// - [`SampleError::Cuda`] if opening the device or compiling its kernels failed.

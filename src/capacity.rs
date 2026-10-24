@@ -160,6 +160,19 @@ pub fn msa_footprint(
     betas: usize,
     limits: &DeviceLimits,
 ) -> Footprint {
+    msa_footprint_with_shared_cap(shape, precision, storage, reads, betas, limits, None)
+}
+
+/// Footprint with the benchmark's optional shared-spin cap.
+pub(crate) fn msa_footprint_with_shared_cap(
+    shape: ModelShape,
+    precision: Precision,
+    storage: MsaStorage,
+    reads: usize,
+    betas: usize,
+    limits: &DeviceLimits,
+    shared_cap: Option<usize>,
+) -> Footprint {
     let count = instances(KernelKind::Msa, limits.sm_count);
     if storage == MsaStorage::Dense {
         let coefficient_bytes = match precision {
@@ -223,14 +236,12 @@ pub fn msa_footprint(
         Precision::Binary | Precision::Float32 => {}
     }
     let reads = reads.max(1);
-    let words = reads
-        .div_ceil(MSA_LANES)
-        .checked_next_power_of_two()
-        .unwrap_or(usize::MAX);
-    let shared_spins = n.min(msa_shared_spins(
+    let (words, shared_spins) = msa_spin_layout(
+        n,
+        reads,
         msa_dynamic_shared_bytes(limits.shared_bytes_per_block_optin),
-        words,
-    ));
+        shared_cap,
+    );
     let spill = msa_spill_words(n, shared_spins, words, 1)
         .max(1)
         .saturating_mul(8);
@@ -364,6 +375,22 @@ pub const MSA_DEFAULT_BETAS: usize = 64;
 /// Reads packed into one 64-bit word by the msa kernel (`kernels/msa.cu`).
 pub const MSA_LANES: usize = 64;
 
+/// Default reads from the shared-memory probe at the mining baseline size.
+#[must_use]
+pub fn msa_device_reads(limits: &DeviceLimits) -> usize {
+    let (_, shared) = msa_spin_layout(
+        MSA_DEFAULT_NODES,
+        MSA_MAX_READS,
+        msa_dynamic_shared_bytes(limits.shared_bytes_per_block_optin),
+        None,
+    );
+    if shared == MSA_DEFAULT_NODES {
+        MSA_MAX_READS
+    } else {
+        MSA_LANES
+    }
+}
+
 /// Replica words per spin an msa session allocates at 128 reads. Shared memory
 /// no longer bounds this: spins that do not fit spill to global memory.
 pub const MSA_REPLICA_WORDS: usize = 2;
@@ -379,7 +406,7 @@ pub const MSA_THREADS_PER_NONCE: u32 = 256;
 /// Neighbours per spin the msa kernel counts (`MSA_MAX_DEG` in
 /// `kernels/msa.cu`), 20 per pass. With the field bond the count reaches 63,
 /// the most the kernel's six bit planes hold, and the same ceiling as
-/// `quip-cpu-msa`. A denser topology is refused per job.
+/// `quip-cpu-msa`. Denser topologies use dense storage.
 pub const MSA_MAX_DEGREE: usize = 62;
 
 /// Static `__shared__` members of the msa kernel: `s_active_slot` and
@@ -433,6 +460,111 @@ pub fn msa_spill_words(nodes: usize, shared_spins: usize, words: usize, nonces: 
         .saturating_mul(nonces)
 }
 
+/// Replica words and shared spins used by both allocation and capacity checks.
+pub(crate) fn msa_spin_layout(
+    nodes: usize,
+    reads: usize,
+    dynamic_shared_bytes: usize,
+    cap: Option<usize>,
+) -> (usize, usize) {
+    let words = reads
+        .max(1)
+        .div_ceil(MSA_LANES)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX);
+    let shared = nodes
+        .min(msa_shared_spins(dynamic_shared_bytes, words))
+        .min(cap.unwrap_or(usize::MAX));
+    (words, shared)
+}
+
+/// Connectivity used to derive a maximum MSA model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connectivity {
+    /// Fixed maximum degree, with `nodes * degree / 2` couplers.
+    Degree(usize),
+    /// Every distinct pair of nodes is coupled.
+    Complete,
+}
+
+impl Connectivity {
+    /// Storage used for this connectivity's capacity calculation.
+    #[must_use]
+    pub fn storage(self) -> MsaStorage {
+        match self {
+            Self::Degree(d) if d <= MSA_MAX_DEGREE => MsaStorage::Sparse,
+            Self::Degree(_) | Self::Complete => MsaStorage::Dense,
+        }
+    }
+
+    /// Shape at a given node count, saturating for oversized requests.
+    #[must_use]
+    pub fn shape(self, nodes: usize) -> ModelShape {
+        let degree = match self {
+            Self::Degree(d) => d,
+            Self::Complete => nodes.saturating_sub(1),
+        };
+        ModelShape {
+            nodes,
+            couplers: nodes.saturating_mul(degree) / 2,
+            max_degree: degree,
+        }
+    }
+}
+
+/// Largest model that fits the default beta schedule and kernel index widths.
+#[must_use]
+pub fn msa_max_model(
+    conn: Connectivity,
+    precision: Precision,
+    reads: usize,
+    limits: &DeviceLimits,
+) -> ModelShape {
+    let storage = conn.storage();
+    let mut high = if storage == MsaStorage::Dense {
+        // Dense row-major matrix indices are signed 32-bit integers.
+        46_340
+    } else {
+        let words = reads
+            .max(1)
+            .div_ceil(MSA_LANES)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX);
+        let ceiling = ((i32::MAX as usize - MSA_THREADS_PER_NONCE as usize) / words)
+            .min(i32::MAX as usize - 8191);
+        match conn {
+            Connectivity::Degree(0) => ceiling,
+            Connectivity::Degree(d) => ceiling.min((i32::MAX as usize - 20) / d),
+            Connectivity::Complete => unreachable!(),
+        }
+    };
+    let mut low = 0;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if msa_footprint(
+            conn.shape(mid),
+            precision,
+            storage,
+            reads,
+            MSA_DEFAULT_BETAS,
+            limits,
+        )
+        .total()
+            <= limits.usable_bytes()
+        {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    if let Connectivity::Degree(d) = conn {
+        if low <= d {
+            low = 0;
+        }
+    }
+    conn.shape(low)
+}
+
 /// Largest uncoupled Binary model that fits the device at `reads`.
 /// The default mining beta count bounds the schedule allocation. Longer
 /// schedules still pass through the per-model footprint check.
@@ -454,7 +586,7 @@ pub fn msa_max_nodes(limits: &DeviceLimits, reads: usize) -> usize {
     })
 }
 
-/// Largest sparse Binary coupler count that fits at degree [`MSA_MAX_DEGREE`].
+/// Largest Binary coupler count across sparse degree 62 and complete dense models.
 /// Nodes use the smallest degree-bounded shape. Node and coupler maxima are
 /// independent bounds, so a model near both can still exceed device memory.
 #[must_use]
@@ -463,7 +595,7 @@ pub fn msa_max_couplers(limits: &DeviceLimits, reads: usize) -> usize {
     // MSA_CHUNK (20) increment at the end of a row.
     let ceiling = (i32::MAX as usize - 20) / 2;
     let max_nodes = msa_max_nodes(limits, reads);
-    msa_max_fitting(
+    let sparse = msa_max_fitting(
         limits,
         reads,
         ceiling.min(max_nodes.saturating_mul(MSA_MAX_DEGREE) / 2),
@@ -474,7 +606,8 @@ pub fn msa_max_couplers(limits: &DeviceLimits, reads: usize) -> usize {
             couplers,
             max_degree: MSA_MAX_DEGREE,
         },
-    )
+    );
+    sparse.max(msa_max_model(Connectivity::Complete, Precision::Binary, reads, limits).couplers)
 }
 
 fn msa_max_fitting(
@@ -574,9 +707,9 @@ pub fn advertised_nodes(
     let want = requested.max(default_nodes(kernel));
     match kernel {
         KernelKind::Sa => want.min(LOCAL_MEM_BYTES_PER_THREAD * 8 / 9),
-        KernelKind::Msa => {
-            limits.map_or(0, |limits| want.min(msa_max_nodes(limits, MSA_MAX_READS)))
-        }
+        KernelKind::Msa => limits.map_or(0, |limits| {
+            want.min(msa_max_nodes(limits, msa_device_reads(limits)))
+        }),
         KernelKind::Gibbs => want,
     }
 }
@@ -600,7 +733,7 @@ pub fn resolve(
     let (budget, resource) = match kernel {
         KernelKind::Sa => (sa_budget(limits), BudgetResource::DeviceMemory),
         KernelKind::Msa => (
-            msa_max_nodes(limits, MSA_MAX_READS),
+            msa_max_nodes(limits, msa_device_reads(limits)),
             BudgetResource::DeviceMemory,
         ),
         KernelKind::Gibbs => (
@@ -1249,10 +1382,15 @@ mod tests {
     }
 
     #[test]
+    fn advertised_couplers_include_dense_complete_models() {
+        assert!(msa_max_couplers(&a4000_limits(), 128) > 32_139_292);
+    }
+
+    #[test]
     fn a4000_advertised_limits_match_the_documented_example() {
         let limits = a4000_limits();
         assert_eq!(msa_max_nodes(&limits, 128), 3_987_504);
-        assert_eq!(msa_max_couplers(&limits, 128), 32_139_292);
+        assert_eq!(msa_max_couplers(&limits, 128), 44_599_290);
     }
 
     #[test]
@@ -1311,71 +1449,111 @@ mod tests {
     #[test]
     fn advertised_msa_axes_fit_the_default_schedule_footprint() {
         for limits in [a4000_limits(), a4000(64 << 20)] {
-            let nodes = msa_max_nodes(&limits, 128);
-            let couplers = msa_max_couplers(&limits, 128);
-            for (value, shape) in [
-                (
-                    nodes,
-                    ModelShape {
-                        nodes,
-                        couplers: 0,
-                        max_degree: 0,
-                    },
-                ),
-                (
-                    couplers,
-                    ModelShape {
-                        nodes: (couplers * 2)
-                            .div_ceil(MSA_MAX_DEGREE)
-                            .max(MSA_MAX_DEGREE + 1),
-                        couplers,
-                        max_degree: MSA_MAX_DEGREE,
-                    },
-                ),
+            for conn in [
+                Connectivity::Degree(0),
+                Connectivity::Degree(62),
+                Connectivity::Complete,
             ] {
+                let shape = msa_max_model(conn, Precision::Binary, 128, &limits);
                 let footprint = |shape| {
                     msa_footprint(
                         shape,
                         Precision::Binary,
-                        MsaStorage::Sparse,
+                        conn.storage(),
                         128,
                         MSA_DEFAULT_BETAS,
                         &limits,
                     )
                     .total()
                 };
+                assert!(shape.nodes > 0);
                 assert!(footprint(shape) <= limits.usable_bytes());
-                let next = if shape.couplers == 0 {
-                    ModelShape {
-                        nodes: value + 1,
-                        ..shape
-                    }
-                } else {
-                    ModelShape {
-                        nodes: ((value + 1) * 2)
-                            .div_ceil(MSA_MAX_DEGREE)
-                            .max(MSA_MAX_DEGREE + 1),
-                        couplers: value + 1,
-                        ..shape
-                    }
-                };
-                assert!(footprint(next) > limits.usable_bytes());
+                assert!(footprint(conn.shape(shape.nodes + 1)) > limits.usable_bytes());
+                assert!(msa_max_couplers(&limits, 128) >= shape.couplers);
             }
+            let nodes = msa_max_nodes(&limits, 128);
             assert_eq!(resolve(KernelKind::Msa, nodes, &limits), Ok(nodes));
-            assert_eq!(
-                resolve(KernelKind::Msa, nodes + 1, &limits),
-                Err(CapacityError::AboveDeviceBudget {
-                    requested: nodes + 1,
-                    budget: nodes,
-                    resource: BudgetResource::DeviceMemory
-                })
-            );
+            assert!(resolve(KernelKind::Msa, nodes + 1, &limits).is_err());
+        }
+    }
+
+    #[test]
+    fn msa_device_reads_keeps_turing_at_64() {
+        assert_eq!(msa_device_reads(&a4000_limits()), 128);
+        let limits = DeviceLimits {
+            shared_bytes_per_block_optin: 65_536,
+            ..a4000_limits()
+        };
+        assert_eq!(msa_device_reads(&limits), 64);
+    }
+
+    #[test]
+    fn max_model_checks_every_precision_and_kernel_index_ceiling() {
+        for limits in [a4000_limits(), a4000(64 << 20), a4000(usize::MAX)] {
+            for conn in [
+                Connectivity::Degree(0),
+                Connectivity::Degree(20),
+                Connectivity::Degree(60),
+                Connectivity::Degree(63),
+                Connectivity::Complete,
+            ] {
+                for precision in [
+                    Precision::Binary,
+                    Precision::Int8,
+                    Precision::Int32,
+                    Precision::Float32,
+                ] {
+                    let shape = msa_max_model(conn, precision, 128, &limits);
+                    if shape.nodes == 0 {
+                        continue;
+                    }
+                    assert!(
+                        msa_footprint(
+                            shape,
+                            precision,
+                            conn.storage(),
+                            128,
+                            MSA_DEFAULT_BETAS,
+                            &limits
+                        )
+                        .total()
+                            <= limits.usable_bytes()
+                    );
+                    if conn.storage() == MsaStorage::Dense {
+                        assert!(i32::try_from(shape.nodes * shape.nodes).is_ok());
+                    } else {
+                        assert!(i32::try_from(shape.couplers * 2 + 20).is_ok());
+                    }
+                    let next = conn.shape(shape.nodes + 1);
+                    assert!(
+                        msa_footprint(
+                            next,
+                            precision,
+                            conn.storage(),
+                            128,
+                            MSA_DEFAULT_BETAS,
+                            &limits
+                        )
+                        .total()
+                            > limits.usable_bytes()
+                            || (conn.storage() == MsaStorage::Dense
+                                && i32::try_from(next.nodes * next.nodes).is_err())
+                            || (conn.storage() == MsaStorage::Sparse
+                                && (i32::try_from(next.couplers * 2 + 20).is_err()
+                                    || i32::try_from(
+                                        next.nodes * 2 + MSA_THREADS_PER_NONCE as usize
+                                    )
+                                    .is_err()
+                                    || i32::try_from(next.nodes + 8191).is_err()))
+                    );
+                }
+            }
         }
     }
 
     #[test]
     fn msa_limits_are_zero_without_session_memory() {
-        for free_bytes in [0, 32 << 20] {
+        for free_bytes in [0, 1024] {
             let limits = a4000(free_bytes);
             assert_eq!(msa_max_nodes(&limits, 128), 0);
             assert_eq!(msa_max_couplers(&limits, 128), 0);
