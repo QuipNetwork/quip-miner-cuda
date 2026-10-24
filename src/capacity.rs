@@ -137,10 +137,6 @@ impl Footprint {
     }
 }
 
-/// Beta entries reserved by [`msa_footprint`] for schedule-dependent tables.
-/// Longer schedules need their excess bytes added before checking capacity.
-pub const MSA_FOOTPRINT_BETAS: usize = 65_536;
-
 /// Upper estimate of sparse MSA session device allocations at full width.
 ///
 /// CSR and colour tables, beta schedules and integer acceptance tables are
@@ -150,16 +146,17 @@ pub const MSA_FOOTPRINT_BETAS: usize = 65_536;
 /// bound. A 32 MiB allowance covers CUDA pool growth and allocation overhead
 /// measured by the A4000 allocation test.
 ///
-/// The interface has no schedule length: this reserves [`MSA_FOOTPRINT_BETAS`]
-/// beta entries. It assumes the default shared-spin layout, without a bench
-/// shared-spin cap. Dense storage returns a saturated per-instance size until
-/// its allocation layout is implemented.
+/// Schedule tables use `betas.max(1)` entries, matching the session builders.
+/// This assumes the default shared-spin layout, without a bench shared-spin
+/// cap. Dense storage returns a saturated per-instance size until its
+/// allocation layout is implemented.
 #[must_use]
 pub fn msa_footprint(
     shape: ModelShape,
     precision: Precision,
     storage: MsaStorage,
     reads: usize,
+    betas: usize,
     limits: &DeviceLimits,
 ) -> Footprint {
     let count = instances(KernelKind::Msa, limits.sm_count);
@@ -170,6 +167,7 @@ pub fn msa_footprint(
             instances: count,
         };
     }
+    let betas = betas.max(1);
     let n = shape.nodes;
     let nnz = shape.couplers.saturating_mul(2).max(1);
     let colours = n.min(shape.max_degree.saturating_add(1)).max(1);
@@ -179,7 +177,7 @@ pub fn msa_footprint(
         .saturating_add(colours.saturating_mul(2)) // starts and counts
         .saturating_add(n.max(1)) // colour nodes
         .saturating_mul(4)
-        .saturating_add(MSA_FOOTPRINT_BETAS * 4) // d_beta
+        .saturating_add(betas.saturating_mul(4)) // d_beta
         .saturating_add(32 << 20); // CUDA pool growth and allocation overhead
     let coefficient_bytes = match precision {
         Precision::Binary | Precision::Int8 => 1,
@@ -188,7 +186,7 @@ pub fn msa_footprint(
     match precision {
         Precision::Int8 | Precision::Int32 => {
             shared = shared
-                .saturating_add(MSA_FOOTPRINT_BETAS * (8 + 4)) // beta_fixed and delta_cut
+                .saturating_add(betas.saturating_mul(8 + 4)) // beta_fixed and delta_cut
                 .saturating_add(crate::accept_table::NEGLOG_LEN * 8);
         }
         Precision::Binary | Precision::Float32 => {}
@@ -566,11 +564,33 @@ mod tests {
             couplers: c,
             max_degree: 40,
         };
-        let u = msa_footprint(s(2_000_000), Precision::Binary, MsaStorage::Sparse, 128, &l);
-        let w = msa_footprint(s(2_000_000), Precision::Int32, MsaStorage::Sparse, 128, &l);
+        let u = msa_footprint(
+            s(2_000_000),
+            Precision::Binary,
+            MsaStorage::Sparse,
+            128,
+            1,
+            &l,
+        );
+        let w = msa_footprint(
+            s(2_000_000),
+            Precision::Int32,
+            MsaStorage::Sparse,
+            128,
+            1,
+            &l,
+        );
         assert!(w.total() > u.total());
         assert!(
-            msa_footprint(s(4_000_000), Precision::Binary, MsaStorage::Sparse, 128, &l).total()
+            msa_footprint(
+                s(4_000_000),
+                Precision::Binary,
+                MsaStorage::Sparse,
+                128,
+                1,
+                &l
+            )
+            .total()
                 > u.total()
         );
         assert_eq!(u.instances, 48);
@@ -606,8 +626,8 @@ mod tests {
             couplers: 2_000_000,
             max_degree: 40,
         };
-        let narrow = msa_footprint(shape, Precision::Int8, MsaStorage::Sparse, 128, &l);
-        let wide = msa_footprint(shape, Precision::Int32, MsaStorage::Sparse, 128, &l);
+        let narrow = msa_footprint(shape, Precision::Int8, MsaStorage::Sparse, 128, 1, &l);
+        let wide = msa_footprint(shape, Precision::Int32, MsaStorage::Sparse, 128, 1, &l);
         // Three slots, two directed halves per edge, three extra bytes per coefficient.
         assert_eq!(
             wide.per_instance_bytes - narrow.per_instance_bytes,
@@ -623,8 +643,8 @@ mod tests {
             couplers: 2_000_000,
             max_degree: 40,
         };
-        let one = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 64, &l);
-        let two = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 128, &l);
+        let one = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 64, 1, &l);
+        let two = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 128, 1, &l);
         // 64 more reads in three sample/energy slots, plus the larger spill.
         assert_eq!(two.per_instance_bytes - one.per_instance_bytes, 3_200_768);
         let mut no_shared = l;
@@ -634,6 +654,7 @@ mod tests {
             Precision::Binary,
             MsaStorage::Sparse,
             128,
+            1,
             &no_shared,
         );
         assert_eq!(spilled.per_instance_bytes - two.per_instance_bytes, 92_656);
@@ -650,6 +671,7 @@ mod tests {
             Precision::Float32,
             MsaStorage::Dense,
             128,
+            1,
             &a4000_limits(),
         );
         assert_eq!(footprint.per_instance_bytes, usize::MAX);
@@ -667,6 +689,7 @@ mod tests {
             Precision::Int32,
             MsaStorage::Sparse,
             usize::MAX,
+            1,
             &a4000_limits(),
         );
         assert_eq!(footprint.total(), usize::MAX);
@@ -679,6 +702,50 @@ mod tests {
             .total(),
             usize::MAX
         );
+    }
+
+    #[test]
+    fn footprint_counts_every_beta() {
+        let limits = a4000_limits();
+        let shape = ModelShape {
+            nodes: 1000,
+            couplers: 1000,
+            max_degree: 2,
+        };
+        // build allocates an f32 beta; the integer lane adds i64 beta_fixed
+        // and i32 delta_cut. All three tables are shared across instances.
+        for (precision, bytes_per_beta) in [(Precision::Binary, 4), (Precision::Int32, 16)] {
+            for betas in [1, 65_536] {
+                let extra = 17;
+                let base = msa_footprint(shape, precision, MsaStorage::Sparse, 128, betas, &limits);
+                let longer = msa_footprint(
+                    shape,
+                    precision,
+                    MsaStorage::Sparse,
+                    128,
+                    betas + extra,
+                    &limits,
+                );
+                assert_eq!(longer.total() - base.total(), extra * bytes_per_beta);
+                assert_eq!(longer.per_instance_bytes, base.per_instance_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn footprint_beta_counts_use_standins_and_saturate() {
+        let limits = a4000_limits();
+        let shape = ModelShape {
+            nodes: 1000,
+            couplers: 1000,
+            max_degree: 2,
+        };
+        for precision in [Precision::Binary, Precision::Int32] {
+            let footprint =
+                |betas| msa_footprint(shape, precision, MsaStorage::Sparse, 128, betas, &limits);
+            assert_eq!(footprint(0), footprint(1));
+            assert_eq!(footprint(usize::MAX).total(), usize::MAX);
+        }
     }
 
     #[test]

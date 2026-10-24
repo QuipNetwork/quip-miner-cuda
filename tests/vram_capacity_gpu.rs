@@ -60,6 +60,12 @@ fn footprint_matches_measured_allocation() {
                     CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
                 ),
             };
+            let params = SampleParams {
+                num_reads: 128,
+                num_sweeps: 1,
+                ..SampleParams::default()
+            };
+            let betas = (params.num_sweeps / params.sweeps_per_beta.max(1)).max(1);
             let footprint = msa_footprint(
                 ModelShape {
                     nodes,
@@ -68,7 +74,8 @@ fn footprint_matches_measured_allocation() {
                 },
                 precision,
                 MsaStorage::Sparse,
-                128,
+                params.num_reads,
+                betas,
                 &limits,
             );
             assert_eq!(footprint.instances, stream_width(&device, KernelKind::Msa));
@@ -78,11 +85,7 @@ fn footprint_matches_measured_allocation() {
                 .blocking_send(StreamJob {
                     job_id: vec![0],
                     graph,
-                    params: SampleParams {
-                        num_reads: 128,
-                        num_sweeps: 1,
-                        ..SampleParams::default()
-                    },
+                    params,
                     watermark: None,
                 })
                 .unwrap();
@@ -114,7 +117,7 @@ fn footprint_matches_measured_allocation() {
             });
             // Drain queued frees before the next free-memory measurement.
             ctx.synchronize().unwrap();
-            eprintln!("degree={degree} precision={precision:?} instances={} measured={measured} footprint={}", footprint.instances, footprint.total());
+            eprintln!("degree={degree} precision={precision:?} betas={betas} instances={} measured={measured} footprint={}", footprint.instances, footprint.total());
             assert!(measured > 0);
             assert!(measured <= footprint.total(), "underestimate at degree {degree}, {precision:?}: measured={measured}, footprint={}", footprint.total());
             assert!(
