@@ -102,7 +102,7 @@ impl Precision {
 pub enum MsaStorage {
     /// Two directed CSR entries per undirected coupling.
     Sparse,
-    /// Dense matrix storage, not yet implemented.
+    /// Row-major dense matrix storage.
     Dense,
 }
 
@@ -138,7 +138,7 @@ impl Footprint {
     }
 }
 
-/// Upper estimate of sparse MSA session device allocations at full width.
+/// Device allocation estimate for MSA sessions at full width.
 ///
 /// CSR and colour tables, beta schedules and integer acceptance tables are
 /// session-wide. Each instance owns three coefficient/sample/energy slots,
@@ -149,8 +149,9 @@ impl Footprint {
 ///
 /// Schedule tables use `betas.max(1)` entries, matching the session builders.
 /// This assumes the default shared-spin layout, without a bench shared-spin
-/// cap. Dense storage returns a saturated per-instance size until its
-/// allocation layout is implemented.
+/// cap. Dense Binary storage counts exact buffer bytes, with three i8 matrix
+/// slots and both packed spin layouts. Other dense precisions
+/// remain refused until their builders exist.
 #[must_use]
 pub fn msa_footprint(
     shape: ModelShape,
@@ -162,9 +163,35 @@ pub fn msa_footprint(
 ) -> Footprint {
     let count = instances(KernelKind::Msa, limits.sm_count);
     if storage == MsaStorage::Dense {
+        if precision != Precision::Binary {
+            return Footprint {
+                shared_bytes: 0,
+                per_instance_bytes: usize::MAX,
+                instances: count,
+            };
+        }
+        let n = shape.nodes;
+        let reads = reads.max(1);
+        let words = reads.div_ceil(MSA_LANES);
+        let per_instance = n
+            .saturating_mul(n)
+            .max(1)
+            .saturating_add(n.max(1))
+            .saturating_mul(3)
+            .saturating_add(reads.saturating_mul(n.div_ceil(8).max(1)).saturating_mul(3))
+            .saturating_add(reads.saturating_mul(12))
+            .saturating_add(32)
+            .saturating_add(n.saturating_mul(words).max(1).saturating_mul(8))
+            .saturating_add(
+                n.div_ceil(32)
+                    .saturating_mul(words)
+                    .saturating_mul(64)
+                    .max(1)
+                    .saturating_mul(4),
+            );
         return Footprint {
-            shared_bytes: 0,
-            per_instance_bytes: usize::MAX,
+            shared_bytes: betas.max(1).saturating_mul(4).saturating_add(8),
+            per_instance_bytes: per_instance,
             instances: count,
         };
     }
@@ -761,7 +788,68 @@ mod tests {
     }
 
     #[test]
-    fn dense_footprint_refuses_until_dense_storage_is_implemented() {
+    fn dense_binary_footprint_counts_session_allocations() {
+        let footprint = msa_footprint(
+            ModelShape {
+                nodes: 2_000,
+                couplers: 1_999_000,
+                max_degree: 1_999,
+            },
+            Precision::Binary,
+            MsaStorage::Dense,
+            128,
+            64,
+            &a4000_limits(),
+        );
+        // Two unused CSR stand-ins and 64 f32 beta values.
+        assert_eq!(footprint.shared_bytes, 264);
+        // Three i8 matrices and fields, three output slots, control,
+        // two spin words per node, and 128 transposed u32 words per 32 nodes.
+        assert_eq!(footprint.per_instance_bytes, 12_167_824);
+        assert_eq!(footprint.instances, 48);
+    }
+
+    #[test]
+    fn dense_binary_capacity_boundary_and_overflow() {
+        let limits = a4000_limits();
+        let size = |n| {
+            msa_footprint(
+                ModelShape {
+                    nodes: n,
+                    couplers: 0,
+                    max_degree: 0,
+                },
+                Precision::Binary,
+                MsaStorage::Dense,
+                128,
+                64,
+                &limits,
+            )
+            .total()
+        };
+        let mut low = 0usize;
+        let mut high = 100_000;
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if size(mid) <= limits.usable_bytes() {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        eprintln!(
+            "dense Binary A4000 maximum N={low} bytes={} next_bytes={}",
+            size(low),
+            size(low + 1)
+        );
+        assert!(low >= 8_000);
+        assert!(size(low) <= limits.usable_bytes());
+        assert!(size(low + 1) > limits.usable_bytes());
+        assert_eq!(size(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn dense_weighted_footprint_refuses_until_weighted_storage_is_implemented() {
         let footprint = msa_footprint(
             ModelShape {
                 nodes: 10,

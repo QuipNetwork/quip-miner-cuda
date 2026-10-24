@@ -353,6 +353,8 @@ pub struct CudaDevice {
     /// `cuda_msa_self_feeding` — persistent kernel, 1 block (1 SM) per
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
+    pub(crate) msa_dense: CudaFunction,
+    pub(crate) force_dense_msa: bool,
     /// Weighted storage/lane variants, available only on MSA opens.
     pub(crate) msa_weighted: Option<MsaWeightedKernels>,
     /// Dynamic shared memory one msa block may request: the device's opt-in
@@ -394,6 +396,14 @@ impl fmt::Debug for CudaDevice {
 }
 
 impl CudaDevice {
+    /// Force Binary dense MSA sessions for integration tests until routing exists.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_dense_msa_for_test(mut self) -> Self {
+        self.force_dense_msa = true;
+        self
+    }
+
     /// Create a context on `device_index` and NVRTC-compile the kernels.
     ///
     /// Precreates 64 session stream pairs. Additional concurrent sessions wait
@@ -430,6 +440,7 @@ impl CudaDevice {
     ///
     /// Everything [`CudaDevice::open`] returns, plus [`CudaError::Capacity`]
     /// when `max_nodes` exceeds the kernel's bound on this device.
+    #[allow(clippy::too_many_lines)] // Device discovery and kernel configuration share one context.
     pub fn open_with_nodes(
         device_index: usize,
         kernel: KernelKind,
@@ -538,6 +549,8 @@ impl CudaDevice {
         let sa = sa_mod.load_function("cuda_sa_self_feeding")?;
         let sa_wide = sa_wide_mod.load_function("cuda_sa_self_feeding")?;
         let msa = msa_mod.load_function("cuda_msa_self_feeding")?;
+        let msa_dense = msa_mod.load_function("cuda_msa_dense_self_feeding")?;
+        configure_msa_shared_memory(&msa_dense, shared_per_block_optin)?;
         let gibbs = gibbs_mod.load_function("cuda_gibbs_self_feeding")?;
         let msa_dynamic_shared_bytes = configure_msa_shared_memory(&msa, shared_per_block_optin)?;
         if let Some(weighted) = &msa_weighted {
@@ -566,6 +579,8 @@ impl CudaDevice {
             sa_wide,
             gibbs,
             msa,
+            msa_dense,
+            force_dense_msa: false,
             msa_weighted,
             msa_dynamic_shared_bytes,
             msa_shared_spins_cap: None,

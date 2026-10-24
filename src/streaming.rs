@@ -506,6 +506,12 @@ struct SessionArithmetic {
 /// known-Some-by-invariant.
 enum AlgoState {
     Msa(MsaState),
+    MsaDense {
+        words: i32,
+        d_spins: CudaSlice<u64>,
+        d_replica_spins: CudaSlice<u32>,
+        shared_bytes: u32,
+    },
     MsaWeighted {
         lane: MsaLane,
         msa: MsaState,
@@ -536,9 +542,88 @@ impl AlgoState {
     fn shared_mem_bytes(&self) -> u32 {
         match self {
             Self::Msa(msa) | Self::MsaWeighted { msa, .. } => msa.shared_bytes,
+            Self::MsaDense { shared_bytes, .. } => *shared_bytes,
             Self::Sa { .. } | Self::SaWide { .. } | Self::Gibbs { .. } => 0,
         }
     }
+}
+
+/// Dense matrices use direct row-major positions and no CSR or colouring.
+fn session_topology(
+    device: &CudaDevice,
+    kernel: KernelKind,
+    graph: &IsingGraph,
+) -> Result<SelfFeedingTopology, SampleError> {
+    if kernel != KernelKind::Msa || !device.force_dense_msa {
+        return Ok(SelfFeedingTopology::build(graph));
+    }
+    if !coefficients::is_unit_mining(graph) {
+        return Err(SampleError::Unsupported(
+            "dense MSA currently requires Binary coefficients".into(),
+        ));
+    }
+    let n = graph.num_nodes();
+    if n > device.max_nodes {
+        return Err(SampleError::GraphTooLarge {
+            n,
+            limit: device.max_nodes,
+        });
+    }
+    let nnz = n
+        .checked_mul(n)
+        .ok_or_else(|| SampleError::Unsupported("dense matrix size overflow".into()))?;
+    to_kernel_i32("dense matrix elements", nnz)?;
+    let mut seen = vec![0u8; nnz.div_ceil(8)];
+    let mut edge_pos = Vec::with_capacity(graph.edges.len());
+    for &(u, v) in graph.edges.iter() {
+        if u >= n || v >= n {
+            return Err(SampleError::Unsupported(
+                "dense edge endpoint is outside the graph".into(),
+            ));
+        }
+        let ij = u * n + v;
+        let ji = v * n + u;
+        if seen[ij / 8] & (1 << (ij % 8)) != 0 {
+            return Err(SampleError::Unsupported(
+                "dense Binary MSA requires unique couplers".into(),
+            ));
+        }
+        seen[ij / 8] |= 1 << (ij % 8);
+        seen[ji / 8] |= 1 << (ji % 8);
+        edge_pos.push((u32::try_from(ij).unwrap(), u32::try_from(ji).unwrap()));
+    }
+    Ok(SelfFeedingTopology {
+        n,
+        nnz,
+        row_ptr: vec![],
+        col_ind: vec![],
+        edge_pos,
+        colors: crate::topology::ColorBlocks {
+            starts: vec![],
+            counts: vec![],
+            nodes: vec![],
+            num_colors: 0,
+        },
+    })
+}
+
+fn build_msa_dense_state(
+    stream: &Arc<CudaStream>,
+    n: usize,
+    reads: usize,
+    nonces: usize,
+) -> Result<AlgoState, SampleError> {
+    let words = reads.div_ceil(capacity::MSA_LANES);
+    Ok(AlgoState::MsaDense {
+        words: to_kernel_i32("dense replica words", words)?,
+        d_spins: stream.alloc_zeros::<u64>((nonces * n * words).max(1))?,
+        d_replica_spins: stream
+            .alloc_zeros::<u32>((nonces * n.div_ceil(32) * words * capacity::MSA_LANES).max(1))?,
+        // N^2 fits the i32 ABI, so these two bit rows fit every supported card.
+        shared_bytes: u32::try_from((n.div_ceil(32) * 2 + 4) * 4).map_err(|_| {
+            SampleError::Unsupported("dense shared memory exceeds the launch ABI".into())
+        })?,
+    })
 }
 
 /// Device buffers for the multi-spin kernel: the colour classes plus the
@@ -764,7 +849,11 @@ fn check_session_capacity(
     let footprint = capacity::msa_footprint(
         shape,
         precision,
-        capacity::MsaStorage::Sparse,
+        if device.force_dense_msa {
+            capacity::MsaStorage::Dense
+        } else {
+            capacity::MsaStorage::Sparse
+        },
         reads,
         betas,
         &device.limits,
@@ -829,7 +918,7 @@ impl<'a> SelfFeedingSession<'a> {
         } else {
             topology.row_ptr.clone()
         };
-        let col_ind = if topology.nnz == 0 {
+        let col_ind = if topology.col_ind.is_empty() {
             vec![0i32]
         } else {
             topology.col_ind.clone()
@@ -846,7 +935,9 @@ impl<'a> SelfFeedingSession<'a> {
         let d_ctrl = stream_compute.alloc_zeros::<i32>(num_nonces * CTRL_STRIDE)?;
         let d_beta = stream_compute.alloc_zeros::<f32>(max_num_betas.max(1))?;
 
-        let algo_state = if kernel == KernelKind::Sa && plan.path == CoefficientPath::Wide {
+        let algo_state = if kernel == KernelKind::Msa && device.force_dense_msa {
+            build_msa_dense_state(&stream_compute, n, reads_per_nonce, num_nonces)?
+        } else if kernel == KernelKind::Sa && plan.path == CoefficientPath::Wide {
             build_sa_wide_state(&stream_compute, n, num_nonces, max_num_betas)?
         } else if kernel == KernelKind::Msa && plan.path != CoefficientPath::Int8 {
             build_msa_weighted_state(
@@ -1047,7 +1138,60 @@ impl<'a> SelfFeedingSession<'a> {
         Ok(self.stream_transfer.clone_dtoh(&self.d_ctrl)?)
     }
 
-    /// Launch arm for the multi-spin kernel.
+    /// Launch arm for the dense multi-spin kernel.
+    fn launch_msa_dense(
+        &self,
+        cfg: LaunchConfig,
+        num_betas: i32,
+        sweeps_per_beta: i32,
+        seed: u32,
+    ) -> Result<(), SampleError> {
+        let AlgoState::MsaDense {
+            words,
+            d_spins,
+            d_replica_spins,
+            ..
+        } = &self.algo_state
+        else {
+            return Err(SampleError::Driver(
+                "dense launch without dense state".into(),
+            ));
+        };
+        let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
+            return Err(SampleError::Unsupported(
+                "dense MSA requires Binary coefficients".into(),
+            ));
+        };
+        let mut b = self.stream_compute.launch_builder(&self.device.msa_dense);
+        b.arg(d_j);
+        b.arg(d_h);
+        b.arg(&self.d_samples);
+        b.arg(&self.d_energies);
+        b.arg(&self.d_beta);
+        b.arg(&num_betas);
+        b.arg(&sweeps_per_beta);
+        b.arg(&self.d_ctrl);
+        b.arg(&self.dims.num_nonces);
+        b.arg(&self.dims.reads_per_nonce);
+        b.arg(&self.dims.n);
+        b.arg(&self.dims.max_packed);
+        b.arg(&seed);
+        b.arg(words);
+        b.arg(d_spins);
+        b.arg(d_replica_spins);
+        // SAFETY: the 16 arguments match cuda_msa_dense_self_feeding in order
+        // and type. The builder allocates three matrices/output slots per nonce,
+        // N * words spin words and ceil(N/32) * words * 64 transposed words
+        // per nonce. Reads are clamped to 128. Each block uses 256 threads and
+        // shared memory for two packed coefficient rows and four ballots.
+        // Drop joins the kernel before any buffer is released.
+        unsafe {
+            b.launch(cfg)?;
+        }
+        Ok(())
+    }
+
+    /// Launch arm for the sparse multi-spin kernel.
     fn launch_msa(
         &self,
         cfg: LaunchConfig,
@@ -1329,9 +1473,10 @@ impl<'a> SelfFeedingSession<'a> {
         // cudarc's read/write distinction is inert here — the kernel's own
         // volatile ctrl protocol is the actual synchronization.
         match &self.algo_state {
-            AlgoState::Msa(_) => {
-                self.launch_msa(cfg, num_betas, sweeps_per_beta, seed)?;
+            AlgoState::MsaDense { .. } => {
+                self.launch_msa_dense(cfg, num_betas, sweeps_per_beta, seed)?;
             }
+            AlgoState::Msa(_) => self.launch_msa(cfg, num_betas, sweeps_per_beta, seed)?,
             AlgoState::MsaWeighted { .. } => {
                 self.launch_msa_weighted(cfg, num_betas, sweeps_per_beta, seed)?;
             }
@@ -1760,7 +1905,7 @@ fn sample_one_planned(
     let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_planned_beta_schedule(graph, params, plan)?;
-    let topology = SelfFeedingTopology::build(graph);
+    let topology = session_topology(device, kernel, graph)?;
 
     let mut sess = SelfFeedingSession::build(
         device,
@@ -2081,7 +2226,7 @@ fn bench_many_planned(
     let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_planned_beta_schedule(graph, params, plan)?;
-    let topology = SelfFeedingTopology::build(graph);
+    let topology = session_topology(device, kernel, graph)?;
     let mut sess = SelfFeedingSession::build(
         device,
         kernel,
@@ -2844,7 +2989,13 @@ fn run_session(
         seed.params.schedule,
         key.plan.coefficients.beta_factor(),
     );
-    let topology = SelfFeedingTopology::build(&seed.graph);
+    let topology = match session_topology(device, kernel, &seed.graph) {
+        Ok(topology) => topology,
+        Err(error) => {
+            send_reject(out, seed, error.into());
+            return jobs.blocking_recv();
+        }
+    };
     let mut feed = Feed {
         jobs,
         key: &key,

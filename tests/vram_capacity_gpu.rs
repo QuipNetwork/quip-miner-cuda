@@ -191,4 +191,151 @@ fn footprint_matches_measured_allocation() {
             );
         }
     }
+    dense_allocation_cases(device, &ctx);
+}
+
+fn dense_allocation_cases(device: CudaDevice, ctx: &Arc<CudaContext>) {
+    let dense_device = device.with_dense_msa_for_test();
+    for nodes in [2_000usize, 8_000] {
+        let mut edges = Vec::with_capacity(nodes * (nodes - 1) / 2);
+        let mut j = Vec::with_capacity(edges.capacity());
+        let mut rng = 19u64;
+        for u in 0..nodes {
+            for v in u + 1..nodes {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                edges.push((u, v));
+                j.push(if rng & 1 == 0 { -1.0 } else { 1.0 });
+            }
+        }
+        let graph = IsingGraph::new(vec![0.0; nodes], j, edges);
+        ctx.synchronize().unwrap();
+        let (free_before, _) = ctx.mem_get_info().unwrap();
+        let footprint = msa_footprint(
+            ModelShape {
+                nodes,
+                couplers: graph.edges.len(),
+                max_degree: nodes - 1,
+            },
+            Precision::Binary,
+            MsaStorage::Dense,
+            128,
+            1,
+            &dense_device.limits,
+        );
+        let free = Arc::new(AtomicUsize::new(0));
+        let observer = AllocationAtLaunch {
+            ctx: Arc::clone(ctx),
+            free: Arc::clone(&free),
+        };
+        let p = SampleParams {
+            num_reads: 128,
+            num_sweeps: 1,
+            sweeps_per_beta: 1,
+            seed: 19,
+            ..SampleParams::default()
+        };
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(observer), || {
+            bench_many(
+                &dense_device,
+                &graph,
+                &p,
+                KernelKind::Msa,
+                None,
+                footprint.instances,
+            )
+            .expect("dense session");
+        });
+        let free_after = free.load(Ordering::SeqCst);
+        assert_ne!(free_after, 0);
+        let measured = free_before.checked_sub(free_after).unwrap();
+        let exact = footprint.total();
+        eprintln!(
+            "dense N={nodes} instances={} measured={measured} footprint={exact}",
+            footprint.instances
+        );
+        // cuMemGetInfo includes allocator page rounding and pool growth.
+        // The footprint counts requested bytes, so allow the same 64 MiB
+        // driver overhead used above, in either direction.
+        assert!(measured.abs_diff(exact) <= 64 << 20);
+        ctx.synchronize().unwrap();
+        measure_dense_sweeps(&dense_device, &graph);
+    }
+}
+
+// Subtract one-sweep from five-sweep CUDA event times to remove initialization
+// and packing. Use the median of three pairs at one instance and 128 reads.
+fn measure_dense_sweeps(device: &CudaDevice, graph: &IsingGraph) {
+    let mut differences = Vec::new();
+    for _ in 0..3 {
+        let mut p = SampleParams {
+            num_reads: 128,
+            num_sweeps: 1,
+            sweeps_per_beta: 1,
+            beta_range: Some((0.1, 0.1)),
+            seed: 19,
+            ..SampleParams::default()
+        };
+        let (_, one) = bench_many(device, graph, &p, KernelKind::Msa, None, 1).unwrap();
+        p.num_sweeps = 5;
+        p.sweeps_per_beta = 5;
+        let (_, five) = bench_many(device, graph, &p, KernelKind::Msa, None, 1).unwrap();
+        let per_sweep = five.kernel_ns.checked_sub(one.kernel_ns).unwrap() / 4;
+        differences.push(per_sweep);
+        eprintln!(
+            "dense timing N={} one_sweep_ns={} five_sweeps_ns={} per_sweep_ns={per_sweep}",
+            graph.num_nodes(),
+            one.kernel_ns,
+            five.kernel_ns
+        );
+    }
+    differences.sort_unstable();
+    eprintln!(
+        "dense timing N={} replicas=128 instances=1 median_per_sweep_ns={}",
+        graph.num_nodes(),
+        differences[1]
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn dense_oversized_model_refused_before_allocation() {
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 2_000).unwrap();
+    let limits = DeviceLimits {
+        free_bytes: 64 << 20,
+        ..device.limits
+    };
+    let device = device
+        .with_limits_for_test(limits)
+        .with_dense_msa_for_test();
+    let graph = circulant(2_000, 60, Precision::Binary);
+    let p = SampleParams {
+        num_reads: 128,
+        num_sweeps: 1,
+        ..SampleParams::default()
+    };
+    let ctx = CudaContext::new(0).unwrap();
+    ctx.synchronize().unwrap();
+    let (before, _) = ctx.mem_get_info().unwrap();
+    let error = sample_ising(&device, &graph, &p, KernelKind::Msa).unwrap_err();
+    let SampleError::ModelExceedsDeviceMemory {
+        nodes,
+        couplers,
+        required_bytes,
+        available_bytes,
+        instances,
+    } = error
+    else {
+        panic!("unexpected refusal: {error}");
+    };
+    assert_eq!(
+        (nodes, couplers, instances),
+        (2_000, 60_000, device.max_sms)
+    );
+    assert!(required_bytes > available_bytes);
+    assert_eq!(available_bytes, limits.usable_bytes());
+    ctx.synchronize().unwrap();
+    let (after, _) = ctx.mem_get_info().unwrap();
+    assert!(before.saturating_sub(after) <= 2 << 20);
 }

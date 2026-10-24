@@ -794,3 +794,195 @@ extern "C" __global__ void cuda_msa_self_feeding(
         if (active_slot < 0) return;
     }
 }
+
+#ifndef QUIP_MSA_WEIGHTED
+// Dense Binary MSA: one 256-thread block per instance, three independent
+// row-major i8 coefficient matrices (one per slot). Keeping all three copies
+// preserves overlapped uploads and the sparse slot/control protocol. i8,
+// rather than packed signs, keeps zero/diagonal entries explicit and leaves
+// msa_coef_t as the coefficient seam for weighted lanes. This trades capacity
+// for simple uploads and direct coefficient loads.
+//
+// Visit spins in fixed index order. All threads pack one coefficient row into
+// shared sign/presence bit vectors. Replica lanes then compute local fields
+// with population counts and decide flips. Zero entries and diagonal terms
+// are masked out. No colouring or degree-limited bit counter is used.
+// Spins retain the 64-replicas-per-u64 layout (one or two words). A second,
+// transposed bit vector packs 32 nodes per u32 for each replica, with replica
+// as the contiguous axis. This makes field reads coalesced and replaces
+// scalar neighbour updates with population counts over 32 bonds at a time.
+// Both spin layouts live in global memory. Dynamic shared memory holds two
+// packed coefficient rows and four ballot words, far below Turing's budget.
+// RNG state depends only on seed, slot and replica. Initial spin words use
+// a separate counter hash so increasing N does not advance the update RNG.
+extern "C" __global__ void cuda_msa_dense_self_feeding(
+    const msa_coef_t* __restrict__ slot_J_vals,
+    const msa_coef_t* __restrict__ slot_h_vals,
+    signed char* slot_samples,
+    int* slot_energies,
+    const float* __restrict__ beta_schedule,
+    int num_betas,
+    int sweeps_per_beta,
+    volatile int* nonce_ctrl,
+    int num_nonces,
+    int num_reads,
+    int N,
+    int max_packed_size,
+    unsigned int base_seed,
+    int words,
+    u64* spin_state,
+    unsigned int* replica_spins
+) {
+    extern __shared__ unsigned int dense_scratch[];
+    const int node_words = (N + 31) / 32;
+    unsigned int* row_signs = dense_scratch;
+    unsigned int* row_present = row_signs + node_words;
+    unsigned int* ballots = row_present + node_words; // 4 entries
+    __shared__ int s_active_slot;
+    __shared__ int s_abort;
+    const int tid = threadIdx.x;
+    const int nonce = blockIdx.x;
+    if (nonce >= num_nonces) return;
+    const int ctrl_base = nonce * CTRL_STRIDE;
+    const int replicas = words * 64;
+    u64* state = spin_state + (size_t)nonce * N * words;
+    unsigned int* by_replica = replica_spins + (size_t)nonce * node_words * replicas;
+    int active_slot = -1;
+    if (tid == 0) {
+        while (true) {
+            for (int s = 0; s < 3; ++s) {
+                if (atomicCAS((int*)&nonce_ctrl[ctrl_base + s], SLOT_READY, SLOT_ACTIVE) == SLOT_READY) {
+                    active_slot = s;
+                    break;
+                }
+            }
+            if (active_slot >= 0) {
+                nonce_ctrl[ctrl_base + CTRL_ACTIVE_SLOT] = active_slot;
+                __threadfence();
+                break;
+            }
+            if (nonce_ctrl[ctrl_base + CTRL_EXIT_NOW]) break;
+            __nanosleep(10000);
+        }
+        s_active_slot = active_slot;
+    }
+    __syncthreads();
+    active_slot = s_active_slot;
+    while (active_slot >= 0) {
+        const int slot = nonce * 3 + active_slot;
+        const msa_coef_t* J = slot_J_vals + (size_t)slot * N * N;
+        const msa_coef_t* h = slot_h_vals + (size_t)slot * N;
+        const u64 seed = splitmix64(((u64)base_seed << 8) ^ (u64)slot);
+        u64 rng = splitmix64(seed ^ ((u64)(tid + 1) * 0x9E3779B97F4A7C15ull));
+        if (rng == 0) rng = 0xdeadbeefcafef00dull;
+        for (int i = tid; i < N * words; i += blockDim.x) {
+            state[i] = splitmix64(seed ^ ((u64)(i / words) << 2) ^ (u64)(i % words));
+        }
+        __syncthreads();
+        // Build the transposed view once. Each replica lane owns its word.
+        for (int w = 0; w < node_words; ++w) {
+            if (tid == 0) s_abort = nonce_ctrl[ctrl_base + CTRL_EXIT_NOW] == EXIT_ABORT;
+            __syncthreads();
+            if (s_abort) break;
+            if (tid < replicas) {
+                unsigned int bits = 0;
+                for (int bit = 0; bit < 32; ++bit) {
+                    const int node = w * 32 + bit;
+                    if (node < N) {
+                        bits |= (unsigned int)((state[node * words + tid / 64] >> (tid % 64)) & 1ull) << bit;
+                    }
+                }
+                by_replica[(size_t)w * replicas + tid] = bits;
+            }
+        }
+        __syncthreads();
+        for (int beta_idx = 0; beta_idx < num_betas && !s_abort; ++beta_idx) {
+            const float beta = beta_schedule[beta_idx];
+            for (int sweep = 0; sweep < sweeps_per_beta && !s_abort; ++sweep) {
+                for (int node = 0; node < N; ++node) {
+                    if (tid == 0) s_abort = nonce_ctrl[ctrl_base + CTRL_EXIT_NOW] == EXIT_ABORT;
+                    __syncthreads();
+                    if (s_abort) break;
+                    // Every warp votes, including padding lanes in the last
+                    // tile, so each ballot has its complete participation mask.
+                    for (int base = 0; base < N; base += blockDim.x) {
+                        const int j = base + tid;
+                        const int coef = j < N && j != node ? (int)J[(size_t)node * N + j] : 0;
+                        const unsigned int signs = __ballot_sync(0xffffffffu, coef < 0);
+                        const unsigned int present = __ballot_sync(0xffffffffu, coef != 0);
+                        if ((tid & 31) == 0 && j < N) {
+                            row_signs[j / 32] = signs;
+                            row_present[j / 32] = present;
+                        }
+                    }
+                    __syncthreads();
+                    if (tid < replicas) {
+                        int field = h[node];
+                        for (int w = 0; w < node_words; ++w) {
+                            const unsigned int present = row_present[w];
+                            const unsigned int disagree = (by_replica[(size_t)w * replicas + tid] ^ row_signs[w]) & present;
+                            field += __popc(present) - 2 * __popc(disagree);
+                        }
+                        const int spin = (state[node * words + tid / 64] >> (tid % 64)) & 1ull ? -1 : 1;
+                        const int delta = -2 * spin * field;
+                        // Always advance once per spin, even on downhill moves.
+                        const float u = (float)((xs64(rng) >> 40) + 1ull) * (1.0f / 16777216.0f);
+                        const bool flip = tid < num_reads && (delta <= 0 || u < __expf(-beta * (float)delta));
+                        if (flip) by_replica[(size_t)(node / 32) * replicas + tid] ^= 1u << (node % 32);
+                        const unsigned int mask = __ballot_sync(0xffffffffu, flip);
+                        if ((tid & 31) == 0) ballots[tid / 32] = mask;
+                    }
+                    __syncthreads();
+                    if (tid < words) {
+                        const u64 flip = (u64)ballots[tid * 2] | ((u64)ballots[tid * 2 + 1] << 32);
+                        state[node * words + tid] ^= flip;
+                    }
+                    __syncthreads();
+                }
+            }
+        }
+        if (!s_abort) {
+            for (int r = tid; r < num_reads; r += blockDim.x) {
+                signed char* out = slot_samples + ((size_t)slot * num_reads + r) * max_packed_size;
+                for (int b = 0; b < max_packed_size; ++b) {
+                    unsigned int byte = 0;
+                    for (int bit = 0; bit < 8; ++bit) {
+                        const int node = b * 8 + bit;
+                        if (node < N) byte |= ((state[node * words + r / 64] >> (r % 64)) & 1ull) << bit;
+                    }
+                    out[b] = (signed char)byte;
+                }
+                slot_energies[(size_t)slot * num_reads + r] = 0; // host scores exact energy
+            }
+        }
+        __syncthreads();
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+            s_active_slot = -1;
+            if (!s_abort) {
+                nonce_ctrl[ctrl_base + active_slot] = SLOT_COMPLETE;
+                __threadfence();
+                if (!nonce_ctrl[ctrl_base + CTRL_EXIT_NOW]) {
+                    while (true) {
+                        for (int s = 0; s < 3; ++s) {
+                            if (atomicCAS((int*)&nonce_ctrl[ctrl_base + s], SLOT_READY, SLOT_ACTIVE) == SLOT_READY) {
+                                s_active_slot = s;
+                                break;
+                            }
+                        }
+                        if (s_active_slot >= 0 || nonce_ctrl[ctrl_base + CTRL_EXIT_NOW]) break;
+                        __nanosleep(10000);
+                    }
+                    if (s_active_slot >= 0) {
+                        nonce_ctrl[ctrl_base + CTRL_ACTIVE_SLOT] = s_active_slot;
+                        __threadfence();
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        active_slot = s_active_slot;
+    }
+}
+#endif
