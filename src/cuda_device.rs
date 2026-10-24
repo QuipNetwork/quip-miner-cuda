@@ -336,6 +336,8 @@ pub struct CudaDevice {
     pub msa_shared_spins_cap: Option<usize>,
     /// SMs on this device (`launch_self_feeding`'s `num_kernels` budget).
     pub max_sms: usize,
+    /// Device memory and launch limits read once at open.
+    pub limits: capacity::DeviceLimits,
     /// Node capacity the running kernel was compiled for.
     pub max_nodes: usize,
     /// Node budget for wide SA jobs, capped at the compiled SA capacity.
@@ -537,6 +539,7 @@ impl CudaDevice {
             msa_dynamic_shared_bytes,
             msa_shared_spins_cap: None,
             max_sms: max_sms.max(1),
+            limits,
             max_nodes: resolved,
             sa_wide_max_nodes,
             _sa_mod: sa_mod,
@@ -544,6 +547,14 @@ impl CudaDevice {
             _gibbs_mod: gibbs_mod,
             _msa_mod: msa_mod,
         })
+    }
+
+    /// Override the memory budget for allocation-refusal tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_limits_for_test(mut self, limits: capacity::DeviceLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Number of CUDA devices visible to this process.

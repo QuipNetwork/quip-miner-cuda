@@ -693,6 +693,73 @@ fn build_algo_state(
     }
 }
 
+/// Check session capacity before taking streams or allocating device buffers.
+fn check_session_capacity(
+    device: &CudaDevice,
+    kernel: KernelKind,
+    topology: &SelfFeedingTopology,
+    reads: usize,
+    betas: usize,
+    arithmetic: SessionArithmetic,
+) -> Result<(), SampleError> {
+    let n = topology.n;
+    let plan = arithmetic.coefficients;
+    // Defense in depth: the backend identity's `max_nodes` already rejects
+    // an oversized job in `job.rs` before it reaches the sampler. This
+    // catches any future drift between what the identity advertises and
+    // the capacity the kernel was actually compiled for, before it becomes
+    // a kernel-side buffer overrun instead of a clean error.
+    if n > device.max_nodes {
+        return Err(SampleError::GraphTooLarge {
+            n,
+            limit: device.max_nodes,
+        });
+    }
+    if kernel == KernelKind::Sa
+        && plan.path == CoefficientPath::Wide
+        && n > device.sa_wide_max_nodes
+    {
+        return Err(SampleError::GraphTooLarge {
+            n,
+            limit: device.sa_wide_max_nodes,
+        });
+    }
+    if kernel != KernelKind::Msa {
+        return Ok(());
+    }
+    let shape = capacity::ModelShape {
+        nodes: topology.n,
+        couplers: topology.edge_pos.len(),
+        max_degree: topology.max_degree(),
+    };
+    // MSA's Int8 plan is the unit lane; weighted models use Wide.
+    let precision = if plan.path == CoefficientPath::Wide && arithmetic.msa_lane == MsaLane::F32 {
+        capacity::Precision::Float32
+    } else {
+        capacity::Precision::from_plan(plan, true)
+    };
+    let footprint = capacity::msa_footprint(
+        shape,
+        precision,
+        capacity::MsaStorage::Sparse,
+        reads,
+        betas,
+        &device.limits,
+    );
+    let required_bytes = footprint.total();
+    let available_bytes = device.limits.usable_bytes();
+    if required_bytes > available_bytes {
+        return Err(SampleError::ModelExceedsDeviceMemory {
+            nodes: shape.nodes,
+            couplers: shape.couplers,
+            required_bytes,
+            available_bytes,
+            instances: footprint.instances,
+        });
+    }
+    Ok(())
+}
+
 impl<'a> SelfFeedingSession<'a> {
     fn build(
         device: &'a CudaDevice,
@@ -707,26 +774,14 @@ impl<'a> SelfFeedingSession<'a> {
         let plan = arithmetic.coefficients;
         let msa_lane = arithmetic.msa_lane;
         let n = topology.n;
-        // Defense in depth: the backend identity's `max_nodes` already rejects
-        // an oversized job in `job.rs` before it reaches the sampler. This
-        // catches any future drift between what the identity advertises and
-        // the capacity the kernel was actually compiled for, before it becomes
-        // a kernel-side buffer overrun instead of a clean error.
-        if n > device.max_nodes {
-            return Err(SampleError::GraphTooLarge {
-                n,
-                limit: device.max_nodes,
-            });
-        }
-        if kernel == KernelKind::Sa
-            && plan.path == CoefficientPath::Wide
-            && n > device.sa_wide_max_nodes
-        {
-            return Err(SampleError::GraphTooLarge {
-                n,
-                limit: device.sa_wide_max_nodes,
-            });
-        }
+        check_session_capacity(
+            device,
+            kernel,
+            &topology,
+            reads_per_nonce,
+            max_num_betas,
+            arithmetic,
+        )?;
         let nnz_alloc = topology.nnz.max(1);
         let max_packed_size = n.div_ceil(8).max(1);
         let total_slots = num_nonces * usize::from(SLOTS_PER_NONCE);

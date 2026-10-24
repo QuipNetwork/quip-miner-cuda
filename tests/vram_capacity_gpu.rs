@@ -6,6 +6,7 @@ use quip_solver_cuda::capacity::{msa_footprint, DeviceLimits, ModelShape, MsaSto
 use quip_solver_cuda::coefficients;
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::nvml_gov::UtilGovernor;
+use quip_solver_cuda::sampler::{sample_ising, SampleError};
 use quip_solver_cuda::streaming::{run_stream, stream_width};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 
@@ -26,6 +27,55 @@ fn circulant(nodes: usize, degree: usize, precision: Precision) -> IsingGraph {
         })
         .collect();
     IsingGraph::new(vec![0.0; nodes], j, edges)
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn oversized_model_refused_before_allocation() {
+    let nodes = 50_000;
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, nodes).expect("MSA device");
+    let limits = DeviceLimits {
+        free_bytes: 64 << 20,
+        ..device.limits
+    };
+    let device = device.with_limits_for_test(limits);
+    let ctx = CudaContext::new(device.device_index).expect("session device context");
+    let graph = circulant(nodes, 60, Precision::Binary);
+    let params = SampleParams {
+        num_reads: 128,
+        num_sweeps: 1,
+        ..SampleParams::default()
+    };
+    ctx.synchronize().unwrap();
+    let (free_before, _) = ctx.mem_get_info().expect("free before refusal");
+    let result = sample_ising(&device, &graph, &params, KernelKind::Msa);
+    ctx.synchronize().unwrap();
+    let (free_after, _) = ctx.mem_get_info().expect("free after refusal");
+    match result {
+        Err(SampleError::ModelExceedsDeviceMemory {
+            nodes: rejected_nodes,
+            couplers,
+            required_bytes,
+            available_bytes,
+            instances,
+        }) => {
+            assert_eq!(rejected_nodes, nodes);
+            assert_eq!(couplers, 1_500_000);
+            assert!(required_bytes > available_bytes);
+            assert_eq!(available_bytes, limits.usable_bytes());
+            assert_eq!(instances, device.max_sms);
+        }
+        Err(other) => panic!("expected ModelExceedsDeviceMemory, got {other:?}"),
+        Ok(samples) => panic!(
+            "expected ModelExceedsDeviceMemory, got {} successful reads",
+            samples.len()
+        ),
+    }
+    eprintln!("refused model: free_before={free_before} free_after={free_after}");
+    assert!(
+        free_before.saturating_sub(free_after) <= 2 << 20,
+        "refused session allocated device memory: before={free_before}, after={free_after}"
+    );
 }
 
 #[test]
