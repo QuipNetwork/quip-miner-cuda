@@ -404,7 +404,16 @@ __device__ __forceinline__ u64 weighted_accept_dense(
         }
         #pragma unroll
         for (int l = 0; l < MSA_LANE_GROUP; ++l) {
+#ifdef QUIP_MSA_COEF_F32
+            // Shared draws couple real-valued replicas until all reads can
+            // collapse into one local minimum. Give each replica its own draw.
+            LaneTest lane_test = test;
+            lane_test.draw = splitmix64(test.draw ^ (u64)(w * 64 + lane0 + l));
+            lane_test.arm();
+            accept |= (u64)lane_test.ok(field[l], bi, lane0 + l) << (lane0 + l);
+#else
             accept |= (u64)test.ok(field[l], bi, lane0 + l) << (lane0 + l);
+#endif
         }
     }
     return accept;
@@ -538,7 +547,7 @@ __device__ __forceinline__ bool anneal_model(
                         ^ ((u64)sweep << 20) ^ (u64)var);
 #ifdef QUIP_MSA_LANE_I32
                     const long long bound = __ldg(&mdl.neglog_table[draw & NEGLOG_MASK]);
-#else
+#elif !defined(QUIP_MSA_COEF_F32)
                     // 23 bits keep k + 0.5f exact, so u never reaches 1.0f.
                     const float u = ((float)(draw >> 41) + 0.5f) * 1.1920929e-7f;
 #endif
@@ -550,12 +559,20 @@ __device__ __forceinline__ bool anneal_model(
                             // Spin bit 1 is -1. Missing neighbours have J = 0.
                             field += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
                         }
+#ifdef QUIP_MSA_COEF_F32
+                        LaneTest test;
+                        test.draw = splitmix64(draw ^ (u64)(w * 64 + lane));
+                        test.beta = beta;
+                        test.arm();
+                        const bool ok = test.ok(field, bi, lane);
+#else
                         const msa_field_t de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
 #ifdef QUIP_MSA_LANE_I32
                         const bool ok = de <= 0
                             || (de <= rung_cut && (long long)de * rung_beta < bound);
 #else
                         const bool ok = de <= 0 || u < __expf(-beta * (float)de);
+#endif
 #endif
                         accept |= (u64)ok << lane;
                     }
