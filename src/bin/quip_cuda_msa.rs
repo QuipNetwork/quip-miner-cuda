@@ -171,6 +171,7 @@ fn print_probe(device: &CudaDevice, reads: usize, json: bool) {
                 "instances": instances(KernelKind::Msa, limits.sm_count),
                 "per_instance_budget": msa_per_instance_budget(limits),
                 "reads": reads, "betas": MSA_DEFAULT_BETAS, "cells": cells,
+                "slowdown_reference": "RTX A4000, 128 reads, 48 nonces, per lane-update against degree-20 Binary N=5791",
             })
         );
         return;
@@ -188,10 +189,12 @@ fn print_probe(device: &CudaDevice, reads: usize, json: bool) {
             print!(
                 " | {:<48}",
                 format!(
-                    "{} vars, {} couplers, {}, slowdown unknown",
+                    "{} vars, {} couplers, {}, slowdown {}",
                     cell.nodes,
                     cell.couplers,
-                    cell.tier()
+                    cell.tier(),
+                    cell.expected_slowdown
+                        .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.2}x"))
                 )
             );
         }
@@ -211,7 +214,7 @@ fn print_probe(device: &CudaDevice, reads: usize, json: bool) {
             row[2].per_instance_bytes
         );
     }
-    println!("Int32 has the Float32 capacity. Slowdown is unavailable until calibration.");
+    println!("Int32 has the Float32 capacity. Slowdown: RTX A4000, 128 reads, 48 nonces, per lane-update against degree-20 Binary N=5791. Unknown for other read counts or outside measured ranges.");
 }
 
 #[cfg(test)]
