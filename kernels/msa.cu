@@ -95,19 +95,41 @@
 // Coefficient width. The default build is the unit-weight kernel every
 // mining job runs, and it contains no weighted code.
 // -DQUIP_MSA_WEIGHTED builds the weighted kernel (QUI-1641, after the CPU
-// design in QUI-1398): i32 coefficients and a per-lane local field. Exactly
+// design in QUI-1398): i32 coefficients by default and a per-lane local field.
+// QUIP_MSA_COEF_I8 selects i8 storage; QUIP_MSA_COEF_F32 selects real storage. Exactly
 // one lane arithmetic is chosen: QUIP_MSA_LANE_I32 (integer-only Metropolis
 // against the host's -ln(u) table, the same on every GPU) or
 // QUIP_MSA_LANE_F32 (an __expf test).
 #ifdef QUIP_MSA_WEIGHTED
+#if defined(QUIP_MSA_COEF_I8) && defined(QUIP_MSA_COEF_F32)
+#error "choose exactly one weighted coefficient storage type"
+#endif
+#if defined(QUIP_MSA_COEF_I8)
+typedef signed char msa_coef_t;
+#elif defined(QUIP_MSA_COEF_F32)
+typedef float msa_coef_t;
+#ifndef QUIP_MSA_LANE_F32
+#error "f32 coefficient storage requires the f32 lane"
+#endif
+#else
 typedef int msa_coef_t;
+#endif
 #if defined(QUIP_MSA_LANE_I32) == defined(QUIP_MSA_LANE_F32)
 #error "a weighted msa build needs exactly one of QUIP_MSA_LANE_I32 and QUIP_MSA_LANE_F32"
 #endif
 #define NEGLOG_MASK 65535
-static_assert(sizeof(msa_coef_t) == 4, "weighted msa uses i32 coefficients");
+#ifndef QUIP_MSA_COEF_I8
+static_assert(sizeof(msa_coef_t) == 4, "wide coefficient storage is four bytes");
+#endif
 #else
 typedef signed char msa_coef_t;
+#endif
+
+// Preserve integer local fields for the existing builds, including the unit lane.
+#ifdef QUIP_MSA_COEF_F32
+typedef float msa_field_t;
+#else
+typedef int msa_field_t;
 #endif
 
 typedef unsigned long long u64;
@@ -332,8 +354,8 @@ struct LaneTest {
 #endif
 
     // Same predicate as the inline one in anneal_model's single-pass path.
-    __device__ __forceinline__ bool ok(int field, u64 bi, int lane) const {
-        const int de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
+    __device__ __forceinline__ bool ok(msa_field_t field, u64 bi, int lane) const {
+        const msa_field_t de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
 #ifdef QUIP_MSA_LANE_I32
         return de <= 0 || (de <= rung_cut && (long long)de * rung_beta < bound);
 #else
@@ -352,24 +374,24 @@ struct LaneTest {
 template <bool SPILL>
 __device__ __forceinline__ u64 weighted_accept_dense(
     const int* col_ind, const msa_coef_t* J, const SpinStore<SPILL>& st,
-    u64 bi, int w, int pstart, int pend, int h, LaneTest test) {
+    u64 bi, int w, int pstart, int pend, msa_field_t h, LaneTest test) {
     test.arm();
     u64 accept = 0ull;
     for (int lane0 = 0; lane0 < 64; lane0 += MSA_LANE_GROUP) {
-        int field[MSA_LANE_GROUP];
+        msa_field_t field[MSA_LANE_GROUP];
         #pragma unroll
         for (int l = 0; l < MSA_LANE_GROUP; ++l) {
             field[l] = h;
         }
         for (int base = pstart; base < pend; base += MSA_CHUNK) {
-            int jj[MSA_CHUNK];
+            msa_field_t jj[MSA_CHUNK];
             u64 sw[MSA_CHUNK];
             #pragma unroll
             for (int q = 0; q < MSA_CHUNK; ++q) {
                 int p = base + q;
                 bool ok = p < pend;
                 int nb = ok ? __ldg(&col_ind[p]) : 0;
-                jj[q] = ok ? (int)__ldg(&J[p]) : 0;
+                jj[q] = ok ? (msa_field_t)__ldg(&J[p]) : 0;
                 sw[q] = st.at(nb, w);
             }
             #pragma unroll
@@ -469,7 +491,7 @@ __device__ __forceinline__ bool anneal_model(
                     int var = __ldg(&mdl.color_nodes[start + k]);
                     int pstart = __ldg(&mdl.csr_row_ptr[var]);
                     int pend = __ldg(&mdl.csr_row_ptr[var + 1]);
-                    int h = __ldg(&mdl.h[var]);
+                    msa_field_t h = __ldg(&mdl.h[var]);
 
 #ifdef QUIP_MSA_WEIGHTED
                     if (pend - pstart > MSA_CHUNK) {
@@ -496,13 +518,13 @@ __device__ __forceinline__ bool anneal_model(
                     // (a shared helper measured +8.6% to +10.5% on
                     // weighted-i32 against main).
                     int nb[MSA_CHUNK];
-                    int jj[MSA_CHUNK];
+                    msa_field_t jj[MSA_CHUNK];
                     #pragma unroll
                     for (int q = 0; q < MSA_CHUNK; ++q) {
                         int p = pstart + q;
                         bool ok = p < pend;
                         nb[q] = ok ? __ldg(&mdl.csr_col_ind[p]) : 0;
-                        jj[q] = ok ? (int)__ldg(&mdl.J[p]) : 0;
+                        jj[q] = ok ? (msa_field_t)__ldg(&mdl.J[p]) : 0;
                     }
 
                     u64 bi = st.at(var, w);
@@ -522,13 +544,13 @@ __device__ __forceinline__ bool anneal_model(
 #endif
                     u64 accept = 0ull;
                     for (int lane = 0; lane < 64; ++lane) {
-                        int field = h;
+                        msa_field_t field = h;
                         #pragma unroll
                         for (int q = 0; q < MSA_CHUNK; ++q) {
                             // Spin bit 1 is -1. Missing neighbours have J = 0.
                             field += ((sw[q] >> lane) & 1ull) ? -jj[q] : jj[q];
                         }
-                        const int de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
+                        const msa_field_t de = ((bi >> lane) & 1ull) ? 2 * field : -2 * field;
 #ifdef QUIP_MSA_LANE_I32
                         const bool ok = de <= 0
                             || (de <= rung_cut && (long long)de * rung_beta < bound);

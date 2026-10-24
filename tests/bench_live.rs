@@ -159,3 +159,41 @@ fn nonce_zero_reads_ignore_concurrent_spilled_nonces() {
     let c: Vec<_> = crowded.iter().map(|r| r.spins.clone()).collect();
     assert_eq!(a, c);
 }
+
+/// Real benchmark timing must keep host energies in the original f64 units.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[serial]
+fn bench_real_coefficients_keep_real_energies_and_timing() {
+    use quip_solver_cuda::streaming::bench_many_real;
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 64).unwrap();
+    let graph = IsingGraph::new(
+        vec![std::f64::consts::PI; 12],
+        vec![-std::f64::consts::SQRT_2; 12],
+        (0..12).map(|i| (i, (i + 1) % 12)).collect(),
+    );
+    let params = SampleParams {
+        num_reads: 64,
+        num_sweeps: 256,
+        seed: 7,
+        ..SampleParams::default()
+    };
+    let (reads, timing) = bench_many_real(&device, &graph, &params, 1).unwrap();
+    assert_eq!(reads.len(), 64);
+    assert!(timing.kernel_ns > 0);
+    for read in reads {
+        let fields: f64 = read
+            .spins
+            .iter()
+            .map(|&s| std::f64::consts::PI * f64::from(s))
+            .sum();
+        let pairs: f64 = graph
+            .edges
+            .iter()
+            .map(|&(u, v)| {
+                -std::f64::consts::SQRT_2 * f64::from(read.spins[u]) * f64::from(read.spins[v])
+            })
+            .sum();
+        assert!((read.energy - fields - pairs).abs() < 1e-10);
+    }
+}

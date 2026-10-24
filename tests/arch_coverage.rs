@@ -134,6 +134,26 @@ fn every_supported_arch_compiles_and_assembles_every_kernel() {
                 quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
                 &["-DQUIP_MSA_WEIGHTED", "-DQUIP_MSA_LANE_F32"][..],
             ),
+            (
+                "msa-weighted-int8",
+                MSA_SRC,
+                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+                &[
+                    "-DQUIP_MSA_WEIGHTED",
+                    "-DQUIP_MSA_LANE_I32",
+                    "-DQUIP_MSA_COEF_I8",
+                ][..],
+            ),
+            (
+                "msa-real-f32",
+                MSA_SRC,
+                quip_solver_cuda::capacity::MSA_DEFAULT_NODES,
+                &[
+                    "-DQUIP_MSA_WEIGHTED",
+                    "-DQUIP_MSA_LANE_F32",
+                    "-DQUIP_MSA_COEF_F32",
+                ][..],
+            ),
             // The screen sizes its shared memory per launch; the node define is unused.
             ("screen", SCREEN_SRC, 0, &[][..]),
         ] {

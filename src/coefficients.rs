@@ -40,6 +40,10 @@ pub enum CoefficientPath {
     Int8,
     /// i32 coefficients: wide SA delta or weighted MSA lane arithmetic.
     Wide,
+    /// Scaled i8 coefficients on a weighted MSA lane.
+    WeightedInt8,
+    /// Real f32 coefficients on the MSA f32 lane, never selected for mining.
+    Float32,
 }
 
 /// The path and integer scale one job runs at.
@@ -197,7 +201,10 @@ pub(crate) fn plan_with_unit(
                     graph.h.len()
                 ))
             } else {
-                Ok(CoefficientPlan { path: CoefficientPath::Wide, scale_milli })
+                Ok(CoefficientPlan {
+                    path: if max_coef <= INT8_MAX_COEF { CoefficientPath::WeightedInt8 } else { CoefficientPath::Wide },
+                    scale_milli,
+                })
             }
         }
         KernelKind::Gibbs if max_coef <= INT8_MAX_COEF => Ok(int8),
@@ -240,6 +247,38 @@ mod tests {
         }
         let j = vec![1.0; edges.len()];
         graph(vec![h; n], j, edges)
+    }
+
+    #[test]
+    fn int8_range_model_plans_weighted_int8() {
+        let g = graph(
+            vec![0.016, -0.992, 0.0],
+            vec![0.032, -0.976],
+            vec![(0, 1), (1, 2)],
+        );
+        let p = plan(KernelKind::Msa, &g, BIG_WIDE).unwrap();
+        assert_eq!(p.path, CoefficientPath::WeightedInt8);
+        assert_eq!(p.scale_milli, 16);
+    }
+
+    #[test]
+    fn int8_overflow_plans_wide() {
+        let g = graph(vec![0.001, 0.0], vec![1.0], vec![(0, 1)]);
+        let p = plan(KernelKind::Msa, &g, BIG_WIDE).unwrap();
+        assert_eq!(p.path, CoefficientPath::Wide);
+        assert_eq!(p.scale_milli, 1);
+    }
+
+    #[test]
+    fn binary_model_plan_unchanged() {
+        let g = graph(vec![-1.0, 0.0, 1.0], vec![1.0, -1.0], vec![(0, 1), (1, 2)]);
+        assert_eq!(
+            plan(KernelKind::Msa, &g, BIG_WIDE).unwrap(),
+            CoefficientPlan {
+                path: CoefficientPath::Int8,
+                scale_milli: 1000,
+            }
+        );
     }
 
     const NO_WIDE: usize = 0;
@@ -400,7 +439,10 @@ mod tests {
             vec![(0, 1), (1, 2)],
         );
         let p = plan(KernelKind::Msa, &g, 5000).unwrap();
-        assert_eq!((p.path, p.scale_milli), (CoefficientPath::Wide, 250));
+        assert_eq!(
+            (p.path, p.scale_milli),
+            (CoefficientPath::WeightedInt8, 250)
+        );
     }
 
     #[test]

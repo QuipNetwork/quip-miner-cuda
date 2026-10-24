@@ -348,6 +348,12 @@ enum SlotCoefficients {
         stage_j: Vec<i8>,
         stage_h: Vec<i8>,
     },
+    Float32 {
+        d_j: CudaSlice<f32>,
+        d_h: CudaSlice<f32>,
+        stage_j: Vec<f32>,
+        stage_h: Vec<f32>,
+    },
     Wide {
         d_j: CudaSlice<i32>,
         d_h: CudaSlice<i32>,
@@ -357,36 +363,24 @@ enum SlotCoefficients {
 }
 
 /// Stage and upload one slot's coefficients at the selected element width.
-fn upload_slot_coefficients<T>(
-    topology: &SelfFeedingTopology,
-    graph: &IsingGraph,
-    scale_milli: u64,
+fn upload_slot_coefficients<T: DeviceRepr + Copy + Default>(
+    coefficients: Result<(Vec<T>, Vec<T>), String>,
     stream: &Arc<CudaStream>,
     slot_idx: usize,
     (d_j, d_h): (&mut CudaSlice<T>, &mut CudaSlice<T>),
     (stage_j, stage_h): (&mut [T], &mut [T]),
-) -> Result<(), SampleError>
-where
-    T: DeviceRepr + Copy + Default + TryFrom<i64>,
-{
-    let nnz_alloc = topology.nnz.max(1);
-    let n_alloc = topology.n.max(1);
+) -> Result<(), SampleError> {
+    let (j, h) = coefficients.map_err(SampleError::Unsupported)?;
+    let nnz_alloc = stage_j.len();
+    let n_alloc = stage_h.len();
     let j_start = slot_idx * nnz_alloc;
     let h_start = slot_idx * n_alloc;
     stage_j.fill(T::default());
     stage_h.fill(T::default());
-    let (j, h) =
-        fill_coefficients::<T>(topology, graph, scale_milli).map_err(SampleError::Unsupported)?;
     stage_j[..j.len()].copy_from_slice(&j);
     stage_h[..h.len()].copy_from_slice(&h);
-    stream.memcpy_htod(
-        &stage_j[..nnz_alloc],
-        &mut d_j.slice_mut(j_start..j_start + nnz_alloc),
-    )?;
-    stream.memcpy_htod(
-        &stage_h[..n_alloc],
-        &mut d_h.slice_mut(h_start..h_start + n_alloc),
-    )?;
+    stream.memcpy_htod(stage_j, &mut d_j.slice_mut(j_start..j_start + nnz_alloc))?;
+    stream.memcpy_htod(stage_h, &mut d_h.slice_mut(h_start..h_start + n_alloc))?;
     Ok(())
 }
 
@@ -454,11 +448,17 @@ impl SlotCoefficients {
         n: usize,
     ) -> Result<Self, SampleError> {
         Ok(match path {
-            CoefficientPath::Int8 => SlotCoefficients::Int8 {
+            CoefficientPath::Int8 | CoefficientPath::WeightedInt8 => SlotCoefficients::Int8 {
                 d_j: stream.alloc_zeros::<i8>(total_slots * nnz_alloc)?,
                 d_h: stream.alloc_zeros::<i8>(total_slots * n.max(1))?,
                 stage_j: vec![0i8; nnz_alloc],
                 stage_h: vec![0i8; n.max(1)],
+            },
+            CoefficientPath::Float32 => SlotCoefficients::Float32 {
+                d_j: stream.alloc_zeros::<f32>(total_slots * nnz_alloc)?,
+                d_h: stream.alloc_zeros::<f32>(total_slots * n.max(1))?,
+                stage_j: vec![0.0; nnz_alloc],
+                stage_h: vec![0.0; n.max(1)],
             },
             CoefficientPath::Wide => SlotCoefficients::Wide {
                 d_j: stream.alloc_zeros::<i32>(total_slots * nnz_alloc)?,
@@ -732,7 +732,7 @@ fn check_session_capacity(
         couplers: topology.edge_pos.len(),
         max_degree: topology.max_degree(),
     };
-    // MSA's Int8 plan is the unit lane; weighted models use Wide.
+    // The legacy f32 lane still holds i32 coefficients but omits integer tables.
     let precision = if plan.path == CoefficientPath::Wide && arithmetic.msa_lane == MsaLane::F32 {
         capacity::Precision::Float32
     } else {
@@ -772,7 +772,11 @@ impl<'a> SelfFeedingSession<'a> {
     ) -> Result<Self, SampleError> {
         let _span = trace_span!("problem_setup", n = topology.n, nnz = topology.nnz).entered();
         let plan = arithmetic.coefficients;
-        let msa_lane = arithmetic.msa_lane;
+        let msa_lane = match plan.path {
+            CoefficientPath::WeightedInt8 => MsaLane::I32,
+            CoefficientPath::Float32 => MsaLane::F32,
+            CoefficientPath::Int8 | CoefficientPath::Wide => arithmetic.msa_lane,
+        };
         let n = topology.n;
         check_session_capacity(
             device,
@@ -821,7 +825,7 @@ impl<'a> SelfFeedingSession<'a> {
 
         let algo_state = if kernel == KernelKind::Sa && plan.path == CoefficientPath::Wide {
             build_sa_wide_state(&stream_compute, n, num_nonces, max_num_betas)?
-        } else if kernel == KernelKind::Msa && plan.path == CoefficientPath::Wide {
+        } else if kernel == KernelKind::Msa && plan.path != CoefficientPath::Int8 {
             build_msa_weighted_state(
                 device,
                 &stream_compute,
@@ -944,9 +948,7 @@ impl<'a> SelfFeedingSession<'a> {
                 stage_j,
                 stage_h,
             } => upload_slot_coefficients(
-                &self.topology,
-                graph,
-                self.plan.scale_milli,
+                fill_coefficients(&self.topology, graph, self.plan.scale_milli),
                 &self.stream_transfer,
                 slot_idx,
                 (d_j, d_h),
@@ -958,9 +960,19 @@ impl<'a> SelfFeedingSession<'a> {
                 stage_j,
                 stage_h,
             } => upload_slot_coefficients(
-                &self.topology,
-                graph,
-                self.plan.scale_milli,
+                fill_coefficients(&self.topology, graph, self.plan.scale_milli),
+                &self.stream_transfer,
+                slot_idx,
+                (d_j, d_h),
+                (stage_j, stage_h),
+            )?,
+            SlotCoefficients::Float32 {
+                d_j,
+                d_h,
+                stage_j,
+                stage_h,
+            } => upload_slot_coefficients(
+                crate::topology::fill_real_coefficients(&self.topology, graph),
                 &self.stream_transfer,
                 slot_idx,
                 (d_j, d_h),
@@ -1096,9 +1108,21 @@ impl<'a> SelfFeedingSession<'a> {
         let kernels = self.device.msa_weighted.as_ref().ok_or_else(|| {
             SampleError::Unsupported("weighted MSA requires an MSA device open".into())
         })?;
-        let function = match lane {
-            MsaLane::I32 => &kernels.i32,
-            MsaLane::F32 => &kernels.f32,
+        let function = match (&self.coefs, lane) {
+            (SlotCoefficients::Int8 { .. }, MsaLane::I32) => &kernels.int8,
+            (SlotCoefficients::Int8 { .. }, MsaLane::F32) => {
+                return Err(SampleError::Driver(
+                    "int8 weighted coefficients require the i32 lane".into(),
+                ))
+            }
+            (SlotCoefficients::Wide { .. }, MsaLane::I32) => &kernels.i32,
+            (SlotCoefficients::Wide { .. }, MsaLane::F32) => &kernels.f32,
+            (SlotCoefficients::Float32 { .. }, MsaLane::F32) => &kernels.real,
+            (SlotCoefficients::Float32 { .. }, MsaLane::I32) => {
+                return Err(SampleError::Driver(
+                    "f32 coefficients require the f32 lane".into(),
+                ))
+            }
         };
         let MsaState {
             d_color_starts,
@@ -1110,11 +1134,6 @@ impl<'a> SelfFeedingSession<'a> {
             shared_spins,
             ..
         } = msa;
-        let SlotCoefficients::Wide { d_j, d_h, .. } = &self.coefs else {
-            return Err(SampleError::Driver(
-                "launch_msa_weighted without wide coefficients".into(),
-            ));
-        };
         let dims = &self.dims;
         let mut b = self.stream_compute.launch_builder(function);
         b.arg(&self.d_row_ptr);
@@ -1123,8 +1142,20 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(d_color_counts);
         b.arg(d_color_nodes);
         b.arg(num_colors);
-        b.arg(d_j);
-        b.arg(d_h);
+        match &self.coefs {
+            SlotCoefficients::Int8 { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+            SlotCoefficients::Wide { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+            SlotCoefficients::Float32 { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+        }
         b.arg(&self.d_samples);
         b.arg(&self.d_energies);
         b.arg(&self.d_beta);
@@ -1154,8 +1185,8 @@ impl<'a> SelfFeedingSession<'a> {
         }
         // SAFETY: the 26 arguments for I32, or 23 for F32, mirror
         // `cuda_msa_self_feeding` compiled with QUIP_MSA_WEIGHTED and its lane
-        // define, in order, type and count. J and h are i32. `build` sizes
-        // every slot and colouring buffer from these same dimensions, and
+        // define, in order, type and count. J and h match the selected storage.
+        // `build` sizes every slot and colouring buffer from these same dimensions, and
         // checks the degree. `msa_layout` keeps `shared_spins` within the
         // shared budget by construction. The three I32 buffers hold
         // num_betas, num_betas and NEGLOG_LEN entries. `d_spill` holds
@@ -1685,15 +1716,22 @@ pub fn sample_one(
 ) -> Result<Vec<SamplerResult>, SampleError> {
     let plan = coefficients::plan(kernel, graph, wide_max_nodes(device, kernel))
         .map_err(SampleError::Unsupported)?;
+    Ok(sample_one_planned(device, graph, params, kernel, plan)?
+        .into_iter()
+        .map(|spins| score_spins(&spins, graph))
+        .collect())
+}
+
+fn sample_one_planned(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: KernelKind,
+    plan: CoefficientPlan,
+) -> Result<Vec<Vec<i8>>, SampleError> {
     let n = graph.num_nodes();
     if n == 0 {
-        let reads = params.num_reads.max(1);
-        return Ok((0..reads)
-            .map(|_| SamplerResult {
-                spins: vec![],
-                energy_milli: 0,
-            })
-            .collect());
+        return Ok(vec![Vec::new(); params.num_reads.max(1)]);
     }
 
     let limits = algo_limits(kernel);
@@ -1740,11 +1778,113 @@ pub fn sample_one(
     sess.signal_exit()?;
     sess.wait_exit()?;
 
+    Ok(reads.into_iter().take(params.num_reads.max(1)).collect())
+}
+
+/// A real-valued read scored on the host with the original f64 coefficients.
+#[derive(Clone, Debug)]
+pub struct RealSample {
+    /// Spin configuration, one entry per variable in {-1, +1}.
+    pub spins: Vec<i8>,
+    /// Ising energy without a model file's constant offset.
+    pub energy: f64,
+}
+
+/// Real-valued reads returned by [`sample_one_real`].
+pub type SampleSet = Vec<RealSample>;
+
+/// Sample an MSA graph, trying exact coefficients before real f32 storage.
+///
+/// # Errors
+/// Returns the same device and capacity errors as [`sample_one`].
+/// Non-finite or unrepresentable f32 coefficients are refused.
+pub fn sample_one_real(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+) -> Result<SampleSet, SampleError> {
+    let plan = real_plan(device, graph)?;
+    let reads = sample_one_planned(device, graph, params, KernelKind::Msa, plan)?;
     Ok(reads
         .into_iter()
-        .take(params.num_reads.max(1))
-        .map(|spins| score_spins(&spins, graph))
+        .map(|read| RealSample {
+            energy: real_energy(&read, graph),
+            spins: read,
+        })
         .collect())
+}
+
+fn real_plan(device: &CudaDevice, graph: &IsingGraph) -> Result<CoefficientPlan, SampleError> {
+    validate_real_graph(graph)?;
+    match coefficients::plan(KernelKind::Msa, graph, device.max_nodes) {
+        Ok(plan) => Ok(plan),
+        Err(_)
+            if graph
+                .h
+                .iter()
+                .chain(&graph.j)
+                .any(|&v| coefficients::to_milli(v).is_none()) =>
+        {
+            float_plan(graph)
+        }
+        Err(error) => Err(SampleError::Unsupported(error)),
+    }
+}
+
+fn validate_real_graph(graph: &IsingGraph) -> Result<(), SampleError> {
+    if graph.j.len() != graph.edges.len()
+        || graph
+            .edges
+            .iter()
+            .any(|&(u, v)| u >= graph.h.len() || v >= graph.h.len() || u == v)
+    {
+        return Err(SampleError::Unsupported(
+            "real graph requires matching couplers and distinct in-range endpoints".into(),
+        ));
+    }
+    for &value in graph.h.iter().chain(&graph.j) {
+        crate::topology::real_coefficient(value).map_err(SampleError::Unsupported)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn float_plan(graph: &IsingGraph) -> Result<CoefficientPlan, SampleError> {
+    validate_real_graph(graph)?;
+    let mut fields: Vec<f64> = graph.h.iter().map(|v| v.abs()).collect();
+    for (&coupling, &(u, v)) in graph.j.iter().zip(graph.edges.iter()) {
+        fields[u] += coupling.abs();
+        fields[v] += coupling.abs();
+    }
+    // The kernel forms delta = +/-2 * field in f32.
+    if fields
+        .iter()
+        .any(|&field| field > f64::from(f32::MAX) / 2.0)
+    {
+        return Err(SampleError::Unsupported(
+            "real local field exceeds the finite f32 delta range".into(),
+        ));
+    }
+    Ok(CoefficientPlan {
+        path: CoefficientPath::Float32,
+        scale_milli: 1000,
+    })
+}
+
+pub(crate) fn real_energy(spins: &[i8], graph: &IsingGraph) -> f64 {
+    let _span = trace_span!("energy_score", n = graph.h.len()).entered();
+    let fields: f64 = graph
+        .h
+        .iter()
+        .zip(spins)
+        .map(|(&h, &s)| h * f64::from(s))
+        .sum();
+    fields
+        + graph
+            .j
+            .iter()
+            .zip(graph.edges.iter())
+            .map(|(&j, &(u, v))| j * f64::from(spins[u]) * f64::from(spins[v]))
+            .sum::<f64>()
 }
 
 /// Device-facing durations measured for one isolated single-shot bench run.
@@ -1852,6 +1992,60 @@ pub fn bench_many(
     msa_lane: Option<MsaLane>,
     num_nonces: usize,
 ) -> Result<(Vec<SamplerResult>, DeviceTimings), SampleError> {
+    let plan = bench_plan(device, graph, kernel, msa_lane)?;
+    let (reads, timing) =
+        bench_many_planned(device, graph, params, kernel, msa_lane, num_nonces, plan)?;
+    Ok((
+        reads
+            .into_iter()
+            .map(|spins| score_spins(&spins, graph))
+            .collect(),
+        timing,
+    ))
+}
+
+/// Time real f32 MSA coefficients with `num_nonces` concurrent models.
+/// Returned energies use the original f64 graph and exclude any file offset.
+///
+/// # Errors
+/// Returns device and capacity errors as [`bench_many`], and refuses invalid f32 coefficients.
+pub fn bench_many_real(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    num_nonces: usize,
+) -> Result<(SampleSet, DeviceTimings), SampleError> {
+    let plan = float_plan(graph)?;
+    let (reads, timing) = bench_many_planned(
+        device,
+        graph,
+        params,
+        KernelKind::Msa,
+        Some(MsaLane::F32),
+        num_nonces,
+        plan,
+    )?;
+    Ok((
+        reads
+            .into_iter()
+            .map(|spins| RealSample {
+                energy: real_energy(&spins, graph),
+                spins,
+            })
+            .collect(),
+        timing,
+    ))
+}
+
+fn bench_many_planned(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    kernel: KernelKind,
+    msa_lane: Option<MsaLane>,
+    num_nonces: usize,
+    plan: CoefficientPlan,
+) -> Result<(Vec<Vec<i8>>, DeviceTimings), SampleError> {
     let num_nonces = num_nonces.max(1);
     let width = stream_width(device, kernel);
     if num_nonces > width {
@@ -1859,17 +2053,12 @@ pub fn bench_many(
             "{num_nonces} concurrent models exceed the device's stream width of {width}"
         )));
     }
-    let plan = bench_plan(device, graph, kernel, msa_lane)?;
     let n = graph.num_nodes();
     if n == 0 {
-        let reads = params.num_reads.max(1);
-        let empty = (0..reads)
-            .map(|_| SamplerResult {
-                spins: vec![],
-                energy_milli: 0,
-            })
-            .collect();
-        return Ok((empty, DeviceTimings::default()));
+        return Ok((
+            vec![Vec::new(); params.num_reads.max(1)],
+            DeviceTimings::default(),
+        ));
     }
     let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
@@ -1932,11 +2121,7 @@ pub fn bench_many(
     sess.signal_exit()?;
     sess.wait_exit()?;
 
-    let scored = reads
-        .into_iter()
-        .take(params.num_reads.max(1))
-        .map(|spins| score_spins(&spins, graph))
-        .collect();
+    let scored = reads.into_iter().take(params.num_reads.max(1)).collect();
     Ok((
         scored,
         DeviceTimings {
@@ -2829,6 +3014,12 @@ mod tests {
     use tokio::sync::mpsc::channel;
 
     #[test]
+    fn float_plan_refuses_overflowing_local_fields() {
+        let graph = crate::IsingGraph::new(vec![2.0e38, 0.0], vec![2.0e38], vec![(0, 1)]);
+        assert!(super::float_plan(&graph).is_err());
+    }
+
+    #[test]
     fn governor_wait_ends_when_the_session_watermark_is_cancelled() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let (job_tx, job_rx) = channel(1);
@@ -3204,7 +3395,10 @@ mod tests {
         seed.graph.h[0] = 0.25;
         let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 5000, MsaLane::I32).unwrap();
         let integer = key.plan_for(&seed).unwrap();
-        assert_eq!(integer.arithmetic.coefficients.path, CoefficientPath::Wide);
+        assert_eq!(
+            integer.arithmetic.coefficients.path,
+            CoefficientPath::WeightedInt8
+        );
         assert!(key.matches(&seed, integer));
         let float = JobPlan {
             arithmetic: SessionArithmetic {

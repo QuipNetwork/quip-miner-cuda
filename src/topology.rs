@@ -339,6 +339,24 @@ where
     fill_converted(topology, graph, |v| scaled(v, scale))
 }
 
+pub(crate) fn fill_real_coefficients(
+    topology: &SelfFeedingTopology,
+    graph: &IsingGraph,
+) -> Result<(Vec<f32>, Vec<f32>), String> {
+    fill_converted(topology, graph, real_coefficient)
+}
+
+#[allow(clippy::cast_possible_truncation)] // Real entry points explicitly select f32 storage.
+pub(crate) fn real_coefficient(value: f64) -> Result<f32, String> {
+    let narrowed = value as f32;
+    if !narrowed.is_finite() || (value != 0.0 && narrowed.abs() < f32::MIN_POSITIVE) {
+        return Err(format!(
+            "real coefficient {value} is outside the finite f32 range"
+        ));
+    }
+    Ok(narrowed)
+}
+
 fn fill_converted<T: Copy + Default>(
     topology: &SelfFeedingTopology,
     graph: &IsingGraph,

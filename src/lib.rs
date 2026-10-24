@@ -30,6 +30,7 @@ mod jit_cache;
 pub mod kernel;
 mod lease;
 mod lease_turn;
+pub mod model_file;
 pub mod nsight;
 pub mod nvml_gov;
 pub mod sampler;
@@ -43,6 +44,7 @@ pub mod topology;
 pub use kernel::KernelKind;
 pub use quip_solver_core::{IsingGraph, SampleParams, SamplerResult};
 pub use sampler::sample_ising;
+pub use streaming::{sample_one_real, RealSample, SampleSet};
 
 use cuda_device::CudaDevice;
 use nvml_gov::UtilGovernor;

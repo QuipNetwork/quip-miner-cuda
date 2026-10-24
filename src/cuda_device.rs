@@ -20,12 +20,16 @@ pub const SA_WIDE_DEFINE: &str = "-DQUIP_SA_WIDE";
 const GIBBS_SRC: &str = include_str!("../kernels/gibbs.cu");
 /// Multi-spin coded SA, see `kernels/msa.cu`.
 const MSA_SRC: &str = include_str!("../kernels/msa.cu");
-/// NVRTC define selecting i32 coefficients for weighted MSA.
+/// NVRTC define selecting weighted MSA, with i32 coefficients by default.
 pub const MSA_WEIGHTED_DEFINE: &str = "-DQUIP_MSA_WEIGHTED";
 /// NVRTC define selecting integer lane arithmetic for weighted MSA.
 pub const MSA_LANE_I32_DEFINE: &str = "-DQUIP_MSA_LANE_I32";
 /// NVRTC define selecting floating-point lane arithmetic for weighted MSA.
 pub const MSA_LANE_F32_DEFINE: &str = "-DQUIP_MSA_LANE_F32";
+/// NVRTC define selecting i8 coefficient storage on the weighted integer lane.
+pub const MSA_COEF_I8_DEFINE: &str = "-DQUIP_MSA_COEF_I8";
+/// NVRTC define selecting f32 coefficient storage on the floating-point lane.
+pub const MSA_COEF_F32_DEFINE: &str = "-DQUIP_MSA_COEF_F32";
 
 /// Lane arithmetic used by weighted MSA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,15 +165,19 @@ type CompiledKernels = (
     Option<MsaWeightedKernels>,
 );
 
-/// Both weighted MSA functions and the modules that keep their code alive.
+/// Weighted MSA storage/lane variants and the modules that keep their code alive.
 pub(crate) struct MsaWeightedKernels {
     pub(crate) i32: CudaFunction,
     pub(crate) f32: CudaFunction,
+    pub(crate) int8: CudaFunction,
+    pub(crate) real: CudaFunction,
+    _int8_mod: Arc<CudaModule>,
+    _real_mod: Arc<CudaModule>,
     _integer_mod: Arc<CudaModule>,
     _float_mod: Arc<CudaModule>,
 }
 
-/// Compile the four base kernels and, for MSA opens, both weighted lanes.
+/// Compile the four base kernels and, for MSA opens, the weighted storage variants.
 /// Kept out of [`CudaDevice::open_with_nodes`] to stay under the function-length cap.
 fn compile_all_kernels(
     ctx: &Arc<CudaContext>,
@@ -182,7 +190,7 @@ fn compile_all_kernels(
     let (sa_nodes, msa_nodes, gibbs_nodes) = nodes;
     let _span = trace_span!(
         "jit",
-        kernels = if kernel == KernelKind::Msa { 6 } else { 4 }
+        kernels = if kernel == KernelKind::Msa { 8 } else { 4 }
     )
     .entered();
     let (sa, sa_wide, msa, gibbs) = (
@@ -227,23 +235,44 @@ fn compile_all_kernels(
             || compile_for_arch(GIBBS_SRC, gibbs_nodes, sel, &[]),
         )?,
     );
-    let weighted = |name, lane| {
-        let defines = [MSA_WEIGHTED_DEFINE, lane];
+    let weighted = |name, defines: &[&str]| {
         jit_cache::load_or_compile(
             ctx,
             name,
             MSA_SRC,
-            &defines,
+            defines,
             arch,
             driver_ver,
             msa_nodes,
-            || compile_for_arch(MSA_SRC, msa_nodes, sel, &defines),
+            || compile_for_arch(MSA_SRC, msa_nodes, sel, defines),
         )
     };
     let msa_weighted = if kernel == KernelKind::Msa {
-        let integer_mod = weighted("msa-weighted-i32", MSA_LANE_I32_DEFINE)?;
-        let float_mod = weighted("msa-weighted-f32", MSA_LANE_F32_DEFINE)?;
+        let integer_mod = weighted(
+            "msa-weighted-i32",
+            &[MSA_WEIGHTED_DEFINE, MSA_LANE_I32_DEFINE],
+        )?;
+        let float_mod = weighted(
+            "msa-weighted-f32",
+            &[MSA_WEIGHTED_DEFINE, MSA_LANE_F32_DEFINE],
+        )?;
+        let int8_mod = weighted(
+            "msa-weighted-int8",
+            &[MSA_WEIGHTED_DEFINE, MSA_LANE_I32_DEFINE, MSA_COEF_I8_DEFINE],
+        )?;
+        let real_mod = weighted(
+            "msa-real-f32",
+            &[
+                MSA_WEIGHTED_DEFINE,
+                MSA_LANE_F32_DEFINE,
+                MSA_COEF_F32_DEFINE,
+            ],
+        )?;
         Some(MsaWeightedKernels {
+            int8: int8_mod.load_function("cuda_msa_self_feeding")?,
+            real: real_mod.load_function("cuda_msa_self_feeding")?,
+            _int8_mod: int8_mod,
+            _real_mod: real_mod,
             i32: integer_mod.load_function("cuda_msa_self_feeding")?,
             f32: float_mod.load_function("cuda_msa_self_feeding")?,
             _integer_mod: integer_mod,
@@ -324,7 +353,7 @@ pub struct CudaDevice {
     /// `cuda_msa_self_feeding` — persistent kernel, 1 block (1 SM) per
     /// nonce, 64 reads per replica word.
     pub(crate) msa: CudaFunction,
-    /// Both weighted lanes, available only on MSA opens.
+    /// Weighted storage/lane variants, available only on MSA opens.
     pub(crate) msa_weighted: Option<MsaWeightedKernels>,
     /// Dynamic shared memory one msa block may request: the device's opt-in
     /// ceiling less the kernel's static members. `streaming` sizes msa
@@ -514,6 +543,8 @@ impl CudaDevice {
         if let Some(weighted) = &msa_weighted {
             configure_msa_shared_memory(&weighted.i32, shared_per_block_optin)?;
             configure_msa_shared_memory(&weighted.f32, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.int8, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.real, shared_per_block_optin)?;
         }
 
         // Read before the struct is built so an unreadable attribute fails the
@@ -691,16 +722,21 @@ mod msa_weighted_gpu_tests {
             .collect();
         assert_eq!(
             ptx.len(),
-            6,
+            8,
             "MSA open must cache both weighted lane modules"
         );
-        for name in ["msa-weighted-i32-", "msa-weighted-f32-"] {
+        for name in [
+            "msa-weighted-i32-",
+            "msa-weighted-f32-",
+            "msa-weighted-int8-",
+            "msa-real-f32-",
+        ] {
             assert!(ptx
                 .iter()
                 .any(|entry| entry.file_name().to_string_lossy().starts_with(name)));
         }
         let weighted = device.msa_weighted.as_ref().expect("weighted MSA kernels");
-        for lane in [&weighted.i32, &weighted.f32] {
+        for lane in [&weighted.i32, &weighted.f32, &weighted.int8, &weighted.real] {
             assert!(
                 usize::try_from(lane.shared_size_bytes().expect("loaded weighted function"))
                     .expect("nonnegative static shared memory")

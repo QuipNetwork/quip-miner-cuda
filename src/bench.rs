@@ -46,7 +46,9 @@ use crate::corpus;
 use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
 use crate::schema::{BenchRecord, Metric, Part, Scope, Source};
-use crate::streaming::{bench_many, bench_plan, stream_width, DeviceTimings};
+use crate::streaming::{
+    bench_many, bench_many_real, bench_plan, float_plan, stream_width, DeviceTimings,
+};
 use crate::{IsingGraph, KernelKind, SampleParams};
 use clap::{Args, Subcommand, ValueEnum};
 use quip_protocol::chacha8::ChaCha8Rng;
@@ -84,6 +86,8 @@ pub enum MsaPath {
     WeightedI32,
     /// Force the weighted floating-point lane, including for unit models.
     WeightedF32,
+    /// Force f32 coefficients and floating-point lane arithmetic.
+    F32,
 }
 
 impl MsaPath {
@@ -91,9 +95,22 @@ impl MsaPath {
         match self {
             Self::Auto => None,
             Self::WeightedI32 => Some(MsaLane::I32),
-            Self::WeightedF32 => Some(MsaLane::F32),
+            Self::WeightedF32 | Self::F32 => Some(MsaLane::F32),
         }
     }
+}
+
+/// Coefficient tier of a redrawn benchmark graph.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchPrecision {
+    /// Preserve the original graph.
+    Binary,
+    /// Integer fields in -127..=127 and nonzero coupling magnitudes up to 127.
+    Int8,
+    /// Integer fields in -1000..=1000 and nonzero coupling magnitudes up to 1000.
+    Int32,
+    /// Normal real fields and coupling magnitudes, with original coupling signs.
+    Float,
 }
 
 /// Arguments for `bench run`.
@@ -102,10 +119,12 @@ pub struct RunArgs {
     /// MSA path (default: auto). Accepted only by the MSA kernel.
     #[arg(long, value_enum)]
     pub msa_path: Option<MsaPath>,
-    /// Maximum integer weight. 1 preserves the graph; larger values redraw
-    /// fields in -K..=K and coupling magnitudes in 1..=K, preserving signs.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    pub weights: u32,
+    /// Coefficient tier (default: binary). Redraws fields and couplings at the selected precision.
+    #[arg(long, value_enum)]
+    pub precision: Option<BenchPrecision>,
+    /// Real-valued `.qmodel` file. Uses the MSA f32 coefficient path.
+    #[arg(long, conflicts_with_all = ["source", "degree", "shuffle", "precision"])]
+    pub model: Option<PathBuf>,
     /// Reads per model, at most the kernel's cap (256 for sa and gibbs, 128 for msa).
     #[arg(long, default_value_t = 8)]
     pub reads: u64,
@@ -162,7 +181,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub flame: Option<PathBuf>,
     /// Metadata passthrough for `BenchRecord.nonce` (synthetic problems have
-    /// no real nonce). A 64-hex value also seeds `--weights`.
+    /// no real nonce). A 64-hex value also seeds `--precision`.
     #[arg(long)]
     pub nonce: Option<String>,
     /// Metadata passthrough for `BenchRecord.topology_hash`.
@@ -399,6 +418,8 @@ fn check_degree(degree: u64, nodes: u64) -> Result<(), BenchError> {
 struct BenchModel {
     /// The graph to bench.
     graph: IsingGraph,
+    /// Constant energy term from a model file, zero for generated graphs.
+    offset: f64,
     /// Passed through into the emitted [`BenchRecord::nonce`].
     nonce: String,
     /// Passed through into the emitted [`BenchRecord::topology_hash`].
@@ -410,6 +431,7 @@ impl BenchModel {
     /// metadata passthrough (synthetic problems have no real identity).
     fn synthetic(args: &RunArgs) -> Self {
         Self {
+            offset: 0.0,
             graph: circulant_graph(
                 args.nodes,
                 args.degree,
@@ -425,16 +447,23 @@ impl BenchModel {
     }
 }
 
-/// Build the bench grid's models: a `--source` corpus (redrawn per nonce
-/// against `--topology`) when given, else the single synthetic circulant problem.
+/// Build the bench grid from a model file, a corpus redrawn per nonce against
+/// `--topology`, or the single synthetic circulant problem.
 fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
-    if args.weights == 0 {
-        return Err(BenchError::Args("--weights must be at least 1".into()));
+    if let Some(path) = &args.model {
+        let model =
+            crate::model_file::read_model(path).map_err(|e| BenchError::Io(e.to_string()))?;
+        return Ok(vec![BenchModel {
+            graph: model.graph,
+            offset: model.offset,
+            nonce: args.nonce.clone().unwrap_or_else(|| "0x0".into()),
+            topology_hash: args.topology_hash.clone().unwrap_or_else(|| "0x0".into()),
+        }]);
     }
     let Some(source) = &args.source else {
         check_degree(args.degree, args.nodes)?;
         let mut model = BenchModel::synthetic(args);
-        reweight_model(&mut model, args.weights);
+        reweight_model(&mut model, args.precision.unwrap_or(BenchPrecision::Binary));
         return Ok(vec![model]);
     };
     // clap's `requires` makes this infallible from the CLI, but stay
@@ -451,11 +480,12 @@ fn load_models(args: &RunArgs) -> Result<Vec<BenchModel>, BenchError> {
         .into_iter()
         .map(|(record, graph)| {
             let mut model = BenchModel {
+                offset: 0.0,
                 graph,
                 nonce: record.nonce,
                 topology_hash: record.topology_hash,
             };
-            reweight_model(&mut model, args.weights);
+            reweight_model(&mut model, args.precision.unwrap_or(BenchPrecision::Binary));
             model
         })
         .collect())
@@ -481,23 +511,36 @@ fn nonce_seed(nonce: &str) -> [u8; 32] {
 
 /// Use the corpus nonce as the `ChaCha8` seed, or the default all-zero seed
 /// for a synthetic model without a 64-hex nonce. Draw fields before couplings,
-/// using the protocol draw's word-modulo-range convention.
-fn reweight_model(model: &mut BenchModel, weights: u32) {
-    if weights == 1 {
-        return;
-    }
-    let seed = nonce_seed(&model.nonce);
-    let mut rng = ChaCha8Rng::from_seed(seed);
-    let field_range = 2 * u64::from(weights) + 1;
-    for h in &mut model.graph.h {
-        let mut word = u64::from(rng.next_u32());
-        if field_range > u64::from(u32::MAX) {
-            word |= u64::from(rng.next_u32()) << 32;
+/// using word-modulo-range integer draws or Box-Muller normal real draws.
+fn reweight_model(model: &mut BenchModel, precision: BenchPrecision) {
+    let weights = match precision {
+        BenchPrecision::Binary => return,
+        BenchPrecision::Int8 => 127,
+        BenchPrecision::Int32 => 1000,
+        BenchPrecision::Float => {
+            let mut rng = ChaCha8Rng::from_seed(nonce_seed(&model.nonce));
+            // Box-Muller uses open-interval uniforms, so ln never sees zero.
+            let mut normal = || {
+                let u = (f64::from(rng.next_u32()) + 0.5) / 4_294_967_296.0;
+                let v = (f64::from(rng.next_u32()) + 0.5) / 4_294_967_296.0;
+                (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+            };
+            for h in &mut model.graph.h {
+                *h = normal();
+            }
+            for j in &mut model.graph.j {
+                *j = if *j == 0.0 {
+                    0.0
+                } else {
+                    j.signum() * normal().abs()
+                };
+            }
+            return;
         }
-        // The draw is at most 2*u32::MAX, which is exact in f64.
-        #[allow(clippy::cast_precision_loss)]
-        let draw = (word % field_range) as f64;
-        *h = draw - f64::from(weights);
+    };
+    let mut rng = ChaCha8Rng::from_seed(nonce_seed(&model.nonce));
+    for h in &mut model.graph.h {
+        *h = f64::from(rng.next_u32() % (2 * weights + 1)) - f64::from(weights);
     }
     for j in &mut model.graph.j {
         let magnitude = f64::from(rng.next_u32() % weights + 1);
@@ -507,6 +550,12 @@ fn reweight_model(model: &mut BenchModel, weights: u32) {
             j.signum() * magnitude
         };
     }
+}
+
+fn uses_real(args: &RunArgs) -> bool {
+    args.model.is_some()
+        || args.precision == Some(BenchPrecision::Float)
+        || args.msa_path == Some(MsaPath::F32)
 }
 
 fn backend_name(kernel: KernelKind) -> &'static str {
@@ -635,6 +684,11 @@ fn run_run(
             "--msa-path requires the MSA kernel".into(),
         ));
     }
+    if uses_real(args) && kernel != KernelKind::Msa {
+        return Err(BenchError::Args(
+            "real coefficients require the MSA kernel".into(),
+        ));
+    }
     if args.msa_shared_spins.is_some() && kernel != KernelKind::Msa {
         return Err(BenchError::Args(
             "--msa-shared-spins requires the MSA kernel".into(),
@@ -757,8 +811,13 @@ fn run_model(
         ..SampleParams::default()
     };
     let msa_lane = args.msa_path.and_then(MsaPath::lane);
-    let plan = bench_plan(ctx.device, graph, ctx.kernel, msa_lane)
-        .map_err(|e| BenchError::Device(e.to_string()))?;
+    let real = uses_real(args);
+    let plan = if real {
+        float_plan(graph)
+    } else {
+        bench_plan(ctx.device, graph, ctx.kernel, msa_lane)
+    }
+    .map_err(|e| BenchError::Device(e.to_string()))?;
     let (beta, sweeps_per_beta) = crate::streaming::build_beta_schedule(
         graph,
         params.num_sweeps,
@@ -779,8 +838,21 @@ fn run_model(
     for i in 0..(args.warmup + args.repeats) {
         take_cell(&ctx.totals); // clear stale totals before the measured call
         let model_start = Instant::now();
-        let (reads, dev) = bench_many(ctx.device, graph, &params, ctx.kernel, msa_lane, ctx.nonces)
-            .map_err(|e| BenchError::Device(e.to_string()))?;
+        let (best, dev) = if real {
+            let (reads, dev) = bench_many_real(ctx.device, graph, &params, ctx.nonces)
+                .map_err(|e| BenchError::Device(e.to_string()))?;
+            let best = reads
+                .iter()
+                .map(|r| r.energy + model.offset)
+                .reduce(f64::min)
+                .map(|energy| Metric::new("best_energy", energy, "energy", Source::CounterDerived));
+            (best, dev)
+        } else {
+            let (reads, dev) =
+                bench_many(ctx.device, graph, &params, ctx.kernel, msa_lane, ctx.nonces)
+                    .map_err(|e| BenchError::Device(e.to_string()))?;
+            (best_energy_metric(&reads), dev)
+        };
         let model_total_ns = u64::try_from(model_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let spans = take_cell(&ctx.totals);
         if i < args.warmup {
@@ -802,7 +874,7 @@ fn run_model(
             &host,
             model_total_ns,
         );
-        record.metrics.extend(best_energy_metric(&reads));
+        record.metrics.extend(best);
         #[allow(clippy::cast_precision_loss)] // counts far below 2^53
         record.metrics.push(Metric::new(
             "concurrent_models",
@@ -971,131 +1043,137 @@ mod tests {
     }
 
     #[test]
-    fn weights_one_preserves_synthetic_graph() {
+    fn precision_cli_accepts_all_tiers_and_replaces_weights() {
         use clap::Parser as _;
-        let args = RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "1"])
-            .unwrap()
-            .args;
-        let models = super::load_models(&args).unwrap();
-        let original = super::circulant_graph(args.nodes, 2, None);
-        assert_eq!(models[0].graph.h, original.h);
-        assert_eq!(models[0].graph.j, original.j);
-        assert_eq!(models[0].graph.edges, original.edges);
+        for tier in ["binary", "int8", "int32", "float"] {
+            assert!(
+                RunCli::try_parse_from(["bench", "--out", "unused", "--precision", tier]).is_ok(),
+                "{tier}"
+            );
+        }
+        assert!(RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "1000"]).is_err());
     }
 
     #[test]
-    fn weights_are_bounded_and_deterministic_per_nonce() {
+    fn model_cli_conflicts_with_graph_inputs() {
         use clap::Parser as _;
+        assert!(
+            RunCli::try_parse_from(["bench", "--out", "unused", "--model", "x.qmodel"]).is_ok()
+        );
+        for flags in [
+            vec!["--source", "s", "--topology", "t"],
+            vec!["--degree", "2"],
+            vec!["--shuffle"],
+            vec!["--precision", "binary"],
+        ] {
+            let mut argv = vec!["bench", "--out", "unused", "--model", "x.qmodel"];
+            argv.extend(flags);
+            assert!(RunCli::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn precision_binary_preserves_synthetic_graph() {
+        use clap::Parser as _;
+        for flags in [vec![], vec!["--precision", "binary"]] {
+            let mut argv = vec!["bench", "--out", "unused"];
+            argv.extend(flags);
+            let parsed = RunCli::try_parse_from(argv).unwrap().args;
+            let model = super::load_models(&parsed).unwrap().remove(0);
+            let original = super::circulant_graph(parsed.nodes, 2, None);
+            assert_eq!(model.graph.h, original.h);
+            assert_eq!(model.graph.j, original.j);
+            assert_eq!(model.graph.edges, original.edges);
+        }
+    }
+
+    #[test]
+    fn precision_draws_are_bounded_and_deterministic_per_nonce() {
+        use clap::Parser as _;
+        for (tier, bound) in [("int8", 127.0), ("int32", 1000.0), ("float", 10.0)] {
+            let args = RunCli::try_parse_from(["bench", "--out", "unused", "--precision", tier])
+                .unwrap()
+                .args;
+            let a = super::load_models(&args).unwrap().remove(0).graph;
+            let b = super::load_models(&args).unwrap().remove(0).graph;
+            assert_eq!(a.h, b.h);
+            assert_eq!(a.j, b.j);
+            assert!(a.h.iter().all(|h| h.abs() <= bound));
+            assert!(a.h.iter().any(|h| *h < 0.0));
+            assert!(a.h.iter().any(|h| *h > 0.0));
+            assert!(a.j.iter().all(|j| *j > 0.0 && *j <= bound));
+            if tier == "float" {
+                assert!(a
+                    .h
+                    .iter()
+                    .any(|&v| crate::coefficients::to_milli(v).is_none()));
+            } else {
+                assert!(a.h.iter().chain(&a.j).all(|v| v.fract() == 0.0));
+            }
+            let mut other = args;
+            other.nonce = Some("b4".repeat(32));
+            assert_ne!(a.h, super::load_models(&other).unwrap().remove(0).graph.h);
+        }
+    }
+
+    #[test]
+    fn precision_preserves_coupling_signs_and_zeros() {
+        use super::{BenchModel, BenchPrecision};
+        for tier in [
+            BenchPrecision::Int8,
+            BenchPrecision::Int32,
+            BenchPrecision::Float,
+        ] {
+            let mut model = BenchModel {
+                graph: crate::IsingGraph::new(
+                    vec![0.0; 4],
+                    vec![1.0, -1.0, 0.0],
+                    vec![(0, 1), (1, 2), (2, 3)],
+                ),
+                offset: 0.0,
+                nonce: "0x0".into(),
+                topology_hash: "0x0".into(),
+            };
+            super::reweight_model(&mut model, tier);
+            assert!(model.graph.j[0] > 0.0);
+            assert!(model.graph.j[1] < 0.0);
+            assert_eq!(model.graph.j[2].to_bits(), 0.0_f64.to_bits());
+        }
+    }
+
+    #[test]
+    fn model_file_load_keeps_real_coefficients_and_offset() {
+        use clap::Parser as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("real.qmodel");
+        crate::model_file::write_model(
+            &path,
+            &crate::model_file::RealModel {
+                graph: crate::IsingGraph::new(
+                    vec![std::f64::consts::PI, 0.0],
+                    vec![-0.125],
+                    vec![(0, 1)],
+                ),
+                offset: 12.5,
+            },
+        )
+        .unwrap();
         let args = RunCli::try_parse_from([
             "bench",
             "--out",
             "unused",
-            "--weights",
-            "5",
-            "--nonce",
-            "b4179357b751254ed0e68b5e969dcb50e73fd8c56be192b79d286ff2722d6a72",
+            "--model",
+            path.to_str().unwrap(),
         ])
         .unwrap()
         .args;
-        let first = super::load_models(&args).unwrap().remove(0).graph;
-        let second = super::load_models(&args).unwrap().remove(0).graph;
-        assert_eq!(first.h, second.h);
-        assert_eq!(first.j, second.j);
-        assert_eq!(first.edges, second.edges);
-        assert!(first
-            .h
-            .iter()
-            .all(|h| (-5.0..=5.0).contains(h) && h.fract() == 0.0));
-        assert!(first
-            .j
-            .iter()
-            .all(|j| (1.0..=5.0).contains(j) && j.fract() == 0.0));
-        assert!(first.h.iter().any(|h| *h != 0.0));
-        assert!(first.j.iter().any(|j| *j > 1.0));
-        let mut other = args;
-        other.nonce = Some("00".repeat(32));
-        let other = super::load_models(&other).unwrap().remove(0).graph;
-        assert_ne!(first.h, other.h);
-    }
-
-    #[test]
-    fn weights_cli_defaults_and_rejects_zero() {
-        use clap::Parser as _;
-        assert!(RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "0"]).is_err());
-        let default = RunCli::try_parse_from(["bench", "--out", "unused"])
-            .unwrap()
-            .args;
-        let explicit = RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "1"])
-            .unwrap()
-            .args;
-        assert_eq!(default.weights, 1);
-        let mut invalid = default.clone();
-        invalid.weights = 0;
-        assert!(matches!(
-            super::load_models(&invalid),
-            Err(super::BenchError::Args(_))
-        ));
+        let models = super::load_models(&args).unwrap();
         assert_eq!(
-            super::load_models(&default).unwrap()[0].graph.h,
-            super::load_models(&explicit).unwrap()[0].graph.h
+            models[0].graph.h[0].to_bits(),
+            std::f64::consts::PI.to_bits()
         );
-    }
-
-    #[test]
-    fn weights_large_range_draws_fields_of_both_signs() {
-        use clap::Parser as _;
-        let args = RunCli::try_parse_from(["bench", "--out", "unused", "--weights", "4294967295"])
-            .unwrap()
-            .args;
-        let graph = super::load_models(&args).unwrap().remove(0).graph;
-        assert!(graph.h.iter().any(|h| *h > 0.0));
-        assert!(graph.h.iter().any(|h| *h < 0.0));
-        assert!(graph.h.iter().all(|h| h.abs() <= f64::from(u32::MAX)));
-    }
-
-    #[test]
-    fn weights_preserve_corpus_signs_and_identity() {
-        use clap::Parser as _;
-        let dir = std::env::temp_dir().join(format!("bench-weights-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let topology = dir.join("topology.json");
-        let source = dir.join("corpus.jsonl");
-        std::fs::write(&topology, r#"{"nodes":[0,1,2,3],"edges":[[0,1],[1,2],[2,3],[0,3]],"allowed_h_milli":[-1000,0,1000],"allowed_j_milli":[-1000,1000]}"#).unwrap();
-        std::fs::write(
-            &source,
-            "{\"nonce\":\"b4179357b751254ed0e68b5e969dcb50e73fd8c56be192b79d286ff2722d6a72\"}\n",
-        )
-        .unwrap();
-        let mut args = RunCli::try_parse_from([
-            "bench",
-            "--out",
-            "unused",
-            "--source",
-            source.to_str().unwrap(),
-            "--topology",
-            topology.to_str().unwrap(),
-            "--weights",
-            "1",
-        ])
-        .unwrap()
-        .args;
-        let original = super::load_models(&args).unwrap().remove(0);
-        assert_eq!(original.graph.h, vec![1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(original.graph.j, vec![1.0, -1.0, -1.0, 1.0]);
-        args.weights = 5;
-        let weighted = super::load_models(&args).unwrap().remove(0);
-        assert_eq!(weighted.graph.edges, original.graph.edges);
-        assert_eq!(weighted.nonce, original.nonce);
-        assert_eq!(weighted.topology_hash, original.topology_hash);
-        for (&j, &original_j) in weighted.graph.j.iter().zip(&original.graph.j) {
-            assert_eq!(j.is_sign_positive(), original_j.is_sign_positive());
-            assert!((1.0..=5.0).contains(&j.abs()));
-        }
-        assert!(weighted.graph.h.iter().all(|h| (-5.0..=5.0).contains(h)));
-        let repeated = super::load_models(&args).unwrap().remove(0);
-        assert_eq!(weighted.graph.h, repeated.graph.h);
-        assert_eq!(weighted.graph.j, repeated.graph.j);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(models[0].offset.to_bits(), 12.5_f64.to_bits());
+        assert!(super::uses_real(&args));
     }
 
     #[test]
@@ -1118,13 +1196,13 @@ mod tests {
     #[test]
     fn msa_path_cli_parses_all_lanes() {
         use clap::Parser as _;
-        for path in ["auto", "weighted-i32", "weighted-f32"] {
+        for path in ["auto", "weighted-i32", "weighted-f32", "f32"] {
             let parsed = RunCli::try_parse_from(["bench", "--out", "unused", "--msa-path", path]);
             assert!(parsed.is_ok(), "{path}: {parsed:?}");
             let selected = parsed.unwrap().args.msa_path.unwrap();
             let expected = match path {
                 "weighted-i32" => Some(crate::cuda_device::MsaLane::I32),
-                "weighted-f32" => Some(crate::cuda_device::MsaLane::F32),
+                "weighted-f32" | "f32" => Some(crate::cuda_device::MsaLane::F32),
                 _ => None,
             };
             assert_eq!(selected.lane(), expected);
@@ -1144,7 +1222,7 @@ mod tests {
     #[test]
     fn msa_path_flag_rejected_for_other_kernels() {
         use clap::Parser as _;
-        for path in ["auto", "weighted-i32", "weighted-f32"] {
+        for path in ["auto", "weighted-i32", "weighted-f32", "f32"] {
             let args = RunCli::try_parse_from(["bench", "--out", "unused", "--msa-path", path])
                 .unwrap()
                 .args;

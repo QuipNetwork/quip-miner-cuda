@@ -1,14 +1,17 @@
 //! GPU allocation measurements for the MSA capacity estimate.
 
 use cudarc::driver::{sys::CUdevice_attribute, CudaContext};
-use quip_solver_core::{CancelToken, StreamJob, StreamOutcome};
 use quip_solver_cuda::capacity::{msa_footprint, DeviceLimits, ModelShape, MsaStorage, Precision};
 use quip_solver_cuda::coefficients;
 use quip_solver_cuda::cuda_device::CudaDevice;
-use quip_solver_cuda::nvml_gov::UtilGovernor;
 use quip_solver_cuda::sampler::{sample_ising, SampleError};
-use quip_solver_cuda::streaming::{run_stream, stream_width};
+use quip_solver_cuda::streaming::{bench_many, bench_many_real, stream_width};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tracing_subscriber::prelude::*;
 
 fn circulant(nodes: usize, degree: usize, precision: Precision) -> IsingGraph {
     let mut edges = Vec::with_capacity(nodes * degree / 2);
@@ -18,12 +21,12 @@ fn circulant(nodes: usize, degree: usize, precision: Precision) -> IsingGraph {
         }
     }
     let j = (0..edges.len())
-        .map(|edge| {
-            if precision == Precision::Int32 && edge % 2 == 0 {
-                1.001
-            } else {
-                -1.0
-            }
+        .map(|edge| match precision {
+            Precision::Int32 if edge % 2 == 0 => 1.001,
+            Precision::Int8 if edge % 2 == 0 => 0.016,
+            Precision::Int8 => -0.992,
+            Precision::Float32 => -std::f64::consts::SQRT_2,
+            Precision::Binary | Precision::Int32 => -1.0,
         })
         .collect();
     IsingGraph::new(vec![0.0; nodes], j, edges)
@@ -78,23 +81,49 @@ fn oversized_model_refused_before_allocation() {
     );
 }
 
+// Observe live allocations at the existing launch span, before the kernel runs.
+// This keeps real models out of the mining stream, which must refuse off-grid data.
+struct AllocationAtLaunch {
+    ctx: Arc<CudaContext>,
+    free: Arc<AtomicUsize>,
+}
+
+impl<S> tracing_subscriber::Layer<S> for AllocationAtLaunch
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_enter(&self, id: &tracing::span::Id, context: tracing_subscriber::layer::Context<'_, S>) {
+        if context.span(id).unwrap().metadata().name() == "launch" {
+            let (free, _) = self.ctx.mem_get_info().expect("free with session alive");
+            self.free.store(free, Ordering::SeqCst);
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn footprint_matches_measured_allocation() {
     let nodes = 50_000;
     let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, nodes).expect("MSA device");
-    // cudarc retains the same primary context on the session's device.
     let ctx = CudaContext::new(device.device_index).expect("session device context");
     let attribute = |key| usize::try_from(ctx.attribute(key).expect("device attribute")).unwrap();
-    let gov = UtilGovernor::start(&device.pci_bus_id, 100, false);
     for degree in [20, 60] {
-        for precision in [Precision::Binary, Precision::Int32] {
+        for precision in [
+            Precision::Binary,
+            Precision::Int8,
+            Precision::Int32,
+            Precision::Float32,
+        ] {
             let graph = circulant(nodes, degree, precision);
-            let plan = coefficients::plan(KernelKind::Msa, &graph, device.max_nodes).unwrap();
-            assert_eq!(
-                Precision::from_plan(plan, precision == Precision::Binary),
-                precision
-            );
+            if precision == Precision::Float32 {
+                assert!(coefficients::plan(KernelKind::Msa, &graph, device.max_nodes).is_err());
+            } else {
+                let plan = coefficients::plan(KernelKind::Msa, &graph, device.max_nodes).unwrap();
+                assert_eq!(
+                    Precision::from_plan(plan, precision == Precision::Binary),
+                    precision
+                );
+            }
             ctx.synchronize().unwrap();
             let (free_before, _) = ctx.mem_get_info().expect("free before session");
             let limits = DeviceLimits {
@@ -128,44 +157,29 @@ fn footprint_matches_measured_allocation() {
                 betas,
                 &limits,
             );
-            assert_eq!(footprint.instances, stream_width(&device, KernelKind::Msa));
-            let (job_tx, job_rx) = tokio::sync::mpsc::channel(1);
-            let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1);
-            job_tx
-                .blocking_send(StreamJob {
-                    job_id: vec![0],
-                    graph,
-                    params,
-                    watermark: None,
-                })
-                .unwrap();
-            let measured = std::thread::scope(|scope| {
-                // run_stream allocates stream_width nonces even for one active job.
-                let driver = scope.spawn(|| {
-                    run_stream(
-                        &device,
-                        KernelKind::Msa,
-                        job_rx,
-                        out_tx,
-                        CancelToken::default(),
-                        &gov,
-                    );
-                });
-                let result = out_rx.blocking_recv().expect("completed model");
-                let (free_after, _) = ctx.mem_get_info().expect("free with session alive");
-                // Keeping the input open holds the session until this measurement.
-                drop(job_tx);
-                drop(out_rx);
-                driver.join().expect("session teardown");
-                assert!(
-                    matches!(result.outcome, StreamOutcome::Completed(Ok(_))),
-                    "session must complete successfully"
-                );
-                free_before
-                    .checked_sub(free_after)
-                    .expect("session consumes memory")
-            });
-            // Drain queued frees before the next free-memory measurement.
+            let width = stream_width(&device, KernelKind::Msa);
+            assert_eq!(footprint.instances, width);
+            let free = Arc::new(AtomicUsize::new(0));
+            let observer = AllocationAtLaunch {
+                ctx: Arc::clone(&ctx),
+                free: Arc::clone(&free),
+            };
+            tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(observer),
+                || {
+                    if precision == Precision::Float32 {
+                        bench_many_real(&device, &graph, &params, width).expect("real session");
+                    } else {
+                        bench_many(&device, &graph, &params, KernelKind::Msa, None, width)
+                            .expect("exact session");
+                    }
+                },
+            );
+            let free_after = free.load(Ordering::SeqCst);
+            assert_ne!(free_after, 0, "launch observer must run");
+            let measured = free_before
+                .checked_sub(free_after)
+                .expect("session consumes memory");
             ctx.synchronize().unwrap();
             eprintln!("degree={degree} precision={precision:?} betas={betas} instances={} measured={measured} footprint={}", footprint.instances, footprint.total());
             assert!(measured > 0);

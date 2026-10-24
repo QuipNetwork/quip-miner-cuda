@@ -90,8 +90,9 @@ impl Precision {
     pub fn from_plan(plan: CoefficientPlan, unit: bool) -> Self {
         match plan.path {
             CoefficientPath::Int8 if unit => Self::Binary,
-            CoefficientPath::Int8 => Self::Int8,
+            CoefficientPath::Int8 | CoefficientPath::WeightedInt8 => Self::Int8,
             CoefficientPath::Wide => Self::Int32,
+            CoefficientPath::Float32 => Self::Float32,
         }
     }
 }
@@ -691,6 +692,23 @@ mod tests {
                 ),
                 Precision::Int32
             );
+        }
+        for (path, expected) in [
+            (CoefficientPath::WeightedInt8, Precision::Int8),
+            (CoefficientPath::Float32, Precision::Float32),
+        ] {
+            for unit in [false, true] {
+                assert_eq!(
+                    Precision::from_plan(
+                        CoefficientPlan {
+                            path,
+                            scale_milli: 1000
+                        },
+                        unit
+                    ),
+                    expected
+                );
+            }
         }
         let plan = CoefficientPlan {
             path: CoefficientPath::Int8,

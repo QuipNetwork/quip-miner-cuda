@@ -397,7 +397,11 @@ fn assert_stream_mixes_paths_and_refusal(kind: KernelKind) {
     );
     assert_eq!(
         plan(kind, &wide, node_budget).unwrap().path,
-        CoefficientPath::Wide
+        if kind == KernelKind::Msa {
+            CoefficientPath::WeightedInt8
+        } else {
+            CoefficientPath::Wide
+        }
     );
 
     let mut graphs = vec![unit.clone()];
