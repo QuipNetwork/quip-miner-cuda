@@ -41,6 +41,7 @@
 //!     --out out/cuda-sa_n512_s1024.folded.jsonl
 //! ```
 
+use crate::capacity::{default_nodes, msa_max_nodes, MSA_MAX_READS};
 use crate::corpus;
 use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
@@ -589,6 +590,7 @@ struct BenchContext<'a> {
 }
 
 /// `bench run` / `bench fold` entry point the binaries dispatch to.
+/// An absent node cap uses the MSA device budget or the other kernels' defaults.
 ///
 /// # Errors
 ///
@@ -599,7 +601,7 @@ struct BenchContext<'a> {
 pub fn run_bench(
     device_index: usize,
     kernel: KernelKind,
-    max_nodes: usize,
+    max_nodes: Option<usize>,
     action: &BenchAction,
 ) -> Result<(), BenchError> {
     match action {
@@ -625,7 +627,7 @@ fn check_reads(kernel: KernelKind, reads: u64) -> Result<(), BenchError> {
 fn run_run(
     device_index: usize,
     kernel: KernelKind,
-    max_nodes: usize,
+    max_nodes: Option<usize>,
     args: &RunArgs,
 ) -> Result<(), BenchError> {
     if args.msa_path.is_some() && kernel != KernelKind::Msa {
@@ -664,8 +666,17 @@ fn run_run(
         // Open for the kernel actually being benched, at the requested
         // capacity: the defaulting `open` would compile SA at 5000 and reject
         // any larger graph regardless of which binary is running.
-        let mut device = CudaDevice::open_with_nodes(device_index, kernel, max_nodes)
-            .map_err(|e| BenchError::Device(e.to_string()))?;
+        let mut device = CudaDevice::open_with_nodes(
+            device_index,
+            kernel,
+            max_nodes.unwrap_or_else(|| default_nodes(kernel)),
+        )
+        .map_err(|e| BenchError::Device(e.to_string()))?;
+        if kernel == KernelKind::Msa && max_nodes.is_none() {
+            // MSA has no compiled node array. Use this open's memory snapshot,
+            // as the miner does when no lower cap was requested.
+            device.max_nodes = msa_max_nodes(&device.limits, MSA_MAX_READS);
+        }
         device.msa_shared_spins_cap = args.msa_shared_spins;
         check_reads(kernel, args.reads)?;
         let width = stream_width(&device, kernel);
@@ -1141,7 +1152,7 @@ mod tests {
                 let err = super::run_bench(
                     usize::MAX,
                     kernel,
-                    0,
+                    Some(0),
                     &super::BenchAction::Run(args.clone()),
                 )
                 .unwrap_err();

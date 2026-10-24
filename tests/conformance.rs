@@ -201,16 +201,7 @@ fn capabilities_and_version_headless() {
 #[serial]
 #[ignore = "requires CUDA GPU"]
 fn msa_capabilities_report_probed_device_limits() {
-    use quip_solver_cuda::capacity::{
-        msa_max_couplers, msa_max_nodes, MSA_DEFAULT_NODES, MSA_MAX_READS,
-    };
-    use quip_solver_cuda::cuda_device::CudaDevice;
-    use quip_solver_cuda::KernelKind;
-
     ensure_built(&["quip-cuda-msa"]);
-    let limits = CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES)
-        .expect("probe MSA device")
-        .limits;
     let out = Command::new(profile_bin("quip-cuda-msa"))
         .arg("--capabilities")
         .output()
@@ -221,9 +212,17 @@ fn msa_capabilities_report_probed_device_limits() {
         String::from_utf8_lossy(&out.stderr)
     );
     let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(caps["maxNodes"], msa_max_nodes(&limits, MSA_MAX_READS));
-    assert_eq!(caps["maxEdges"], msa_max_couplers(&limits, MSA_MAX_READS));
     assert_eq!(caps["maxDegree"], 62);
+    let nodes = caps["maxNodes"].as_u64().unwrap();
+    let edges = caps["maxEdges"].as_u64().unwrap();
+    let degree = caps["maxDegree"].as_u64().unwrap();
+    assert!(nodes > 0 && edges > 0, "{caps}");
+    // Both axes come from one memory snapshot. The smallest degree-bounded
+    // graph at the edge limit must fit within the uncoupled node limit.
+    assert!(
+        (edges * 2).div_ceil(degree).max(degree + 1) <= nodes,
+        "{caps}"
+    );
     assert_eq!(caps["maxLocalFieldMilli"], 16_777_215);
     assert_eq!(caps["exactResolutionMilli"], 1);
     assert!(caps["features"]
@@ -239,6 +238,53 @@ fn msa_capabilities_report_probed_device_limits() {
     assert!(out.status.success());
     let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(caps["maxNodes"], 8192);
+}
+
+/// An absent bench cap uses the device budget, while explicit caps still apply.
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU"]
+fn msa_bench_without_max_nodes_uses_device_limit() {
+    ensure_built(&["quip-cuda-msa"]);
+    for cap in [None, Some("5000"), Some("6000")] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new(profile_bin("quip-cuda-msa"));
+        if let Some(cap) = cap {
+            command.args(["--max-nodes", cap]);
+        }
+        let out = command
+            .args([
+                "bench",
+                "run",
+                "--nodes",
+                "6000",
+                "--reads",
+                "8",
+                "--sweeps",
+                "4",
+                "--warmup",
+                "0",
+                "--repeats",
+                "1",
+                "--out",
+            ])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if cap == Some("5000") {
+            assert!(!out.status.success(), "explicit cap must reject 6000 nodes");
+            assert!(
+                stderr.contains("6000") && stderr.contains("5000"),
+                "{stderr}"
+            );
+        } else {
+            assert!(out.status.success(), "cap {cap:?}: {stderr}");
+            let records = std::fs::read_to_string(dir.path().join("cuda-msa_n6000_s4.jsonl"))
+                .expect("bench record above the default node floor");
+            assert_eq!(records.lines().count(), 1);
+        }
+    }
 }
 
 /// `--check` opens the GPU and compiles kernels.

@@ -55,12 +55,7 @@ enum Command {
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
     if let Some(Command::Bench(action)) = &cli.command {
-        return match run_bench(
-            cli.device,
-            KernelKind::Msa,
-            cli.max_nodes.unwrap_or(MSA_DEFAULT_NODES),
-            action,
-        ) {
+        return match run_bench(cli.device, KernelKind::Msa, cli.max_nodes, action) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("bench failed: {e}");

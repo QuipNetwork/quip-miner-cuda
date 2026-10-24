@@ -407,14 +407,15 @@ pub fn msa_spill_words(nodes: usize, shared_spins: usize, words: usize, nonces: 
 /// schedules still pass through the per-model footprint check.
 #[must_use]
 pub fn msa_max_nodes(limits: &DeviceLimits, reads: usize) -> usize {
-    // `msa.cu` uses int for N * words, N + 7 and the initialization loop
-    // increment. Leave room for the final block-sized loop increment.
+    // `msa.cu` uses int for N * words and the final block-sized loop
+    // increment. Its var + MSA_ROW_MASK also needs 8191 nodes of headroom,
+    // which covers N + 7, sample packing and the colour-loop increment.
     let words = reads.max(1).div_ceil(MSA_LANES).checked_next_power_of_two();
     let Some(words) = words else { return 0 };
     let ceiling = (i32::MAX as usize - MSA_THREADS_PER_NONCE as usize)
         .checked_div(words)
         .unwrap_or(0)
-        .min(i32::MAX as usize - 7);
+        .min(i32::MAX as usize - 8191);
     msa_max_fitting(limits, reads, ceiling, |nodes| ModelShape {
         nodes,
         couplers: 0,
@@ -1147,13 +1148,32 @@ mod tests {
             for reads in [64, 128] {
                 let nodes = msa_max_nodes(&limits, reads);
                 let couplers = msa_max_couplers(&limits, reads);
-                for value in [
-                    nodes,
-                    nodes.div_ceil(8),
-                    nodes * reads.div_ceil(64),
-                    couplers * 2,
+                let words = reads.div_ceil(MSA_LANES);
+                let threads = MSA_THREADS_PER_NONCE as usize;
+                let var = nodes - 1;
+                let packed_size = nodes.div_ceil(8);
+                // Worst-case intermediates from both builds of msa.cu,
+                // including the final loop increments and padded sample byte.
+                for (expression, value) in [
+                    ("N", nodes),
+                    ("N * words", nodes * words),
+                    ("N + 7", nodes + 7),
+                    ("var * words + w", var * words + words - 1),
+                    ("i + blockDim.x", nodes * words - 1 + threads),
+                    ("k + gstride", var + threads / words),
+                    ("start + k", var),
+                    ("var + 1", var + 1),
+                    ("var + off", var + 8191),
+                    ("++b", packed_size),
+                    ("b * 8 + bit", (packed_size - 1) * 8 + 7),
+                    ("nnz", couplers * 2),
+                    ("base + MSA_CHUNK", couplers * 2 + 20),
+                    ("base + q / pstart + q", couplers * 2 + 19),
                 ] {
-                    assert!(i32::try_from(value).is_ok(), "kernel dimension {value}");
+                    assert!(
+                        i32::try_from(value).is_ok(),
+                        "{expression} = {value} exceeds i32 at {nodes} nodes and {reads} reads"
+                    );
                 }
             }
         }
