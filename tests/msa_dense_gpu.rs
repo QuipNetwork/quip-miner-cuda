@@ -1,9 +1,10 @@
-//! Dense Binary MSA correctness and cancellation on a real GPU.
+//! Dense MSA correctness and cancellation on a real GPU.
 
 use quip_solver_core::{CancelToken, StreamJob, StreamOutcome, StreamResult};
+use quip_solver_cuda::coefficients::{self, CoefficientPath};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::nvml_gov::UtilGovernor;
-use quip_solver_cuda::streaming::{run_stream, sample_one};
+use quip_solver_cuda::streaming::{run_stream, sample_one, sample_one_real};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 use serial_test::serial;
 use std::time::{Duration, Instant};
@@ -50,9 +51,9 @@ fn ground_energy(graph: &IsingGraph) -> i64 {
     let mut best_spins = spins.clone();
     for step in 1usize..1 << n {
         let node = step.trailing_zeros() as usize;
-        let mut field = 0i64;
+        let mut field = coefficients::to_milli(graph.h[node]).unwrap();
         for (&(u, v), &j) in graph.edges.iter().zip(&graph.j) {
-            let coef = if j > 0.0 { 1000 } else { -1000 };
+            let coef = coefficients::to_milli(j).unwrap();
             if u == node {
                 field += coef * i64::from(spins[v]);
             }
@@ -279,5 +280,195 @@ fn dense_masks_absent_edges_and_constant_diagonal() {
     for read in reads {
         assert_eq!(read.energy_milli, -42_000);
         assert_eq!(read.spins[0], -1);
+    }
+}
+
+fn random(seed: &mut u64) -> u64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    *seed
+}
+
+fn weighted_graph(n: usize, mut seed: u64, path: CoefficientPath) -> IsingGraph {
+    let mut coefficient = || match path {
+        CoefficientPath::WeightedInt8 => {
+            f64::from(i32::try_from(random(&mut seed) % 255).unwrap() - 127)
+        }
+        CoefficientPath::Wide => {
+            f64::from(i32::try_from(random(&mut seed) % 2001).unwrap() - 1000) / 1000.0
+        }
+        CoefficientPath::Float32 => {
+            // Box-Muller with open-interval uniforms, without a new dependency.
+            let u = (f64::from(u32::try_from(random(&mut seed) >> 32).unwrap()) + 0.5)
+                / 4_294_967_296.0;
+            let v = (f64::from(u32::try_from(random(&mut seed) >> 32).unwrap()) + 0.5)
+                / 4_294_967_296.0;
+            (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+        }
+        CoefficientPath::Int8 => unreachable!(),
+    };
+    let h = (0..n).map(|_| coefficient()).collect();
+    let mut edges = Vec::new();
+    let mut j = Vec::new();
+    for u in 0..n {
+        for v in u + 1..n {
+            edges.push((u, v));
+            j.push(coefficient());
+        }
+    }
+    let graph = IsingGraph::new(h, j, edges);
+    if path != CoefficientPath::Float32 {
+        assert_eq!(
+            coefficients::plan(KernelKind::Msa, &graph, n).unwrap().path,
+            path
+        );
+    }
+    graph
+}
+
+fn host_real_energy(spins: &[i8], graph: &IsingGraph) -> f64 {
+    let fields: f64 = graph
+        .h
+        .iter()
+        .zip(spins)
+        .map(|(h, s)| h * f64::from(*s))
+        .sum();
+    fields
+        + graph
+            .edges
+            .iter()
+            .zip(&graph.j)
+            .map(|(&(u, v), j)| j * f64::from(spins[u]) * f64::from(spins[v]))
+            .sum::<f64>()
+}
+
+fn ground_real_energy(graph: &IsingGraph) -> f64 {
+    let n = graph.num_nodes();
+    let mut spins = vec![1i8; n];
+    let mut energy = host_real_energy(&spins, graph);
+    let mut best = energy;
+    let mut best_spins = spins.clone();
+    for step in 1usize..1 << n {
+        let node = step.trailing_zeros() as usize;
+        let mut field = graph.h[node];
+        for (&(u, v), &j) in graph.edges.iter().zip(&graph.j) {
+            if u == node {
+                field += j * f64::from(spins[v]);
+            }
+            if v == node {
+                field += j * f64::from(spins[u]);
+            }
+        }
+        energy -= 2.0 * f64::from(spins[node]) * field;
+        spins[node] = -spins[node];
+        if energy < best {
+            best = energy;
+            best_spins.clone_from(&spins);
+        }
+    }
+    let scored = host_real_energy(&best_spins, graph);
+    assert!((scored - best).abs() < 1e-6);
+    scored
+}
+
+fn weighted_ground_states(path: CoefficientPath) {
+    let device = open();
+    for seed in 1..=10 {
+        let graph = weighted_graph(20, seed, path);
+        if path == CoefficientPath::Float32 {
+            let ground = ground_real_energy(&graph);
+            let reads = sample_one_real(&device, &graph, &params(4_096)).unwrap();
+            assert_eq!(reads.len(), 128);
+            let best = reads.iter().map(|r| r.energy).fold(f64::INFINITY, f64::min);
+            assert!(
+                (best - ground).abs() <= 1e-4 * ground.abs(),
+                "seed {seed}: {best} != {ground}"
+            );
+        } else {
+            let ground = ground_energy(&graph);
+            let reads = sample_one(&device, &graph, &params(4_096), KernelKind::Msa).unwrap();
+            assert_eq!(reads.len(), 128);
+            assert_eq!(
+                reads.iter().map(|r| r.energy_milli).min(),
+                Some(ground),
+                "seed {seed}"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_int8_finds_brute_force_ground_state() {
+    weighted_ground_states(CoefficientPath::WeightedInt8);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_i32_finds_brute_force_ground_state() {
+    weighted_ground_states(CoefficientPath::Wide);
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_f32_real_finds_brute_force_ground_state() {
+    weighted_ground_states(CoefficientPath::Float32);
+}
+
+fn check_weighted_energies(device: &CudaDevice, graph: &IsingGraph, path: CoefficientPath) {
+    if path == CoefficientPath::Float32 {
+        let reads = sample_one_real(device, graph, &params(64)).unwrap();
+        assert_eq!(reads.len(), 128);
+        for read in reads {
+            assert_eq!(read.spins.len(), graph.num_nodes());
+            assert!(read.spins.iter().all(|&s| s == -1 || s == 1));
+            assert!((read.energy - host_real_energy(&read.spins, graph)).abs() < 1e-8);
+        }
+    } else {
+        let reads = sample_one(device, graph, &params(64), KernelKind::Msa).unwrap();
+        assert_eq!(reads.len(), 128);
+        for read in reads {
+            assert_eq!(read.spins.len(), graph.num_nodes());
+            assert!(read.spins.iter().all(|&s| s == -1 || s == 1));
+            assert_eq!(
+                read.energy_milli,
+                quip_protocol::scoring::energy_milli(&read.spins, &graph.h, &graph.j, &graph.edges)
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_weighted_energies_match_host() {
+    let device = open();
+    for path in [
+        CoefficientPath::WeightedInt8,
+        CoefficientPath::Wide,
+        CoefficientPath::Float32,
+    ] {
+        check_weighted_energies(&device, &weighted_graph(500, 99, path), path);
+    }
+}
+
+#[test]
+#[serial]
+#[ignore = "requires a CUDA GPU"]
+fn dense_and_sparse_weighted_energies_match_host() {
+    let sparse = CudaDevice::open_with_nodes(0, KernelKind::Msa, 500).unwrap();
+    let dense = open();
+    for path in [
+        CoefficientPath::WeightedInt8,
+        CoefficientPath::Wide,
+        CoefficientPath::Float32,
+    ] {
+        let graph = weighted_graph(20, 99, path);
+        check_weighted_energies(&sparse, &graph, path);
+        check_weighted_energies(&dense, &graph, path);
     }
 }

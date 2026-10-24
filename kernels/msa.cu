@@ -795,7 +795,6 @@ extern "C" __global__ void cuda_msa_self_feeding(
     }
 }
 
-#ifndef QUIP_MSA_WEIGHTED
 // Dense Binary MSA: one 256-thread block per instance, three independent
 // row-major i8 coefficient matrices (one per slot). Keeping all three copies
 // preserves overlapped uploads and the sparse slot/control protocol. i8,
@@ -815,6 +814,10 @@ extern "C" __global__ void cuda_msa_self_feeding(
 // packed coefficient rows and four ballot words, far below Turing's budget.
 // RNG state depends only on seed, slot and replica. Initial spin words use
 // a separate counter hash so increasing N does not advance the update RNG.
+// Weighted builds keep the same matrix/spin layouts and slot protocol. All
+// threads load 256 coefficients at a time into shared memory, then replica
+// lanes sum signed coefficients in i32 or f32. Fixed-size tiles bound shared
+// memory independently of N. LaneTest preserves the sparse acceptance rules.
 extern "C" __global__ void cuda_msa_dense_self_feeding(
     const msa_coef_t* __restrict__ slot_J_vals,
     const msa_coef_t* __restrict__ slot_h_vals,
@@ -832,12 +835,22 @@ extern "C" __global__ void cuda_msa_dense_self_feeding(
     int words,
     u64* spin_state,
     unsigned int* replica_spins
+#ifdef QUIP_MSA_LANE_I32
+    , const long long* __restrict__ beta_fixed
+    , const int* __restrict__ delta_cut
+    , const long long* __restrict__ neglog_table
+#endif
 ) {
     extern __shared__ unsigned int dense_scratch[];
     const int node_words = (N + 31) / 32;
+#ifndef QUIP_MSA_WEIGHTED
     unsigned int* row_signs = dense_scratch;
     unsigned int* row_present = row_signs + node_words;
     unsigned int* ballots = row_present + node_words; // 4 entries
+#else
+    msa_coef_t* row = (msa_coef_t*)dense_scratch;
+    unsigned int* ballots = (unsigned int*)(row + 256); // 4 entries
+#endif
     __shared__ int s_active_slot;
     __shared__ int s_abort;
     const int tid = threadIdx.x;
@@ -897,12 +910,15 @@ extern "C" __global__ void cuda_msa_dense_self_feeding(
         }
         __syncthreads();
         for (int beta_idx = 0; beta_idx < num_betas && !s_abort; ++beta_idx) {
+#ifndef QUIP_MSA_LANE_I32
             const float beta = beta_schedule[beta_idx];
+#endif
             for (int sweep = 0; sweep < sweeps_per_beta && !s_abort; ++sweep) {
                 for (int node = 0; node < N; ++node) {
                     if (tid == 0) s_abort = nonce_ctrl[ctrl_base + CTRL_EXIT_NOW] == EXIT_ABORT;
                     __syncthreads();
                     if (s_abort) break;
+#ifndef QUIP_MSA_WEIGHTED
                     // Every warp votes, including padding lanes in the last
                     // tile, so each ballot has its complete participation mask.
                     for (int base = 0; base < N; base += blockDim.x) {
@@ -928,6 +944,37 @@ extern "C" __global__ void cuda_msa_dense_self_feeding(
                         // Always advance once per spin, even on downhill moves.
                         const float u = (float)((xs64(rng) >> 40) + 1ull) * (1.0f / 16777216.0f);
                         const bool flip = tid < num_reads && (delta <= 0 || u < __expf(-beta * (float)delta));
+#else
+                    msa_field_t field = h[node];
+                    for (int base = 0; base < N; base += 256) {
+                        const int j = base + tid;
+                        row[tid] = j < N && j != node ? J[(size_t)node * N + j] : 0;
+                        __syncthreads();
+                        if (tid < replicas) {
+                            for (int offset = 0; offset < 256 && base + offset < N; offset += 32) {
+                                const unsigned int spins = by_replica[(size_t)((base + offset) / 32) * replicas + tid];
+                                #pragma unroll
+                                for (int bit = 0; bit < 32; ++bit) {
+                                    const msa_field_t coef = row[offset + bit];
+                                    field += (spins >> bit) & 1u ? -coef : coef;
+                                }
+                            }
+                        }
+                        __syncthreads();
+                    }
+                    if (tid < replicas) {
+                        LaneTest test;
+                        test.draw = xs64(rng);
+#ifdef QUIP_MSA_LANE_I32
+                        test.rung_beta = beta_fixed[beta_idx];
+                        test.rung_cut = delta_cut[beta_idx];
+                        test.neglog_table = neglog_table;
+#else
+                        test.beta = beta;
+#endif
+                        test.arm();
+                        const bool flip = tid < num_reads && test.ok(field, state[node * words + tid / 64], tid % 64);
+#endif
                         if (flip) by_replica[(size_t)(node / 32) * replicas + tid] ^= 1u << (node % 32);
                         const unsigned int mask = __ballot_sync(0xffffffffu, flip);
                         if ((tid & 31) == 0) ballots[tid / 32] = mask;
@@ -985,4 +1032,3 @@ extern "C" __global__ void cuda_msa_dense_self_feeding(
         active_slot = s_active_slot;
     }
 }
-#endif

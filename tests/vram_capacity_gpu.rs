@@ -195,78 +195,125 @@ fn footprint_matches_measured_allocation() {
 }
 
 fn dense_allocation_cases(device: CudaDevice, ctx: &Arc<CudaContext>) {
-    let dense_device = device.with_dense_msa_for_test();
+    let mut device = device.with_dense_msa_for_test();
     for nodes in [2_000usize, 8_000] {
-        let mut edges = Vec::with_capacity(nodes * (nodes - 1) / 2);
-        let mut j = Vec::with_capacity(edges.capacity());
-        let mut rng = 19u64;
-        for u in 0..nodes {
-            for v in u + 1..nodes {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                edges.push((u, v));
-                j.push(if rng & 1 == 0 { -1.0 } else { 1.0 });
-            }
-        }
-        let graph = IsingGraph::new(vec![0.0; nodes], j, edges);
-        ctx.synchronize().unwrap();
-        let (free_before, _) = ctx.mem_get_info().unwrap();
-        let footprint = msa_footprint(
-            ModelShape {
-                nodes,
-                couplers: graph.edges.len(),
-                max_degree: nodes - 1,
-            },
+        for precision in [
             Precision::Binary,
-            MsaStorage::Dense,
-            128,
-            1,
-            &dense_device.limits,
-        );
-        let free = Arc::new(AtomicUsize::new(0));
-        let observer = AllocationAtLaunch {
-            ctx: Arc::clone(ctx),
-            free: Arc::clone(&free),
-        };
-        let p = SampleParams {
-            num_reads: 128,
-            num_sweeps: 1,
-            sweeps_per_beta: 1,
-            seed: 19,
-            ..SampleParams::default()
-        };
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(observer), || {
-            bench_many(
-                &dense_device,
-                &graph,
-                &p,
-                KernelKind::Msa,
-                None,
-                footprint.instances,
-            )
-            .expect("dense session");
-        });
-        let free_after = free.load(Ordering::SeqCst);
-        assert_ne!(free_after, 0);
-        let measured = free_before.checked_sub(free_after).unwrap();
-        let exact = footprint.total();
-        eprintln!(
-            "dense N={nodes} instances={} measured={measured} footprint={exact}",
-            footprint.instances
-        );
-        // cuMemGetInfo includes allocator page rounding and pool growth.
-        // The footprint counts requested bytes, so allow the same 64 MiB
-        // driver overhead used above, in either direction.
-        assert!(measured.abs_diff(exact) <= 64 << 20);
-        ctx.synchronize().unwrap();
-        measure_dense_sweeps(&dense_device, &graph);
+            Precision::Int8,
+            Precision::Int32,
+            Precision::Float32,
+        ] {
+            let graph = dense_graph(nodes, precision);
+            if nodes == 2_000 || precision == Precision::Binary {
+                measure_dense_allocation(&device, ctx, &graph, precision);
+            }
+            // N=8,000 wide matrices exceed the 48-instance admission budget.
+            // This test-only snapshot admits exactly the one instance timed.
+            let sms = device.limits.sm_count;
+            device.limits.sm_count = 1;
+            measure_dense_sweeps(&device, &graph, precision);
+            device.limits.sm_count = sms;
+        }
+    }
+}
+
+fn dense_graph(nodes: usize, precision: Precision) -> IsingGraph {
+    let mut edges = Vec::with_capacity(nodes * (nodes - 1) / 2);
+    let mut j = Vec::with_capacity(edges.capacity());
+    let mut rng = 19u64;
+    for u in 0..nodes {
+        for v in u + 1..nodes {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            edges.push((u, v));
+            let sign = if rng & 1 == 0 { -1.0 } else { 1.0 };
+            let magnitude = match precision {
+                Precision::Binary => 1.0,
+                Precision::Int8 => f64::from(u32::try_from(rng % 127 + 1).unwrap()),
+                Precision::Int32 => f64::from(u32::try_from(rng % 873 + 128).unwrap()) / 1000.0,
+                Precision::Float32 => std::f64::consts::SQRT_2,
+            };
+            j.push(sign * magnitude);
+        }
+    }
+    let graph = IsingGraph::new(vec![0.0; nodes], j, edges);
+    if precision != Precision::Float32 {
+        let plan = coefficients::plan(KernelKind::Msa, &graph, nodes).unwrap();
+        assert_eq!(Precision::from_plan(plan, true), precision);
+    }
+    graph
+}
+
+fn measure_dense_allocation(
+    device: &CudaDevice,
+    ctx: &Arc<CudaContext>,
+    graph: &IsingGraph,
+    precision: Precision,
+) {
+    let nodes = graph.num_nodes();
+    ctx.synchronize().unwrap();
+    let (free_before, _) = ctx.mem_get_info().unwrap();
+    let footprint = msa_footprint(
+        ModelShape {
+            nodes,
+            couplers: graph.edges.len(),
+            max_degree: nodes - 1,
+        },
+        precision,
+        MsaStorage::Dense,
+        128,
+        1,
+        &device.limits,
+    );
+    let free = Arc::new(AtomicUsize::new(0));
+    let observer = AllocationAtLaunch {
+        ctx: Arc::clone(ctx),
+        free: Arc::clone(&free),
+    };
+    let p = SampleParams {
+        num_reads: 128,
+        num_sweeps: 1,
+        sweeps_per_beta: 1,
+        seed: 19,
+        ..SampleParams::default()
+    };
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(observer), || {
+        dense_timing(device, graph, &p, precision, footprint.instances);
+    });
+    let free_after = free.load(Ordering::SeqCst);
+    assert_ne!(free_after, 0);
+    let measured = free_before.checked_sub(free_after).unwrap();
+    let exact = footprint.total();
+    eprintln!(
+        "dense {precision:?} N={nodes} instances={} measured={measured} footprint={exact}",
+        footprint.instances
+    );
+    // cuMemGetInfo includes allocator page rounding and pool growth.
+    // Allow the same 64 MiB driver overhead as the sparse measurement.
+    assert!(measured.abs_diff(exact) <= 64 << 20);
+    ctx.synchronize().unwrap();
+}
+
+fn dense_timing(
+    device: &CudaDevice,
+    graph: &IsingGraph,
+    params: &SampleParams,
+    precision: Precision,
+    instances: usize,
+) -> quip_solver_cuda::streaming::DeviceTimings {
+    if precision == Precision::Float32 {
+        bench_many_real(device, graph, params, instances).unwrap().1
+    } else {
+        bench_many(device, graph, params, KernelKind::Msa, None, instances)
+            .unwrap()
+            .1
     }
 }
 
 // Subtract one-sweep from five-sweep CUDA event times to remove initialization
 // and packing. Use the median of three pairs at one instance and 128 reads.
-fn measure_dense_sweeps(device: &CudaDevice, graph: &IsingGraph) {
+fn measure_dense_sweeps(device: &CudaDevice, graph: &IsingGraph, precision: Precision) {
     let mut differences = Vec::new();
     for _ in 0..3 {
         let mut p = SampleParams {
@@ -277,14 +324,14 @@ fn measure_dense_sweeps(device: &CudaDevice, graph: &IsingGraph) {
             seed: 19,
             ..SampleParams::default()
         };
-        let (_, one) = bench_many(device, graph, &p, KernelKind::Msa, None, 1).unwrap();
+        let one = dense_timing(device, graph, &p, precision, 1);
         p.num_sweeps = 5;
         p.sweeps_per_beta = 5;
-        let (_, five) = bench_many(device, graph, &p, KernelKind::Msa, None, 1).unwrap();
+        let five = dense_timing(device, graph, &p, precision, 1);
         let per_sweep = five.kernel_ns.checked_sub(one.kernel_ns).unwrap() / 4;
         differences.push(per_sweep);
         eprintln!(
-            "dense timing N={} one_sweep_ns={} five_sweeps_ns={} per_sweep_ns={per_sweep}",
+            "dense {precision:?} timing N={} one_sweep_ns={} five_sweeps_ns={} per_sweep_ns={per_sweep}",
             graph.num_nodes(),
             one.kernel_ns,
             five.kernel_ns
@@ -292,7 +339,7 @@ fn measure_dense_sweeps(device: &CudaDevice, graph: &IsingGraph) {
     }
     differences.sort_unstable();
     eprintln!(
-        "dense timing N={} replicas=128 instances=1 median_per_sweep_ns={}",
+        "dense {precision:?} timing N={} replicas=128 instances=1 median_per_sweep_ns={}",
         graph.num_nodes(),
         differences[1]
     );

@@ -171,6 +171,10 @@ pub(crate) struct MsaWeightedKernels {
     pub(crate) f32: CudaFunction,
     pub(crate) int8: CudaFunction,
     pub(crate) real: CudaFunction,
+    pub(crate) dense_i32: CudaFunction,
+    pub(crate) dense_f32: CudaFunction,
+    pub(crate) dense_int8: CudaFunction,
+    pub(crate) dense_real: CudaFunction,
     _int8_mod: Arc<CudaModule>,
     _real_mod: Arc<CudaModule>,
     _integer_mod: Arc<CudaModule>,
@@ -269,6 +273,10 @@ fn compile_all_kernels(
             ],
         )?;
         Some(MsaWeightedKernels {
+            dense_i32: integer_mod.load_function("cuda_msa_dense_self_feeding")?,
+            dense_f32: float_mod.load_function("cuda_msa_dense_self_feeding")?,
+            dense_int8: int8_mod.load_function("cuda_msa_dense_self_feeding")?,
+            dense_real: real_mod.load_function("cuda_msa_dense_self_feeding")?,
             int8: int8_mod.load_function("cuda_msa_self_feeding")?,
             real: real_mod.load_function("cuda_msa_self_feeding")?,
             _int8_mod: int8_mod,
@@ -396,7 +404,7 @@ impl fmt::Debug for CudaDevice {
 }
 
 impl CudaDevice {
-    /// Force Binary dense MSA sessions for integration tests until routing exists.
+    /// Force dense MSA sessions for integration tests until routing exists.
     #[doc(hidden)]
     #[must_use]
     pub fn with_dense_msa_for_test(mut self) -> Self {
@@ -558,6 +566,10 @@ impl CudaDevice {
             configure_msa_shared_memory(&weighted.f32, shared_per_block_optin)?;
             configure_msa_shared_memory(&weighted.int8, shared_per_block_optin)?;
             configure_msa_shared_memory(&weighted.real, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.dense_i32, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.dense_f32, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.dense_int8, shared_per_block_optin)?;
+            configure_msa_shared_memory(&weighted.dense_real, shared_per_block_optin)?;
         }
 
         // Read before the struct is built so an unreadable attribute fails the

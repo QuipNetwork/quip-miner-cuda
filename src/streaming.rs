@@ -500,6 +500,17 @@ struct SessionArithmetic {
     msa_lane: MsaLane,
 }
 
+impl SessionArithmetic {
+    fn normalized(mut self) -> Self {
+        self.msa_lane = match self.coefficients.path {
+            CoefficientPath::WeightedInt8 => MsaLane::I32,
+            CoefficientPath::Float32 => MsaLane::F32,
+            CoefficientPath::Int8 | CoefficientPath::Wide => self.msa_lane,
+        };
+        self
+    }
+}
+
 /// Kernel-specific buffers, kept out of `Option`s: which variant is
 /// populated always matches `SelfFeedingSession::kernel` by construction,
 /// so `launch()` destructures it directly instead of unwrapping an `Option`
@@ -511,6 +522,10 @@ enum AlgoState {
         d_spins: CudaSlice<u64>,
         d_replica_spins: CudaSlice<u32>,
         shared_bytes: u32,
+        lane: MsaLane,
+        d_beta_fixed: Option<CudaSlice<i64>>,
+        d_delta_cut: Option<CudaSlice<i32>>,
+        d_neglog: Option<CudaSlice<i64>>,
     },
     MsaWeighted {
         lane: MsaLane,
@@ -557,11 +572,6 @@ fn session_topology(
     if kernel != KernelKind::Msa || !device.force_dense_msa {
         return Ok(SelfFeedingTopology::build(graph));
     }
-    if !coefficients::is_unit_mining(graph) {
-        return Err(SampleError::Unsupported(
-            "dense MSA currently requires Binary coefficients".into(),
-        ));
-    }
     let n = graph.num_nodes();
     if n > device.max_nodes {
         return Err(SampleError::GraphTooLarge {
@@ -585,7 +595,7 @@ fn session_topology(
         let ji = v * n + u;
         if seen[ij / 8] & (1 << (ij % 8)) != 0 {
             return Err(SampleError::Unsupported(
-                "dense Binary MSA requires unique couplers".into(),
+                "dense MSA requires unique couplers".into(),
             ));
         }
         seen[ij / 8] |= 1 << (ij % 8);
@@ -612,17 +622,40 @@ fn build_msa_dense_state(
     n: usize,
     reads: usize,
     nonces: usize,
+    betas: usize,
+    arithmetic: SessionArithmetic,
 ) -> Result<AlgoState, SampleError> {
     let words = reads.div_ceil(capacity::MSA_LANES);
+    let path = arithmetic.coefficients.path;
+    let integer_tables = path != CoefficientPath::Int8 && arithmetic.msa_lane == MsaLane::I32;
+    let shared_bytes = if path == CoefficientPath::Int8 {
+        (n.div_ceil(32) * 2 + 4) * 4
+    } else {
+        let coef_bytes = if path == CoefficientPath::WeightedInt8 {
+            1
+        } else {
+            4
+        };
+        256 * coef_bytes + 16
+    };
     Ok(AlgoState::MsaDense {
         words: to_kernel_i32("dense replica words", words)?,
         d_spins: stream.alloc_zeros::<u64>((nonces * n * words).max(1))?,
         d_replica_spins: stream
             .alloc_zeros::<u32>((nonces * n.div_ceil(32) * words * capacity::MSA_LANES).max(1))?,
-        // N^2 fits the i32 ABI, so these two bit rows fit every supported card.
-        shared_bytes: u32::try_from((n.div_ceil(32) * 2 + 4) * 4).map_err(|_| {
+        shared_bytes: u32::try_from(shared_bytes).map_err(|_| {
             SampleError::Unsupported("dense shared memory exceeds the launch ABI".into())
         })?,
+        lane: arithmetic.msa_lane,
+        d_beta_fixed: integer_tables
+            .then(|| stream.alloc_zeros::<i64>(betas.max(1)))
+            .transpose()?,
+        d_delta_cut: integer_tables
+            .then(|| stream.alloc_zeros::<i32>(betas.max(1)))
+            .transpose()?,
+        d_neglog: integer_tables
+            .then(|| stream.clone_htod(&neglog_table()))
+            .transpose()?,
     })
 }
 
@@ -883,12 +916,9 @@ impl<'a> SelfFeedingSession<'a> {
         arithmetic: SessionArithmetic,
     ) -> Result<Self, SampleError> {
         let _span = trace_span!("problem_setup", n = topology.n, nnz = topology.nnz).entered();
+        let arithmetic = arithmetic.normalized();
         let plan = arithmetic.coefficients;
-        let msa_lane = match plan.path {
-            CoefficientPath::WeightedInt8 => MsaLane::I32,
-            CoefficientPath::Float32 => MsaLane::F32,
-            CoefficientPath::Int8 | CoefficientPath::Wide => arithmetic.msa_lane,
-        };
+        let msa_lane = arithmetic.msa_lane;
         let n = topology.n;
         check_session_capacity(
             device,
@@ -936,7 +966,14 @@ impl<'a> SelfFeedingSession<'a> {
         let d_beta = stream_compute.alloc_zeros::<f32>(max_num_betas.max(1))?;
 
         let algo_state = if kernel == KernelKind::Msa && device.force_dense_msa {
-            build_msa_dense_state(&stream_compute, n, reads_per_nonce, num_nonces)?
+            build_msa_dense_state(
+                &stream_compute,
+                n,
+                reads_per_nonce,
+                num_nonces,
+                max_num_betas,
+                arithmetic,
+            )?
         } else if kernel == KernelKind::Sa && plan.path == CoefficientPath::Wide {
             build_sa_wide_state(&stream_compute, n, num_nonces, max_num_betas)?
         } else if kernel == KernelKind::Msa && plan.path != CoefficientPath::Int8 {
@@ -1015,6 +1052,11 @@ impl<'a> SelfFeedingSession<'a> {
         }
         | AlgoState::MsaWeighted {
             lane: MsaLane::I32,
+            d_beta_fixed: Some(d_beta_fixed),
+            d_delta_cut: Some(d_delta_cut),
+            ..
+        }
+        | AlgoState::MsaDense {
             d_beta_fixed: Some(d_beta_fixed),
             d_delta_cut: Some(d_delta_cut),
             ..
@@ -1150,6 +1192,10 @@ impl<'a> SelfFeedingSession<'a> {
             words,
             d_spins,
             d_replica_spins,
+            lane,
+            d_beta_fixed,
+            d_delta_cut,
+            d_neglog,
             ..
         } = &self.algo_state
         else {
@@ -1157,14 +1203,35 @@ impl<'a> SelfFeedingSession<'a> {
                 "dense launch without dense state".into(),
             ));
         };
-        let SlotCoefficients::Int8 { d_j, d_h, .. } = &self.coefs else {
-            return Err(SampleError::Unsupported(
-                "dense MSA requires Binary coefficients".into(),
-            ));
+        let function = if self.plan.path == CoefficientPath::Int8 {
+            &self.device.msa_dense
+        } else {
+            let kernels = self.device.msa_weighted.as_ref().ok_or_else(|| {
+                SampleError::Unsupported("weighted MSA requires an MSA device open".into())
+            })?;
+            match self.plan.path {
+                CoefficientPath::WeightedInt8 => &kernels.dense_int8,
+                CoefficientPath::Wide if *lane == MsaLane::I32 => &kernels.dense_i32,
+                CoefficientPath::Wide => &kernels.dense_f32,
+                CoefficientPath::Float32 => &kernels.dense_real,
+                CoefficientPath::Int8 => unreachable!(),
+            }
         };
-        let mut b = self.stream_compute.launch_builder(&self.device.msa_dense);
-        b.arg(d_j);
-        b.arg(d_h);
+        let mut b = self.stream_compute.launch_builder(function);
+        match &self.coefs {
+            SlotCoefficients::Int8 { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+            SlotCoefficients::Wide { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+            SlotCoefficients::Float32 { d_j, d_h, .. } => {
+                b.arg(d_j);
+                b.arg(d_h);
+            }
+        }
         b.arg(&self.d_samples);
         b.arg(&self.d_energies);
         b.arg(&self.d_beta);
@@ -1179,11 +1246,24 @@ impl<'a> SelfFeedingSession<'a> {
         b.arg(words);
         b.arg(d_spins);
         b.arg(d_replica_spins);
-        // SAFETY: the 16 arguments match cuda_msa_dense_self_feeding in order
-        // and type. The builder allocates three matrices/output slots per nonce,
+        if self.plan.path != CoefficientPath::Int8 && *lane == MsaLane::I32 {
+            let (Some(beta), Some(cut), Some(neglog)) = (d_beta_fixed, d_delta_cut, d_neglog)
+            else {
+                return Err(SampleError::Driver(
+                    "dense integer acceptance buffers are missing".into(),
+                ));
+            };
+            b.arg(beta);
+            b.arg(cut);
+            b.arg(neglog);
+        }
+        // SAFETY: the 16 arguments (19 for integer weighted lanes) match
+        // cuda_msa_dense_self_feeding in order and type. Acceptance tables hold
+        // num_betas, num_betas and NEGLOG_LEN entries. Coefficients match the
+        // selected module. The builder allocates three matrix/output slots,
         // N * words spin words and ceil(N/32) * words * 64 transposed words
         // per nonce. Reads are clamped to 128. Each block uses 256 threads and
-        // shared memory for two packed coefficient rows and four ballots.
+        // shared memory for packed rows or a coefficient tile and four ballots.
         // Drop joins the kernel before any buffer is released.
         unsafe {
             b.launch(cfg)?;
