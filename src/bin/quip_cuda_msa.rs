@@ -6,9 +6,11 @@
 //! `config.toml` with `[cuda.N] binary = "<path>/quip-cuda-msa"`.
 
 use clap::{Parser, Subcommand};
-use quip_solver_core::{run, CommonArgs, OpenError};
+use quip_solver_core::{run, CommonArgs};
 use quip_solver_cuda::bench::{run_bench, BenchAction};
-use quip_solver_cuda::capacity::{advertised_nodes, MSA_DEFAULT_NODES};
+use quip_solver_cuda::capacity::{
+    advertised_nodes, msa_max_couplers, resolve, MSA_DEFAULT_NODES, MSA_MAX_READS,
+};
 use quip_solver_cuda::cuda_device::{device_label_mismatch, CudaDevice};
 use quip_solver_cuda::nvml_gov::UtilGovernor;
 use quip_solver_cuda::{cuda_msa_identity, KernelKind, MsaSampler};
@@ -33,13 +35,11 @@ struct Cli {
     /// exceeds --utilization. Load from this miner is excluded.
     #[arg(long, default_value_t = false)]
     yielding: bool,
-    /// Largest node count to accept. The miner opens its device before the
-    /// coordinator sends a topology, so this cannot come from the wire. Values
-    /// below the default are raised to it; a value above
-    /// `capacity::MSA_MAX_NODES` (200,000) is an error at open, never a silent
-    /// clamp.
-    #[arg(long, default_value_t = MSA_DEFAULT_NODES)]
-    max_nodes: usize,
+    /// Optional lower cap on the node limit derived from device memory.
+    /// Values below 5000 are raised to 5000. A value above the device limit
+    /// is an error at open. Without this flag the full device limit applies.
+    #[arg(long)]
+    max_nodes: Option<usize>,
 }
 
 /// Top-level subcommands. Absent → the ordinary coordinator-driven miner
@@ -55,7 +55,12 @@ enum Command {
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
     if let Some(Command::Bench(action)) = &cli.command {
-        return match run_bench(cli.device, KernelKind::Msa, cli.max_nodes, action) {
+        return match run_bench(
+            cli.device,
+            KernelKind::Msa,
+            cli.max_nodes.unwrap_or(MSA_DEFAULT_NODES),
+            action,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("bench failed: {e}");
@@ -99,10 +104,30 @@ fn main() -> ExitCode {
             cli.device
         );
     }
-    let nodes = advertised_nodes(KernelKind::Msa, cli.max_nodes);
-    run(cuda_msa_identity(nodes), &cli.common, || {
-        let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, cli.max_nodes)
-            .map_err(|e| OpenError(format!("device {}: {e}", cli.device)))?;
+    // MSA has no compiled node array. Open at the floor to read device
+    // limits, then apply the optional cap to the same memory snapshot.
+    let mut device =
+        match CudaDevice::open_with_nodes(cli.device, KernelKind::Msa, MSA_DEFAULT_NODES) {
+            Ok(device) => device,
+            Err(e) => {
+                tracing::error!("device {}: {e}", cli.device);
+                return ExitCode::FAILURE;
+            }
+        };
+    if let Some(cap) = cli.max_nodes {
+        if let Err(e) = resolve(KernelKind::Msa, cap, &device.limits) {
+            tracing::error!("device {}: {e}", cli.device);
+            return ExitCode::FAILURE;
+        }
+    }
+    let nodes = advertised_nodes(
+        KernelKind::Msa,
+        cli.max_nodes.unwrap_or(usize::MAX),
+        Some(&device.limits),
+    );
+    let edges = msa_max_couplers(&device.limits, MSA_MAX_READS);
+    device.max_nodes = nodes;
+    run(cuda_msa_identity(nodes, edges), &cli.common, || {
         // The governor binds by PCI bus id, not by ordinal: NVML's index
         // space is PCI-ordered and does not track the CUDA ordinal this
         // process opened. Taking it from the opened device means both
@@ -120,15 +145,14 @@ mod cli_tests {
     #[test]
     fn parses_max_nodes() {
         let cli = Cli::parse_from(["quip-cuda-msa", "--max-nodes", "5640"]);
-        assert_eq!(cli.max_nodes, 5640);
+        assert_eq!(cli.max_nodes, Some(5640));
     }
 
-    /// Absent flag must land on the msa floor, so a plain invocation opens
-    /// exactly what it always did.
+    /// Absent flag lets the device determine the capacity.
     #[test]
-    fn max_nodes_defaults_to_the_kernel_floor() {
+    fn max_nodes_defaults_to_the_device_limit() {
         let cli = Cli::parse_from(["quip-cuda-msa"]);
-        assert_eq!(cli.max_nodes, quip_solver_cuda::capacity::MSA_DEFAULT_NODES);
+        assert_eq!(cli.max_nodes, None);
     }
 
     #[test]

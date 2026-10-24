@@ -50,7 +50,7 @@ fn identities_report_the_resolved_capacity() {
 /// with difficulty whenever they differ, and msa wants a fixed count.
 #[test]
 fn msa_identity_reads_match_the_kernel_read_cap() {
-    let msa = cuda_msa_identity(MSA_DEFAULT_NODES);
+    let msa = cuda_msa_identity(MSA_DEFAULT_NODES, 123_456);
     assert_eq!(algorithm_name(msa.algorithm), "msa");
     assert_eq!(msa.max_nodes, 5000);
     assert_eq!(msa.adapt.min_reads, msa.adapt.max_reads);
@@ -62,10 +62,10 @@ fn msa_identity_reads_match_the_kernel_read_cap() {
 }
 
 #[test]
-fn msa_identity_declares_the_large_graph_ceilings() {
-    let id = quip_solver_cuda::cuda_msa_identity(200_000);
-    assert_eq!(id.max_nodes, 200_000);
-    assert_eq!(id.max_edges, 4_000_000);
+fn msa_identity_declares_the_resolved_limits() {
+    let id = quip_solver_cuda::cuda_msa_identity(1_234_567, 7_654_321);
+    assert_eq!(id.max_nodes, 1_234_567);
+    assert_eq!(id.max_edges, 7_654_321);
     assert_eq!(id.adapt.max_reads, 128);
     assert_eq!(id.limits.max_degree, Some(62));
 }

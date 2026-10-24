@@ -25,10 +25,14 @@ lower architecture and loads through the driver's forward-compatible PTX JIT.
 (`make test-archs`). The host scores energies with the canonical
 `quip_protocol::scoring::energy_milli` so results match consensus.
 `quip-cuda-msa` keeps as many spins as fit in the opt-in shared memory per
-block and spills the rest to a per-nonce buffer in device memory. Every
-supported device serves 128 reads at every size up to 200,000 nodes and
-4,000,000 edges. Shared memory sets only how many spins stay on chip.
-A session whose buffers do not fit device memory is refused. At 200,000 nodes
+block and spills the rest to a per-nonce buffer in device memory. Node and
+coupler limits come from device memory divided among instances,
+one per SM. With 15 GiB free, 48 SMs and 128 reads, the A4000 advertises
+3,987,504 uncoupled nodes or 32,139,292 sparse couplers at degree 62. These independent
+Binary limits use the default 64-beta schedule. A model near both limits can
+exceed memory. The miner checks each model before allocation, including its
+precision and schedule length. Shared memory sets how many spins stay on chip.
+The miner refuses a session whose buffers exceed device memory. At 200,000 nodes
 and 4,000,000 edges with 48 models, the A4000 measured about 2 GiB for unit
 models and 5.2 GiB for weighted i32 models (see the
 [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)).
@@ -136,9 +140,10 @@ memory per block less 8720 bytes, divided by 8 times the replica words (two
 words at 128 reads, so 16): 5791 on a 99 KB part, 3551 on Turing. Spins past K live in a per-nonce global buffer,
 which reaches L2 and then DRAM as the graph grows. Placement does not change
 the samples: a spilled run returns the same reads as an all-shared run of the
-same seed. `--max-nodes` above 200,000 is an error at open, never a silent
-clamp. The miner also refuses a capacity whose worst-case spill buffer does
-not fit device memory, and the error names the largest capacity that fits.
+same seed. Without `--max-nodes`, the miner uses its device-derived node limit.
+The flag sets a lower cap. A value that exceeds the device limit fails at open,
+and the error names the largest capacity that fits. MSA `--capabilities`
+opens the selected device to read its memory limits.
 See the [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)
 for the throughput at each size.
 

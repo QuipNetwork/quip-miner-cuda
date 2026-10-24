@@ -137,15 +137,13 @@ async fn quip_cuda_gibbs_passes_solve_conformance() {
     assert_passes_solve_gate("quip-cuda-gibbs", &[]).await;
 }
 
-/// Each kernel lists `linear-schedule` and states its model limits, without a
-/// device.
+/// SA and Gibbs list `linear-schedule` and their limits without a device.
 #[test]
 #[serial]
 fn capabilities_advertise_the_schedule_feature_and_limits() {
     ensure_built(&["quip-cuda-sa", "quip-cuda-msa", "quip-cuda-gibbs"]);
     for (bin, degree, field) in [
         ("quip-cuda-sa", 0, Some(536_870_910)),
-        ("quip-cuda-msa", 62, Some(16_777_215)),
         ("quip-cuda-gibbs", 0, None),
     ] {
         let out = Command::new(profile_bin(bin))
@@ -165,7 +163,7 @@ fn capabilities_advertise_the_schedule_feature_and_limits() {
     }
 }
 
-/// `--capabilities` / `--version` are headless (no CUDA).
+/// SA and Gibbs capabilities and every version are headless (no CUDA).
 #[test]
 #[serial]
 fn capabilities_and_version_headless() {
@@ -178,14 +176,13 @@ fn capabilities_and_version_headless() {
     ] {
         let path = profile_bin(bin);
 
-        let out = Command::new(&path).arg("--capabilities").output().unwrap();
-        assert!(out.status.success(), "{bin} --capabilities failed");
-        let s = String::from_utf8(out.stdout).unwrap();
-        assert!(s.contains("\"backend\":\"cuda\""), "{bin}: {s}");
-        assert!(
-            s.contains(&format!("\"algorithm\":\"{algo}\"")),
-            "{bin}: {s}"
-        );
+        if algo != "msa" {
+            let out = Command::new(&path).arg("--capabilities").output().unwrap();
+            assert!(out.status.success(), "{bin} --capabilities failed");
+            let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(caps["backend"], "cuda");
+            assert_eq!(caps["algorithm"], algo);
+        }
 
         let out = Command::new(&path).arg("--version").output().unwrap();
         assert!(out.status.success());
@@ -197,6 +194,51 @@ fn capabilities_and_version_headless() {
             "{bin}: {version}"
         );
     }
+}
+
+/// MSA capabilities use the selected device's memory snapshot.
+#[test]
+#[serial]
+#[ignore = "requires CUDA GPU"]
+fn msa_capabilities_report_probed_device_limits() {
+    use quip_solver_cuda::capacity::{
+        msa_max_couplers, msa_max_nodes, MSA_DEFAULT_NODES, MSA_MAX_READS,
+    };
+    use quip_solver_cuda::cuda_device::CudaDevice;
+    use quip_solver_cuda::KernelKind;
+
+    ensure_built(&["quip-cuda-msa"]);
+    let limits = CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES)
+        .expect("probe MSA device")
+        .limits;
+    let out = Command::new(profile_bin("quip-cuda-msa"))
+        .arg("--capabilities")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(caps["maxNodes"], msa_max_nodes(&limits, MSA_MAX_READS));
+    assert_eq!(caps["maxEdges"], msa_max_couplers(&limits, MSA_MAX_READS));
+    assert_eq!(caps["maxDegree"], 62);
+    assert_eq!(caps["maxLocalFieldMilli"], 16_777_215);
+    assert_eq!(caps["exactResolutionMilli"], 1);
+    assert!(caps["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "linear-schedule"));
+
+    let out = Command::new(profile_bin("quip-cuda-msa"))
+        .args(["--capabilities", "--max-nodes", "8192"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let caps: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(caps["maxNodes"], 8192);
 }
 
 /// `--check` opens the GPU and compiles kernels.

@@ -8,7 +8,7 @@
 //! for the sweep those numbers come from.
 
 use quip_solver_cuda::capacity::GIBBS_DEFAULT_NODES;
-use quip_solver_cuda::capacity::{MSA_DEFAULT_NODES, MSA_MAX_NODES};
+use quip_solver_cuda::capacity::{msa_max_nodes, MSA_DEFAULT_NODES, MSA_MAX_READS};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::sampler::{sample_ising, SampleError};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
@@ -49,10 +49,10 @@ fn msa_opens_at_pegasus_scale() {
 }
 
 /// Spins past the shared-memory budget spill to global memory, so msa
-/// opens far above it; the ceiling is `MSA_MAX_NODES`, named in the error.
+/// opens far above it; the device memory budget is named in the error.
 #[test]
 #[ignore = "requires a CUDA GPU"]
-fn msa_opens_beyond_shared_memory_and_refuses_above_the_kernel_ceiling() {
+fn msa_opens_beyond_shared_memory_and_refuses_above_the_device_budget() {
     if CudaDevice::device_count().unwrap_or(0) == 0 {
         eprintln!("no CUDA device visible; skipping");
         return;
@@ -60,15 +60,16 @@ fn msa_opens_beyond_shared_memory_and_refuses_above_the_kernel_ceiling() {
 
     let dev = CudaDevice::open_with_nodes(0, KernelKind::Msa, 65536).expect("msa at 65536");
     assert_eq!(dev.max_nodes, 65536);
-    let err = CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_MAX_NODES + 1)
-        .expect_err("msa above the kernel ceiling must fail at open");
+    let requested = msa_max_nodes(&dev.limits, MSA_MAX_READS) + 1;
+    let err = CudaDevice::open_with_nodes(0, KernelKind::Msa, requested)
+        .expect_err("msa above the device budget must fail at open");
     let msg = err.to_string();
     assert!(
-        msg.contains("200001"),
+        msg.contains(&requested.to_string()),
         "message must name the request: {msg}"
     );
     assert!(
-        msg.contains("kernel-ceiling budget"),
+        msg.contains("memory budget"),
         "message must name the bound: {msg}"
     );
 }

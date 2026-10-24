@@ -99,7 +99,7 @@ fn main() -> ExitCode {
         );
     }
     run(
-        cuda_gibbs_identity(advertised_nodes(KernelKind::Gibbs, cli.max_nodes)),
+        cuda_gibbs_identity(advertised_nodes(KernelKind::Gibbs, cli.max_nodes, None)),
         &cli.common,
         || {
             let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Gibbs, cli.max_nodes)

@@ -319,19 +319,16 @@ pub const GIBBS_DEFAULT_NODES: usize = 4800;
 /// `s_chunk` and `s_arrival`, one `int` each.
 pub const GIBBS_FIXED_SHARED_BYTES: usize = 8;
 
-/// Capacity used when `--max-nodes` is absent for `quip-cuda-msa`. The same
-/// floor as SA so the three binaries default alike. The msa kernel has no
-/// compiled-in array: its spin state is dynamic shared memory with a global
-/// spill buffer, so this floor only sets what `--max-nodes` defaults to.
+/// Minimum requested MSA capacity, also used when opening to read limits.
+/// The msa kernel has no compiled node array: its spin state uses dynamic
+/// shared memory and a global spill buffer. The miner derives its default
+/// maximum from device memory after opening.
 pub const MSA_DEFAULT_NODES: usize = 5000;
 
-/// Most nodes `quip-cuda-msa` accepts. Spins past the shared-memory budget
-/// spill to global memory, so this is a policy ceiling, not a device one:
-/// the size the spill path is measured at (docs/perf/2026-10-msa-dram-spill-a4000.md).
-pub const MSA_MAX_NODES: usize = 200_000;
-
-/// Most edges `quip-cuda-msa` accepts: 200,000 nodes at an average degree of 40.
-pub const MSA_MAX_EDGES: usize = 4_000_000;
+/// Default mining schedule length: quip-solver-core 0.0.3 `job.rs` uses
+/// `DEFAULT_NUM_SWEEPS = 64` and `sweeps_per_beta.unwrap_or(1)`.
+/// `streaming::build_beta_schedule` divides sweeps by sweeps per beta.
+pub const MSA_DEFAULT_BETAS: usize = 64;
 
 /// Reads packed into one 64-bit word by the msa kernel (`kernels/msa.cu`).
 pub const MSA_LANES: usize = 64;
@@ -405,16 +402,74 @@ pub fn msa_spill_words(nodes: usize, shared_spins: usize, words: usize, nonces: 
         .saturating_mul(nonces)
 }
 
-/// Largest node count whose worst-case msa spill fits this device's usable
-/// memory: every spin spilled, at [`MSA_REPLICA_WORDS`] words, for each of the
-/// `sm_count` nonces (msa runs one nonce per SM).
+/// Largest uncoupled Binary model that fits the device at `reads`.
+/// The default mining beta count bounds the schedule allocation. Longer
+/// schedules still pass through the per-model footprint check.
 #[must_use]
-pub fn msa_spill_budget(limits: &DeviceLimits) -> usize {
-    let per_node = MSA_REPLICA_WORDS
-        .saturating_mul(8)
-        .saturating_mul(limits.sm_count)
-        .max(1);
-    limits.usable_bytes() / per_node
+pub fn msa_max_nodes(limits: &DeviceLimits, reads: usize) -> usize {
+    // `msa.cu` uses int for N * words, N + 7 and the initialization loop
+    // increment. Leave room for the final block-sized loop increment.
+    let words = reads.max(1).div_ceil(MSA_LANES).checked_next_power_of_two();
+    let Some(words) = words else { return 0 };
+    let ceiling = (i32::MAX as usize - MSA_THREADS_PER_NONCE as usize)
+        .checked_div(words)
+        .unwrap_or(0)
+        .min(i32::MAX as usize - 7);
+    msa_max_fitting(limits, reads, ceiling, |nodes| ModelShape {
+        nodes,
+        couplers: 0,
+        max_degree: 0,
+    })
+}
+
+/// Largest sparse Binary coupler count that fits at degree [`MSA_MAX_DEGREE`].
+/// Nodes use the smallest degree-bounded shape. Node and coupler maxima are
+/// independent bounds, so a model near both can still exceed device memory.
+#[must_use]
+pub fn msa_max_couplers(limits: &DeviceLimits, reads: usize) -> usize {
+    // Each coupling has two CSR entries. Leave room for the sparse kernel's
+    // MSA_CHUNK (20) increment at the end of a row.
+    let ceiling = (i32::MAX as usize - 20) / 2;
+    let max_nodes = msa_max_nodes(limits, reads);
+    msa_max_fitting(
+        limits,
+        reads,
+        ceiling.min(max_nodes.saturating_mul(MSA_MAX_DEGREE) / 2),
+        |couplers| ModelShape {
+            nodes: (couplers * 2)
+                .div_ceil(MSA_MAX_DEGREE)
+                .max(MSA_MAX_DEGREE + 1),
+            couplers,
+            max_degree: MSA_MAX_DEGREE,
+        },
+    )
+}
+
+fn msa_max_fitting(
+    limits: &DeviceLimits,
+    reads: usize,
+    ceiling: usize,
+    shape: impl Fn(usize) -> ModelShape,
+) -> usize {
+    let mut low = 0;
+    let mut high = ceiling;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let footprint = msa_footprint(
+            shape(mid),
+            Precision::Binary,
+            MsaStorage::Sparse,
+            reads,
+            MSA_DEFAULT_BETAS,
+            limits,
+        );
+        if footprint.total() <= limits.usable_bytes() {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
 }
 
 /// Which device limit bounds a kernel's capacity.
@@ -427,8 +482,6 @@ pub enum BudgetResource {
     /// its shared-memory budget to a per-nonce global buffer, so its worst
     /// case is bounded by device memory too.
     DeviceMemory,
-    /// A policy ceiling of the kernel, independent of the device.
-    KernelCeiling,
 }
 
 impl std::fmt::Display for BudgetResource {
@@ -436,7 +489,6 @@ impl std::fmt::Display for BudgetResource {
         match self {
             Self::SharedMemory => write!(f, "shared-memory"),
             Self::DeviceMemory => write!(f, "memory"),
-            Self::KernelCeiling => write!(f, "kernel-ceiling"),
         }
     }
 }
@@ -446,7 +498,7 @@ impl std::fmt::Display for BudgetResource {
 pub enum CapacityError {
     /// Above what this device can hold. `resource` names which limit bound
     /// it, because SA is bounded by device memory, Gibbs by shared memory and
-    /// msa by its own ceiling or by the memory its spill needs, and a message
+    /// msa by the memory its session needs, and a message
     /// naming the wrong resource sends the reader to the wrong knob.
     #[error("requested {requested} nodes exceeds the device {resource} budget of {budget}")]
     AboveDeviceBudget {
@@ -476,19 +528,23 @@ pub fn default_nodes(kernel: KernelKind) -> usize {
     }
 }
 
-/// Capacity to advertise in `--capabilities`, which must answer without
-/// opening the device.
+/// Capacity to advertise in `--capabilities`.
 ///
-/// Applies the floor and every bound knowable without a device. SA is
-/// clamped to the per-thread local-memory cap here and msa to
-/// [`MSA_MAX_NODES`]. Gibbs is bounded by device shared memory, so its
-/// request passes through and `open_with_nodes` is what refuses.
+/// SA and Gibbs can answer without device limits. MSA derives its maximum
+/// from the footprint and advertises zero if no device limits are available.
+/// A requested MSA capacity is an optional lower cap on that maximum.
 #[must_use]
-pub fn advertised_nodes(kernel: KernelKind, requested: usize) -> usize {
+pub fn advertised_nodes(
+    kernel: KernelKind,
+    requested: usize,
+    limits: Option<&DeviceLimits>,
+) -> usize {
     let want = requested.max(default_nodes(kernel));
     match kernel {
         KernelKind::Sa => want.min(LOCAL_MEM_BYTES_PER_THREAD * 8 / 9),
-        KernelKind::Msa => want.min(MSA_MAX_NODES),
+        KernelKind::Msa => {
+            limits.map_or(0, |limits| want.min(msa_max_nodes(limits, MSA_MAX_READS)))
+        }
         KernelKind::Gibbs => want,
     }
 }
@@ -501,10 +557,7 @@ pub fn advertised_nodes(kernel: KernelKind, requested: usize) -> usize {
 /// # Errors
 ///
 /// [`CapacityError::AboveDeviceBudget`] when the request exceeds
-/// [`sa_budget`] or [`gibbs_budget`] for this device, [`MSA_MAX_NODES`]
-/// (`KernelCeiling`), or for msa [`msa_spill_budget`] (`DeviceMemory`), the
-/// nodes whose worst-case spill fits device memory. The kernel ceiling is
-/// checked first.
+/// [`sa_budget`], [`gibbs_budget`] or [`msa_max_nodes`] for this device.
 pub fn resolve(
     kernel: KernelKind,
     requested: usize,
@@ -514,8 +567,10 @@ pub fn resolve(
     let want = requested.max(floor);
     let (budget, resource) = match kernel {
         KernelKind::Sa => (sa_budget(limits), BudgetResource::DeviceMemory),
-        KernelKind::Msa if want > MSA_MAX_NODES => (MSA_MAX_NODES, BudgetResource::KernelCeiling),
-        KernelKind::Msa => (msa_spill_budget(limits), BudgetResource::DeviceMemory),
+        KernelKind::Msa => (
+            msa_max_nodes(limits, MSA_MAX_READS),
+            BudgetResource::DeviceMemory,
+        ),
         KernelKind::Gibbs => (
             gibbs_budget(limits.shared_bytes_per_block),
             BudgetResource::SharedMemory,
@@ -545,6 +600,32 @@ mod tests {
             sm_count: 48,
             threads_per_sm: 1536,
         }
+    }
+
+    #[test]
+    fn msa_accepts_a_million_uncoupled_nodes_when_the_footprint_fits() {
+        let limits = a4000_limits();
+        let shape = ModelShape {
+            nodes: 1_000_000,
+            couplers: 0,
+            max_degree: 0,
+        };
+        assert!(
+            msa_footprint(
+                shape,
+                Precision::Binary,
+                MsaStorage::Sparse,
+                128,
+                64,
+                &limits
+            )
+            .total()
+                <= limits.usable_bytes()
+        );
+        assert_eq!(
+            resolve(KernelKind::Msa, shape.nodes, &limits),
+            Ok(shape.nodes)
+        );
     }
 
     #[test]
@@ -975,17 +1056,20 @@ mod tests {
     #[test]
     fn advertised_clamps_sa_to_the_per_thread_local_cap() {
         let cap = LOCAL_MEM_BYTES_PER_THREAD * 8 / 9;
-        assert_eq!(advertised_nodes(KernelKind::Sa, cap * 2), cap);
-        assert_eq!(advertised_nodes(KernelKind::Sa, 5640), 5640);
-        assert_eq!(advertised_nodes(KernelKind::Sa, 64), SA_DEFAULT_NODES);
+        assert_eq!(advertised_nodes(KernelKind::Sa, cap * 2, None), cap);
+        assert_eq!(advertised_nodes(KernelKind::Sa, 5640, None), 5640);
+        assert_eq!(advertised_nodes(KernelKind::Sa, 64, None), SA_DEFAULT_NODES);
     }
 
     /// Gibbs has no static ceiling — its bound comes from the device — so the
     /// request passes through and `open_with_nodes` is what refuses.
     #[test]
     fn advertised_passes_gibbs_through_above_the_default() {
-        assert_eq!(advertised_nodes(KernelKind::Gibbs, 32768), 32768);
-        assert_eq!(advertised_nodes(KernelKind::Gibbs, 64), GIBBS_DEFAULT_NODES);
+        assert_eq!(advertised_nodes(KernelKind::Gibbs, 32768, None), 32768);
+        assert_eq!(
+            advertised_nodes(KernelKind::Gibbs, 64, None),
+            GIBBS_DEFAULT_NODES
+        );
     }
 
     #[test]
@@ -1042,77 +1126,137 @@ mod tests {
     }
 
     #[test]
-    fn resolve_msa_is_bounded_by_the_kernel_ceiling_not_shared_memory() {
-        // A Turing-sized opt-in holds 3551 spins at two words; the rest spill.
-        let turing = DeviceLimits {
-            shared_bytes_per_block_optin: 65_536,
-            ..a4000(16 << 30)
-        };
-        assert_eq!(resolve(KernelKind::Msa, 8000, &turing), Ok(8000));
-        assert_eq!(
-            resolve(KernelKind::Msa, MSA_MAX_NODES, &turing),
-            Ok(MSA_MAX_NODES)
-        );
-        assert_eq!(
-            resolve(KernelKind::Msa, MSA_MAX_NODES + 1, &turing),
-            Err(CapacityError::AboveDeviceBudget {
-                requested: MSA_MAX_NODES + 1,
-                budget: MSA_MAX_NODES,
-                resource: BudgetResource::KernelCeiling,
-            })
-        );
-    }
-
-    /// Worst case is every spin spilled, one nonce per SM, so a card short of
-    /// memory is refused with the node count its spill would fit.
-    #[test]
-    fn resolve_msa_refuses_a_spill_that_does_not_fit_device_memory() {
-        let limits = a4000(64 << 20);
-        let fits = |nodes: usize| {
-            msa_spill_words(nodes, 0, MSA_REPLICA_WORDS, limits.sm_count) * 8
-                <= limits.usable_bytes()
-        };
-        let Err(CapacityError::AboveDeviceBudget {
-            requested,
-            budget,
-            resource,
-        }) = resolve(KernelKind::Msa, MSA_MAX_NODES, &limits)
-        else {
-            panic!("64 MiB cannot hold the worst-case spill at 200k nodes");
-        };
-        assert_eq!(requested, MSA_MAX_NODES);
-        assert_eq!(resource, BudgetResource::DeviceMemory);
-        assert!(fits(budget), "budget {budget} must fit");
-        assert!(!fits(budget + 1), "budget {budget} must be the largest");
-        assert_eq!(resolve(KernelKind::Msa, budget, &limits), Ok(budget));
+    fn a4000_advertised_limits_match_the_documented_example() {
+        let limits = a4000_limits();
+        assert_eq!(msa_max_nodes(&limits, 128), 3_987_504);
+        assert_eq!(msa_max_couplers(&limits, 128), 32_139_292);
     }
 
     #[test]
-    fn resolve_msa_accepts_the_ceiling_on_a_16_gib_card() {
+    fn msa_default_beta_count_matches_default_sample_parameters() {
+        let params = crate::SampleParams::default();
         assert_eq!(
-            resolve(KernelKind::Msa, MSA_MAX_NODES, &a4000(A4000_FREE)),
-            Ok(MSA_MAX_NODES)
+            MSA_DEFAULT_BETAS,
+            params.num_sweeps / params.sweeps_per_beta
         );
     }
 
     #[test]
-    fn advertised_msa_is_clamped_to_the_kernel_ceiling() {
-        assert_eq!(advertised_nodes(KernelKind::Msa, 1_000_000), MSA_MAX_NODES);
+    fn advertised_limits_fit_kernel_i32() {
+        for limits in [a4000_limits(), a4000(usize::MAX)] {
+            for reads in [64, 128] {
+                let nodes = msa_max_nodes(&limits, reads);
+                let couplers = msa_max_couplers(&limits, reads);
+                for value in [
+                    nodes,
+                    nodes.div_ceil(8),
+                    nodes * reads.div_ceil(64),
+                    couplers * 2,
+                ] {
+                    assert!(i32::try_from(value).is_ok(), "kernel dimension {value}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn kernel_ceiling_names_itself() {
-        assert_eq!(BudgetResource::KernelCeiling.to_string(), "kernel-ceiling");
+    fn max_nodes_scales_with_free_memory() {
+        let small = a4000(8 << 30);
+        let large = a4000(16 << 30);
+        assert!(msa_max_nodes(&large, 128) >= msa_max_nodes(&small, 128) * 2 - 1);
+    }
+
+    #[test]
+    fn advertised_msa_axes_fit_the_default_schedule_footprint() {
+        for limits in [a4000_limits(), a4000(64 << 20)] {
+            let nodes = msa_max_nodes(&limits, 128);
+            let couplers = msa_max_couplers(&limits, 128);
+            for (value, shape) in [
+                (
+                    nodes,
+                    ModelShape {
+                        nodes,
+                        couplers: 0,
+                        max_degree: 0,
+                    },
+                ),
+                (
+                    couplers,
+                    ModelShape {
+                        nodes: (couplers * 2)
+                            .div_ceil(MSA_MAX_DEGREE)
+                            .max(MSA_MAX_DEGREE + 1),
+                        couplers,
+                        max_degree: MSA_MAX_DEGREE,
+                    },
+                ),
+            ] {
+                let footprint = |shape| {
+                    msa_footprint(
+                        shape,
+                        Precision::Binary,
+                        MsaStorage::Sparse,
+                        128,
+                        MSA_DEFAULT_BETAS,
+                        &limits,
+                    )
+                    .total()
+                };
+                assert!(footprint(shape) <= limits.usable_bytes());
+                let next = if shape.couplers == 0 {
+                    ModelShape {
+                        nodes: value + 1,
+                        ..shape
+                    }
+                } else {
+                    ModelShape {
+                        nodes: ((value + 1) * 2)
+                            .div_ceil(MSA_MAX_DEGREE)
+                            .max(MSA_MAX_DEGREE + 1),
+                        couplers: value + 1,
+                        ..shape
+                    }
+                };
+                assert!(footprint(next) > limits.usable_bytes());
+            }
+            assert_eq!(resolve(KernelKind::Msa, nodes, &limits), Ok(nodes));
+            assert_eq!(
+                resolve(KernelKind::Msa, nodes + 1, &limits),
+                Err(CapacityError::AboveDeviceBudget {
+                    requested: nodes + 1,
+                    budget: nodes,
+                    resource: BudgetResource::DeviceMemory
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn msa_limits_are_zero_without_session_memory() {
+        for free_bytes in [0, 32 << 20] {
+            let limits = a4000(free_bytes);
+            assert_eq!(msa_max_nodes(&limits, 128), 0);
+            assert_eq!(msa_max_couplers(&limits, 128), 0);
+        }
+    }
+
+    #[test]
+    fn advertised_msa_uses_the_device_budget_and_optional_cap() {
+        let limits = a4000_limits();
+        assert_eq!(
+            advertised_nodes(KernelKind::Msa, usize::MAX, Some(&limits)),
+            msa_max_nodes(&limits, 128)
+        );
+        assert_eq!(advertised_nodes(KernelKind::Msa, 8192, Some(&limits)), 8192);
+        assert_eq!(
+            advertised_nodes(KernelKind::Msa, 64, Some(&limits)),
+            MSA_DEFAULT_NODES
+        );
+        assert_eq!(advertised_nodes(KernelKind::Msa, usize::MAX, None), 0);
     }
 
     #[test]
     fn msa_read_cap_is_two_words_of_lanes() {
         assert_eq!(MSA_MAX_READS, 128);
-    }
-
-    #[test]
-    fn advertised_passes_msa_through_between_the_default_and_the_ceiling() {
-        assert_eq!(advertised_nodes(KernelKind::Msa, 8192), 8192);
-        assert_eq!(advertised_nodes(KernelKind::Msa, 64), MSA_DEFAULT_NODES);
     }
 }

@@ -114,18 +114,17 @@ fn degree_40_spill_matches_all_shared() {
     }
 }
 
-/// The ceiling: 200,000 nodes at degree 40 is 4,000,000 edges. Every read
+/// Historical spill fixture: 200,000 nodes at degree 40. Every read
 /// must come back, and the host-scored energy must equal consensus scoring.
 #[test]
 #[serial]
 #[ignore = "requires a CUDA GPU"]
 fn samples_200k_nodes_at_degree_40() {
     use quip_protocol::scoring::energy_milli;
-    use quip_solver_cuda::capacity::{MSA_MAX_EDGES, MSA_MAX_NODES};
     let device =
-        CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_MAX_NODES).expect("msa at the ceiling");
-    let graph = signed_circulant(MSA_MAX_NODES, 40);
-    assert_eq!(graph.edges.len(), MSA_MAX_EDGES);
+        CudaDevice::open_with_nodes(0, KernelKind::Msa, 200_000).expect("msa at 200k nodes");
+    let graph = signed_circulant(200_000, 40);
+    assert_eq!(graph.edges.len(), 4_000_000);
     let p = SampleParams {
         num_reads: 128,
         num_sweeps: 16,
@@ -133,7 +132,8 @@ fn samples_200k_nodes_at_degree_40() {
         seed: 11,
         ..SampleParams::default()
     };
-    let reads = sample_ising(&device, &graph, &p, KernelKind::Msa).expect("sample at the ceiling");
+    let reads = sample_ising(&device, &graph, &p, KernelKind::Msa)
+        .expect("sample the historical spill fixture");
     assert_eq!(reads.len(), 128);
     for r in reads.iter().take(2) {
         assert_eq!(

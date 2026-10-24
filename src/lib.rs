@@ -195,8 +195,8 @@ const CUDA_ADAPT: quip_solver_core::adapt::AdaptBounds = quip_solver_core::adapt
 /// Narrow a resolved capacity to the wire type.
 ///
 /// Saturating is safe: every value reaching here has passed
-/// [`capacity::resolve`], which bounds it by the algorithm ceiling or the
-/// device shared-memory budget — both orders of magnitude below `u32::MAX`.
+/// [`capacity::resolve`], which bounds it by kernel index widths or the
+/// device memory budget, below `u32::MAX`.
 fn identity_max_nodes(max_nodes: usize) -> u32 {
     u32::try_from(max_nodes).unwrap_or(u32::MAX)
 }
@@ -257,17 +257,16 @@ pub const fn cuda_msa_adapt(max_reads: u32) -> quip_solver_core::adapt::AdaptBou
 
 /// Backend identity for `quip-cuda-msa` at a resolved capacity.
 ///
-/// `max_nodes` is at most `capacity::MSA_MAX_NODES`. Spins past the
-/// device's shared-memory budget spill to global memory, so every device
-/// serves `capacity::MSA_MAX_READS` reads at every size up to that ceiling,
-/// and `max_edges` is `capacity::MSA_MAX_EDGES`.
+/// Node and edge limits come from the device's Binary footprint. Spins past
+/// shared memory spill to global memory. Each axis is an independent bound,
+/// and the session checks the full model footprint before allocating.
 #[must_use]
-pub fn cuda_msa_identity(max_nodes: usize) -> BackendIdentity {
+pub fn cuda_msa_identity(max_nodes: usize, max_edges: usize) -> BackendIdentity {
     BackendIdentity {
         backend: Backend::Cuda,
         algorithm: KernelKind::Msa.algorithm(),
         max_nodes: identity_max_nodes(max_nodes),
-        max_edges: u32::try_from(capacity::MSA_MAX_EDGES).unwrap_or(u32::MAX),
+        max_edges: u32::try_from(max_edges).unwrap_or(u32::MAX),
         features: FEATURES,
         adapt: cuda_msa_adapt(u32::try_from(capacity::MSA_MAX_READS).unwrap_or(u32::MAX)),
         // Unit models run the unit-weight kernel (by sign, 64 lanes per word).

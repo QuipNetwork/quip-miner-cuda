@@ -99,7 +99,7 @@ fn main() -> ExitCode {
         );
     }
     run(
-        cuda_sa_identity(advertised_nodes(KernelKind::Sa, cli.max_nodes)),
+        cuda_sa_identity(advertised_nodes(KernelKind::Sa, cli.max_nodes, None)),
         &cli.common,
         || {
             let device = CudaDevice::open_with_nodes(cli.device, KernelKind::Sa, cli.max_nodes)

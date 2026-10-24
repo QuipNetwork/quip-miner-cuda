@@ -63,9 +63,13 @@ reviewed edit to that list, never a side effect of a toolkit bump.
 
 `quip-cuda-msa` keeps the first spins in shared memory and spills the rest to
 a per-nonce global buffer. The opt-in shared memory per block sets how many
-spins stay on chip. It does not set the node ceiling or the read count. Every
-supported device serves 128 reads up to 200,000 nodes, 4,000,000 edges and
-degree 62. A session whose buffers do not fit device memory is refused. At
+spins stay on chip. It does not set the node ceiling or the read count.
+Node and coupler limits come from device memory divided among instances,
+one per SM. With 15 GiB free, 48 SMs and 128 reads, the A4000
+advertises 3,987,504 uncoupled nodes or 32,139,292 sparse couplers at degree 62.
+These independent Binary limits use the default 64-beta schedule. Each model
+must pass the memory check with its own precision and schedule length.
+The miner refuses a session whose buffers exceed device memory. At
 200,000 nodes and 4,000,000 edges with 48 models, the A4000 measured about 2 GiB
 for unit models and 5.2 GiB for weighted i32 models (see the
 [A4000 spill measurements](docs/perf/2026-10-msa-dram-spill-a4000.md)).

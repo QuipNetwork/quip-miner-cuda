@@ -343,7 +343,7 @@ pub fn assemble_record(
 /// links to i+1 ..= i+degree/2 (mod n). Degree 2 is a ring. With `shuffle`,
 /// nodes are relabeled by a `ChaCha8` permutation of that seed, which keeps
 /// the graph and destroys index locality.
-#[allow(clippy::cast_possible_truncation)] // n bounded by MSA_MAX_NODES
+#[allow(clippy::cast_possible_truncation)] // n fits the supported 64-bit host usize
 fn circulant_graph(n: u64, degree: u64, shuffle: Option<[u8; 32]>) -> IsingGraph {
     let n = n as usize;
     let half = (degree / 2) as usize;

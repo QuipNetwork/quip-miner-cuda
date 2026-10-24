@@ -245,7 +245,10 @@ fn main() -> Result<()> {
     let topo = topology()?;
     let nonces = nonces(args.n)?;
     let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, MSA_DEFAULT_NODES)?;
-    let identity = cuda_msa_identity(device.max_nodes);
+    let identity = cuda_msa_identity(
+        device.max_nodes,
+        quip_solver_cuda::capacity::msa_max_couplers(&device.limits, 128),
+    );
     let adapted = adapt_params(
         args.target_milli,
         1,

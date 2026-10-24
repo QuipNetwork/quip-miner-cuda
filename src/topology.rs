@@ -194,9 +194,9 @@ impl SelfFeedingTopology {
     ///
     /// Host-side adjacency is built entirely in `usize`. Casts to `i32`/`u32`
     /// happen only when packing the CUDA kernel ABI arrays (`row_ptr`,
-    /// `col_ind`, `edge_pos`); graph size is bounded well below `i32::MAX` by
+    /// `col_ind`, `edge_pos`); graph size is bounded by the `i32` index range through
     /// session limits (`DEFAULT_MAX_EDGES` / `max_nodes`, and
-    /// `capacity::MSA_MAX_EDGES` for msa).
+    /// `capacity::msa_max_couplers` for msa).
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn build(graph: &IsingGraph) -> Self {
