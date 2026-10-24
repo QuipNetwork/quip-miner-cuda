@@ -7,6 +7,7 @@
 //! owns every bound on those values so the binaries, the device, and the
 //! backend identities cannot disagree.
 
+use crate::coefficients::{CoefficientPath, CoefficientPlan};
 use crate::kernel::KernelKind;
 use thiserror::Error;
 
@@ -62,6 +63,168 @@ impl DeviceLimits {
     pub fn usable_bytes(&self) -> usize {
         self.free_bytes / MEMORY_HEADROOM_DEN * MEMORY_HEADROOM_NUM
     }
+}
+
+/// Concurrent nonce groups at the kernel's fixed SM width.
+#[must_use]
+pub fn instances(kernel: KernelKind, sm_count: usize) -> usize {
+    (sm_count / kernel.sms_per_instance()).max(1)
+}
+
+/// Coefficient storage and arithmetic for both fields and couplings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precision {
+    /// Unit couplings and fields in {-1, 0, 1}, stored as i8.
+    Binary,
+    /// Scaled i8 coefficients with i32 arithmetic.
+    Int8,
+    /// Exact coefficients wider than i8, stored as i32.
+    Int32,
+    /// Real coefficients stored and evaluated as f32.
+    Float32,
+}
+
+impl Precision {
+    /// Map the selected coefficient path and unit-model property to precision.
+    #[must_use]
+    pub fn from_plan(plan: CoefficientPlan, unit: bool) -> Self {
+        match plan.path {
+            CoefficientPath::Int8 if unit => Self::Binary,
+            CoefficientPath::Int8 => Self::Int8,
+            CoefficientPath::Wide => Self::Int32,
+        }
+    }
+}
+
+/// Device representation of the MSA coupling matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsaStorage {
+    /// Two directed CSR entries per undirected coupling.
+    Sparse,
+    /// Dense matrix storage, not yet implemented.
+    Dense,
+}
+
+/// Topology sizes needed to bound session allocations without building CSR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelShape {
+    /// Number of spins and fields.
+    pub nodes: usize,
+    /// Number of undirected couplings.
+    pub couplers: usize,
+    /// Largest node degree, bounding the greedy colouring by degree plus one.
+    pub max_degree: usize,
+}
+
+/// Device memory shared by the session and repeated for each nonce group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Footprint {
+    /// Session-wide device allocations, including topology and lane tables.
+    /// This is global memory, distinct from CUDA block shared memory.
+    pub shared_bytes: usize,
+    /// Device memory per concurrent nonce group.
+    pub per_instance_bytes: usize,
+    /// Concurrent nonce groups, derived from the device's SM count.
+    pub instances: usize,
+}
+
+impl Footprint {
+    /// Total device memory, saturating so oversized shapes cannot wrap to fit.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.shared_bytes
+            .saturating_add(self.per_instance_bytes.saturating_mul(self.instances))
+    }
+}
+
+/// Beta entries reserved by [`msa_footprint`] for schedule-dependent tables.
+/// Longer schedules need their excess bytes added before checking capacity.
+pub const MSA_FOOTPRINT_BETAS: usize = 65_536;
+
+/// Upper estimate of sparse MSA session device allocations at full width.
+///
+/// CSR and colour tables, beta schedules and integer acceptance tables are
+/// session-wide. Each instance owns three coefficient/sample/energy slots,
+/// eight control words and its spin spill. Empty buffers get stand-ins like
+/// `SelfFeedingSession::build`. Colour counts use the greedy degree-plus-one
+/// bound. A 32 MiB allowance covers CUDA pool growth and allocation overhead
+/// measured by the A4000 allocation test.
+///
+/// The interface has no schedule length: this reserves [`MSA_FOOTPRINT_BETAS`]
+/// beta entries. It assumes the default shared-spin layout, without a bench
+/// shared-spin cap. Dense storage returns a saturated per-instance size until
+/// its allocation layout is implemented.
+#[must_use]
+pub fn msa_footprint(
+    shape: ModelShape,
+    precision: Precision,
+    storage: MsaStorage,
+    reads: usize,
+    limits: &DeviceLimits,
+) -> Footprint {
+    let count = instances(KernelKind::Msa, limits.sm_count);
+    if storage == MsaStorage::Dense {
+        return Footprint {
+            shared_bytes: 0,
+            per_instance_bytes: usize::MAX,
+            instances: count,
+        };
+    }
+    let n = shape.nodes;
+    let nnz = shape.couplers.saturating_mul(2).max(1);
+    let colours = n.min(shape.max_degree.saturating_add(1)).max(1);
+    let mut shared = n
+        .saturating_add(1) // d_row_ptr
+        .saturating_add(nnz) // d_col_ind
+        .saturating_add(colours.saturating_mul(2)) // starts and counts
+        .saturating_add(n.max(1)) // colour nodes
+        .saturating_mul(4)
+        .saturating_add(MSA_FOOTPRINT_BETAS * 4) // d_beta
+        .saturating_add(32 << 20); // CUDA pool growth and allocation overhead
+    let coefficient_bytes = match precision {
+        Precision::Binary | Precision::Int8 => 1,
+        Precision::Int32 | Precision::Float32 => 4,
+    };
+    match precision {
+        Precision::Int8 | Precision::Int32 => {
+            shared = shared
+                .saturating_add(MSA_FOOTPRINT_BETAS * (8 + 4)) // beta_fixed and delta_cut
+                .saturating_add(crate::accept_table::NEGLOG_LEN * 8);
+        }
+        Precision::Binary | Precision::Float32 => {}
+    }
+    let reads = reads.max(1);
+    let words = reads
+        .div_ceil(MSA_LANES)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX);
+    let shared_spins = n.min(msa_shared_spins(
+        msa_dynamic_shared_bytes(limits.shared_bytes_per_block_optin),
+        words,
+    ));
+    let spill = msa_spill_words(n, shared_spins, words, 1)
+        .max(1)
+        .saturating_mul(8);
+    let per_instance = n
+        .max(1)
+        .saturating_add(nnz)
+        .saturating_mul(coefficient_bytes)
+        .saturating_mul(3) // d_h and d_j, three slots
+        .saturating_add(reads.saturating_mul(n.div_ceil(8).max(1)).saturating_mul(3))
+        .saturating_add(reads.saturating_mul(4).saturating_mul(3)) // energies
+        .saturating_add(8 * 4) // d_ctrl
+        .saturating_add(spill);
+    Footprint {
+        shared_bytes: shared,
+        per_instance_bytes: per_instance,
+        instances: count,
+    }
+}
+
+/// Usable device memory per MSA instance, before session-wide allocations.
+#[must_use]
+pub fn msa_per_instance_budget(limits: &DeviceLimits) -> usize {
+    limits.usable_bytes() / instances(KernelKind::Msa, limits.sm_count)
 }
 
 /// Bytes of per-thread stack frame the SA kernel needs for `nodes`.
@@ -373,7 +536,155 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coefficients::{CoefficientPath, CoefficientPlan};
     use crate::kernel::KernelKind;
+
+    fn a4000_limits() -> DeviceLimits {
+        DeviceLimits {
+            shared_bytes_per_block: 49_152,
+            shared_bytes_per_block_optin: 101_376,
+            free_bytes: 15 << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        }
+    }
+
+    #[test]
+    fn instances_divide_sms_by_kernel_width() {
+        assert_eq!(instances(KernelKind::Msa, 48), 48);
+        assert_eq!(instances(KernelKind::Sa, 48), 48);
+        assert_eq!(instances(KernelKind::Gibbs, 48), 12);
+        assert_eq!(instances(KernelKind::Gibbs, 3), 1);
+        assert_eq!(instances(KernelKind::Msa, 0), 1);
+    }
+
+    #[test]
+    fn footprint_grows_with_couplers_and_lane_width() {
+        let l = a4000_limits();
+        let s = |c| ModelShape {
+            nodes: 100_000,
+            couplers: c,
+            max_degree: 40,
+        };
+        let u = msa_footprint(s(2_000_000), Precision::Binary, MsaStorage::Sparse, 128, &l);
+        let w = msa_footprint(s(2_000_000), Precision::Int32, MsaStorage::Sparse, 128, &l);
+        assert!(w.total() > u.total());
+        assert!(
+            msa_footprint(s(4_000_000), Precision::Binary, MsaStorage::Sparse, 128, &l).total()
+                > u.total()
+        );
+        assert_eq!(u.instances, 48);
+    }
+
+    #[test]
+    fn precision_keeps_unit_models_binary_and_wide_models_int32() {
+        for unit in [false, true] {
+            assert_eq!(
+                Precision::from_plan(
+                    CoefficientPlan {
+                        path: CoefficientPath::Wide,
+                        scale_milli: 1
+                    },
+                    unit
+                ),
+                Precision::Int32
+            );
+        }
+        let plan = CoefficientPlan {
+            path: CoefficientPath::Int8,
+            scale_milli: 1000,
+        };
+        assert_eq!(Precision::from_plan(plan, true), Precision::Binary);
+        assert_eq!(Precision::from_plan(plan, false), Precision::Int8);
+    }
+
+    #[test]
+    fn footprint_counts_three_csr_coefficient_slots_per_instance() {
+        let l = a4000_limits();
+        let shape = ModelShape {
+            nodes: 100_000,
+            couplers: 2_000_000,
+            max_degree: 40,
+        };
+        let narrow = msa_footprint(shape, Precision::Int8, MsaStorage::Sparse, 128, &l);
+        let wide = msa_footprint(shape, Precision::Int32, MsaStorage::Sparse, 128, &l);
+        // Three slots, two directed halves per edge, three extra bytes per coefficient.
+        assert_eq!(
+            wide.per_instance_bytes - narrow.per_instance_bytes,
+            36_900_000
+        );
+    }
+
+    #[test]
+    fn footprint_accounts_for_reads_and_spill_layout() {
+        let l = a4000_limits();
+        let shape = ModelShape {
+            nodes: 100_000,
+            couplers: 2_000_000,
+            max_degree: 40,
+        };
+        let one = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 64, &l);
+        let two = msa_footprint(shape, Precision::Binary, MsaStorage::Sparse, 128, &l);
+        // 64 more reads in three sample/energy slots, plus the larger spill.
+        assert_eq!(two.per_instance_bytes - one.per_instance_bytes, 3_200_768);
+        let mut no_shared = l;
+        no_shared.shared_bytes_per_block_optin = 0;
+        let spilled = msa_footprint(
+            shape,
+            Precision::Binary,
+            MsaStorage::Sparse,
+            128,
+            &no_shared,
+        );
+        assert_eq!(spilled.per_instance_bytes - two.per_instance_bytes, 92_656);
+    }
+
+    #[test]
+    fn dense_footprint_refuses_until_dense_storage_is_implemented() {
+        let footprint = msa_footprint(
+            ModelShape {
+                nodes: 10,
+                couplers: 45,
+                max_degree: 9,
+            },
+            Precision::Float32,
+            MsaStorage::Dense,
+            128,
+            &a4000_limits(),
+        );
+        assert_eq!(footprint.per_instance_bytes, usize::MAX);
+        assert_eq!(footprint.total(), usize::MAX);
+    }
+
+    #[test]
+    fn footprint_saturates_instead_of_wrapping_large_shapes() {
+        let footprint = msa_footprint(
+            ModelShape {
+                nodes: usize::MAX,
+                couplers: usize::MAX,
+                max_degree: usize::MAX,
+            },
+            Precision::Int32,
+            MsaStorage::Sparse,
+            usize::MAX,
+            &a4000_limits(),
+        );
+        assert_eq!(footprint.total(), usize::MAX);
+        assert_eq!(
+            Footprint {
+                shared_bytes: 1,
+                per_instance_bytes: usize::MAX / 2 + 1,
+                instances: 2
+            }
+            .total(),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn msa_budget_divides_usable_memory_between_instances() {
+        assert_eq!(msa_per_instance_budget(&a4000_limits()), 268_435_456);
+    }
 
     #[test]
     fn wide_budget_fits_the_compiled_frame_at_16_gib() {

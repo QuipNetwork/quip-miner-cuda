@@ -156,30 +156,20 @@ struct AlgoLimits {
 
 fn algo_limits(kernel: KernelKind) -> AlgoLimits {
     match kernel {
-        // 1 block (1 SM) per nonce; `if (tid < num_reads)` in a 256-thread
-        // block hard-caps reads/nonce. N is capped by the kernel's
-        // `unpacked_state[QUIP_MAX_NODES]`, which is resolved per process and
-        // carried on `CudaDevice::max_nodes` rather than fixed here.
-        KernelKind::Sa => AlgoLimits {
-            sms_per_nonce: 1,
+        // SA's 256-thread block caps reads/nonce. Gibbs chunks reads across
+        // four blocks but keeps the same cap to bound device memory. Their
+        // state-array node limits are resolved on `CudaDevice::max_nodes`.
+        KernelKind::Sa | KernelKind::Gibbs => AlgoLimits {
+            sms_per_nonce: kernel.sms_per_instance(),
             max_reads: 256,
             threads_per_block: 256,
         },
         // 1 block (1 SM) per nonce, like SA. Reads are lanes of 64-bit
         // replica words, two words per spin.
         KernelKind::Msa => AlgoLimits {
-            sms_per_nonce: 1,
+            sms_per_nonce: kernel.sms_per_instance(),
             max_reads: capacity::MSA_MAX_READS,
             threads_per_block: capacity::MSA_THREADS_PER_NONCE,
-        },
-        // reads/nonce isn't block-capped (work is chunked across
-        // `sms_per_nonce` blocks) but is held to the same 256 for a uniform,
-        // generous device-memory bound. N is capped by
-        // `shared_state[QUIP_MAX_NODES]`, see above.
-        KernelKind::Gibbs => AlgoLimits {
-            sms_per_nonce: 4,
-            max_reads: 256,
-            threads_per_block: 256,
         },
     }
 }
@@ -2019,7 +2009,7 @@ impl SlotState {
 /// ```
 #[must_use]
 pub fn stream_width(device: &CudaDevice, kernel: KernelKind) -> usize {
-    (device.max_sms / algo_limits(kernel).sms_per_nonce).max(1)
+    capacity::instances(kernel, device.max_sms)
 }
 
 enum Pull {

@@ -22,6 +22,15 @@ pub enum KernelKind {
 }
 
 impl KernelKind {
+    /// SMs occupied by one independent nonce group, fixed by the kernel.
+    #[must_use]
+    pub const fn sms_per_instance(self) -> usize {
+        match self {
+            Self::Sa | Self::Msa => 1,
+            Self::Gibbs => 4,
+        }
+    }
+
     /// The one name this kernel goes by: the wire `algorithm` name (see
     /// [`Self::algorithm`]), the binary suffix (`quip-cuda-<name>`), the kernel file stem and the JIT cache
     /// key.
