@@ -210,8 +210,8 @@ fn tile_i32(src: &[i32], times: usize) -> Vec<i32> {
 /// Beta schedule of the kind `schedule` names, cast to f32 for kernel upload,
 /// plus sweeps-per-beta.
 // The kernel's beta buffer is `float`, so the schedule is deliberately narrowed
-// on upload. Betas here run O(0.01)-O(10), far inside f32's range, and every
-// kernel-side use of them is f32 arithmetic regardless.
+// on upload. Real coefficient sessions check the converted schedule before
+// allocation because small fields can produce betas beyond f32's range.
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn build_beta_schedule(
     graph: &IsingGraph,
@@ -234,6 +234,29 @@ pub(crate) fn build_beta_schedule(
         .map(|&b| (b * beta_factor) as f32)
         .collect();
     (sched, sweeps_per)
+}
+
+fn build_planned_beta_schedule(
+    graph: &IsingGraph,
+    params: &SampleParams,
+    plan: CoefficientPlan,
+) -> Result<(Vec<f32>, usize), SampleError> {
+    let (beta, sweeps_per_beta) = build_beta_schedule(
+        graph,
+        params.num_sweeps,
+        params.sweeps_per_beta,
+        params.beta_range,
+        params.schedule,
+        plan.beta_factor(),
+    );
+    if plan.path == CoefficientPath::Float32 {
+        if let Some(index) = beta.iter().position(|value| !value.is_finite()) {
+            return Err(SampleError::Unsupported(format!(
+                "real beta schedule value at index {index} is outside the finite f32 range"
+            )));
+        }
+    }
+    Ok((beta, sweeps_per_beta))
 }
 
 pub(crate) fn score_spins(spins: &[i8], graph: &IsingGraph) -> SamplerResult {
@@ -1736,14 +1759,7 @@ fn sample_one_planned(
 
     let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
-    let (beta, sweeps_per_beta) = build_beta_schedule(
-        graph,
-        params.num_sweeps,
-        params.sweeps_per_beta,
-        params.beta_range,
-        params.schedule,
-        plan.beta_factor(),
-    );
+    let (beta, sweeps_per_beta) = build_planned_beta_schedule(graph, params, plan)?;
     let topology = SelfFeedingTopology::build(graph);
 
     let mut sess = SelfFeedingSession::build(
@@ -1797,7 +1813,8 @@ pub type SampleSet = Vec<RealSample>;
 ///
 /// # Errors
 /// Returns the same device and capacity errors as [`sample_one`].
-/// Non-finite or unrepresentable f32 coefficients are refused.
+/// Non-finite or unrepresentable f32 coefficients are refused. Real f32
+/// sessions also refuse beta schedules outside the finite f32 range.
 pub fn sample_one_real(
     device: &CudaDevice,
     graph: &IsingGraph,
@@ -2008,7 +2025,8 @@ pub fn bench_many(
 /// Returned energies use the original f64 graph and exclude any file offset.
 ///
 /// # Errors
-/// Returns device and capacity errors as [`bench_many`], and refuses invalid f32 coefficients.
+/// Returns device and capacity errors as [`bench_many`], and refuses invalid f32
+/// coefficients or beta schedules outside the finite f32 range.
 pub fn bench_many_real(
     device: &CudaDevice,
     graph: &IsingGraph,
@@ -2062,14 +2080,7 @@ fn bench_many_planned(
     }
     let limits = algo_limits(kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
-    let (beta, sweeps_per_beta) = build_beta_schedule(
-        graph,
-        params.num_sweeps,
-        params.sweeps_per_beta,
-        params.beta_range,
-        params.schedule,
-        plan.beta_factor(),
-    );
+    let (beta, sweeps_per_beta) = build_planned_beta_schedule(graph, params, plan)?;
     let topology = SelfFeedingTopology::build(graph);
     let mut sess = SelfFeedingSession::build(
         device,
@@ -3017,6 +3028,48 @@ mod tests {
     fn float_plan_refuses_overflowing_local_fields() {
         let graph = crate::IsingGraph::new(vec![2.0e38, 0.0], vec![2.0e38], vec![(0, 1)]);
         assert!(super::float_plan(&graph).is_err());
+    }
+
+    #[test]
+    fn real_beta_schedule_refuses_f32_overflow() {
+        let graph = IsingGraph::new(vec![1.2e-38; 64], vec![], vec![]);
+        let plan = float_plan(&graph).unwrap();
+        for (schedule, beta_range) in [
+            (BetaSchedule::Geometric, None),
+            (BetaSchedule::Linear, None),
+            (BetaSchedule::Linear, Some((1.0, 3.6e38))),
+            (BetaSchedule::Linear, Some((3.6e38, 1.0))),
+            (BetaSchedule::Linear, Some((f64::NAN, 1.0))),
+        ] {
+            let params = SampleParams {
+                schedule,
+                beta_range,
+                ..SampleParams::default()
+            };
+            let error = build_planned_beta_schedule(&graph, &params, plan).unwrap_err();
+            let SampleError::Unsupported(message) = &error else {
+                panic!("expected unsupported beta range, got {error:?}");
+            };
+            assert!(message.contains("beta"), "{message}");
+            assert!(message.contains("f32"), "{message}");
+            assert_eq!(WireSampleError::from(error), WireSampleError::Capacity);
+        }
+    }
+
+    #[test]
+    fn real_beta_schedule_accepts_finite_override() {
+        let graph = IsingGraph::new(vec![1.2e-38; 64], vec![], vec![]);
+        let plan = float_plan(&graph).unwrap();
+        let params = SampleParams {
+            num_sweeps: 8,
+            sweeps_per_beta: 2,
+            beta_range: Some((1.0e37, 3.0e38)),
+            ..SampleParams::default()
+        };
+        let (beta, sweeps_per_beta) = build_planned_beta_schedule(&graph, &params, plan).unwrap();
+        assert_eq!(beta.len(), 4);
+        assert_eq!(sweeps_per_beta, 2);
+        assert!(beta.iter().all(|value| value.is_finite()));
     }
 
     #[test]

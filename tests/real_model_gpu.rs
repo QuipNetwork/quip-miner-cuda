@@ -2,7 +2,8 @@
 
 use quip_solver_cuda::coefficients::{plan, CoefficientPath};
 use quip_solver_cuda::cuda_device::{CudaDevice, MsaLane};
-use quip_solver_cuda::streaming::{bench_one, sample_one, sample_one_real};
+use quip_solver_cuda::sampler::SampleError;
+use quip_solver_cuda::streaming::{bench_many_real, bench_one, sample_one, sample_one_real};
 use quip_solver_cuda::{IsingGraph, KernelKind, SampleParams};
 
 fn device() -> CudaDevice {
@@ -61,11 +62,39 @@ fn exact_milli_graph_ignores_float_path() {
     ] {
         let exact = sample_one(&device, &graph, &params, KernelKind::Msa).unwrap();
         let real = sample_one_real(&device, &graph, &params).unwrap();
+        assert_eq!(exact.len(), params.num_reads);
+        assert_eq!(real.len(), params.num_reads);
         for (a, b) in exact.iter().zip(&real) {
             assert_eq!(a.spins, b.spins);
             assert!((b.energy - energy(&b.spins, &graph)).abs() < 1e-12);
         }
     }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn real_sampling_refuses_f32_beta_overflow() {
+    let device = device();
+    let graph = IsingGraph::new(vec![1.2e-38; 64], vec![], vec![]);
+    let error = sample_one_real(&device, &graph, &params()).unwrap_err();
+    let SampleError::Unsupported(message) = error else {
+        panic!("expected unsupported beta range, got {error:?}");
+    };
+    assert!(message.contains("beta"), "{message}");
+    assert!(message.contains("f32"), "{message}");
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn real_bench_refuses_f32_beta_overflow() {
+    let device = device();
+    let graph = IsingGraph::new(vec![1.2e-38; 64], vec![], vec![]);
+    let error = bench_many_real(&device, &graph, &params(), 1).unwrap_err();
+    let SampleError::Unsupported(message) = error else {
+        panic!("expected unsupported beta range, got {error:?}");
+    };
+    assert!(message.contains("beta"), "{message}");
+    assert!(message.contains("f32"), "{message}");
 }
 
 #[test]
