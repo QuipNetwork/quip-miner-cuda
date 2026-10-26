@@ -1,5 +1,6 @@
 //! Precision storage and real-valued MSA sampling on a CUDA device.
 
+use quip_solver_cuda::capacity::{msa_device_reads, MsaStorage};
 use quip_solver_cuda::coefficients::{plan, CoefficientPath};
 use quip_solver_cuda::cuda_device::{CudaDevice, MsaLane};
 use quip_solver_cuda::sampler::SampleError;
@@ -62,8 +63,8 @@ fn exact_milli_graph_ignores_float_path() {
     ] {
         let exact = sample_one(&device, &graph, &params, KernelKind::Msa).unwrap();
         let real = sample_one_real(&device, &graph, &params).unwrap();
-        assert_eq!(exact.len(), params.num_reads);
-        assert_eq!(real.len(), params.num_reads);
+        assert_eq!(exact.len(), msa_device_reads(&device.limits));
+        assert_eq!(real.len(), msa_device_reads(&device.limits));
         for (a, b) in exact.iter().zip(&real) {
             assert_eq!(a.spins, b.spins);
             assert!((b.energy - energy(&b.spins, &graph)).abs() < 1e-12);
@@ -163,7 +164,7 @@ fn off_grid_graph_runs_on_f32() {
         })
         .fold(f64::INFINITY, f64::min);
     let reads = sample_one_real(&device, &graph, &params()).unwrap();
-    assert_eq!(reads.len(), 128);
+    assert_eq!(reads.len(), msa_device_reads(&device.limits));
     assert!(reads
         .iter()
         .any(|r| (r.energy - ground).abs() <= 1e-4 * ground.abs().max(1.0)));
@@ -188,7 +189,10 @@ fn real_chunked_fields_keep_fractional_couplings_with_spill() {
         edges,
     );
     let ground = energy(&vec![-1; nodes], &graph);
-    for num_reads in [64, 128] {
+    for num_reads in [64, 128]
+        .into_iter()
+        .filter(|&reads| reads <= msa_device_reads(&device.limits))
+    {
         let params = SampleParams {
             num_reads,
             ..params()
@@ -198,5 +202,133 @@ fn real_chunked_fields_keep_fractional_couplings_with_spill() {
         assert!(reads
             .iter()
             .any(|r| (r.energy - ground).abs() < 1e-4 * ground.abs()));
+    }
+}
+
+fn acceptance_oracle() -> Vec<Vec<i8>> {
+    fn mix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    let base_seed = mix(42) >> 32;
+    assert_eq!(base_seed, 0xbdd7_3226);
+    let slot_seed = mix(base_seed << 8);
+    assert_eq!(slot_seed, 0xfbf9_46e1_d36c_5141);
+    let p = (-2.0 * (2.0 * f64::from(0.125_000_01_f32))).exp();
+    let oracle: Vec<Vec<i8>> = (0..128_u64)
+        .map(|r| {
+            (0..64_u64)
+                .map(|node| {
+                    let event = mix(slot_seed ^ (1 << 40) ^ node);
+                    let uniform = (f64::from(u32::try_from(mix(event ^ r) >> 41).unwrap()) + 0.5)
+                        / 8_388_608.0;
+                    if uniform < p {
+                        1
+                    } else {
+                        -1
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    oracle
+}
+
+/// Pin independent acceptance draws across lanes, replica words and spill layouts.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn real_sparse_acceptance_matches_replica_oracle() {
+    use quip_solver_core::BetaSchedule;
+    use quip_solver_cuda::streaming::last_storage;
+
+    fn mask(samples: &[Vec<i8>], node: usize) -> u64 {
+        samples.iter().enumerate().fold(0, |bits, (r, spins)| {
+            bits | (u64::from(spins[node] == 1) << r)
+        })
+    }
+
+    let mut device = device();
+    let max_reads = msa_device_reads(&device.limits);
+    if max_reads == 64 {
+        eprintln!(
+            "63/64 replica word crossing requires a 128-read device; running 63 and 64 reads"
+        );
+    }
+    let oracle = acceptance_oracle();
+    let expected_masks = [
+        [0xf993_8ace_786f_bd13, 0xad3e_4a59_54b9_5e76],
+        [0xf5ac_4257_3db9_7b93, 0x97dd_dffb_57db_ed9c],
+    ];
+    for (node, expected) in expected_masks.iter().enumerate() {
+        assert_eq!(mask(&oracle[..64], node), expected[0]);
+        assert_eq!(mask(&oracle[64..], node), expected[1]);
+    }
+    assert_ne!(oracle[63][0], oracle[64][0]);
+    let mut prefix: Option<Vec<Vec<i8>>> = None;
+    for degree in [20, 22] {
+        let edges: Vec<_> = (0..64)
+            .flat_map(|node| (1..=degree / 2).map(move |d| (node, (node + d) % 64)))
+            .collect();
+        let graph = IsingGraph::new(vec![0.125_000_01_f64; 64], vec![0.0; edges.len()], edges);
+        assert!(plan(KernelKind::Msa, &graph, device.max_nodes).is_err());
+        for cap in [None, Some(0)] {
+            device.msa_shared_spins_cap = cap;
+            for num_reads in [63, 64, 65, 128].into_iter().filter(|&r| r <= max_reads) {
+                let params = SampleParams {
+                    num_reads,
+                    num_sweeps: 2,
+                    sweeps_per_beta: 1,
+                    seed: 42,
+                    schedule: BetaSchedule::Linear,
+                    beta_range: Some((1_000_000.0, 2.0)),
+                };
+                let mut repeated = Vec::new();
+                for _ in 0..2 {
+                    let reads = sample_one_real(&device, &graph, &params).unwrap();
+                    assert_eq!(last_storage(&device), Some(MsaStorage::Sparse));
+                    assert_eq!(reads.len(), num_reads);
+                    repeated.push(reads.into_iter().map(|read| read.spins).collect::<Vec<_>>());
+                }
+                let samples = &repeated[0];
+                if num_reads >= 64 {
+                    eprintln!("degree={degree} cap={cap:?} reads={num_reads} node0={:#018x} node1={:#018x}", mask(&samples[..64], 0), mask(&samples[..64], 1));
+                }
+                if num_reads == 128 {
+                    eprintln!(
+                        "second word: node0={:#018x} node1={:#018x}",
+                        mask(&samples[64..], 0),
+                        mask(&samples[64..], 1)
+                    );
+                }
+                assert_eq!(
+                    repeated[0], repeated[1],
+                    "repeatability: degree={degree} cap={cap:?} reads={num_reads}"
+                );
+                if let Some(previous) = &prefix {
+                    let common = previous.len().min(num_reads);
+                    assert_eq!(
+                        samples[..common],
+                        previous[..common],
+                        "prefix: degree={degree} cap={cap:?} reads={num_reads}"
+                    );
+                }
+                prefix = Some(samples.clone());
+                assert_eq!(
+                    *samples,
+                    oracle[..num_reads],
+                    "oracle: degree={degree} cap={cap:?} reads={num_reads}"
+                );
+                if num_reads >= 64 {
+                    for (node, expected) in expected_masks.iter().enumerate() {
+                        assert_eq!(mask(&samples[..64], node), expected[0]);
+                        if num_reads == 128 {
+                            assert_eq!(mask(&samples[64..], node), expected[1]);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

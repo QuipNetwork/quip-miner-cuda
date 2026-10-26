@@ -1,7 +1,7 @@
 # A4000 capacity and slowdown
 
-The RTX A4000 runs sparse models with more than one million nodes and complete models up to 9,595 nodes with Binary coefficients.
-Float32 fits complete models with 4,800 nodes. The limits describe how much fits. The times show how long it runs.
+The RTX A4000 runs sparse models with more than one million nodes and complete models up to 9,583 nodes with Binary coefficients.
+Float32 fits complete models with 4,794 nodes. The limits describe how much fits. The times show how long it runs.
 
 ## Test setup
 
@@ -31,24 +31,36 @@ Sparse runs use synthetic circulant graphs without node shuffling. Complete grap
 
 ## Runtime capacity grid
 
-The initial probe reports 16,621,961,216 free bytes and 13,297,568,972 usable bytes.
+The corrected probe on 2026-10-26 reports 16,621,961,216 free bytes and 13,297,568,972 usable bytes.
 The budget is 277,032,686 bytes per instance. The probe uses 48 instances and 64 beta rungs.
 The limits use these values. Free device memory can change between runs.
+The corrected footprint includes a 32 MiB session allowance for pool growth on both storage paths.
 
 | Connectivity | Precision | Nodes | Couplers | Storage | Bytes per instance | Slowdown, 48 nonces |
 |---|---|---:|---:|---|---:|---:|
 | degree 20 | Binary | 2,145,598 | 21,455,980 | spill | 272,399,954 | 4.186× |
 | degree 20 | Int8 | 2,145,512 | 21,455,120 | spill | 272,388,936 | 5.109× |
+| degree 20 | Int32 | 869,680 | 8,696,800 | spill | 274,727,792 | unknown |
 | degree 20 | Float32 | 869,715 | 8,697,150 | spill | 274,739,092 | 9.086× |
 | degree 60 | Binary | 1,096,198 | 32,885,940 | spill | 270,669,914 | 16.597× |
 | degree 60 | Int8 | 1,096,153 | 32,884,590 | spill | 270,659,039 | 76.852× |
+| degree 60 | Int32 | 345,013 | 10,350,390 | spill | 274,539,404 | unknown |
 | degree 60 | Float32 | 345,027 | 10,350,810 | spill | 274,550,644 | 94.018× |
-| complete | Binary | 9,595 | 46,027,215 | dense | 276,990,348 | 2981.754× |
-| complete | Int8 | 9,595 | 46,027,215 | dense | 276,990,348 | 5430.551× |
-| complete | Float32 | 4,800 | 11,517,600 | dense | 276,923,168 | 1382.427× |
+| complete | Binary | 9,583 | 45,912,153 | dense | 276,298,944 | 2979.056× |
+| complete | Int8 | 9,583 | 45,912,153 | dense | 276,298,944 | 5424.181× |
+| complete | Int32 | 4,794 | 11,488,821 | dense | 276,232,232 | 1885.922× |
+| complete | Float32 | 4,794 | 11,488,821 | dense | 276,232,232 | 1379.464× |
 
-Int32 has the Float32 capacity. Each precision applies to both fields and couplings.
+Each precision applies to both fields and couplings. Int32 also needs 525,056 bytes for integer acceptance tables with 64 beta rungs.
+The probe computes an Int32 limit with those tables. Node rounding can give the same complete-model limit for both precisions.
 Each instance uses one SM. The limit depends on precision. It also counts reads and beta rungs.
+
+The prior probe used the same memory snapshot. It admitted complete Binary and Int8 models at 9,595 nodes and Float32 at 4,800 nodes.
+The corrected limits are 9,583 and 4,794 nodes. The timing tables keep the measured sizes from the prior run.
+The calibration endpoints remain those measured sizes. The corrected grid interpolates within that range.
+
+The JSON and text probe logs are in the worktree at
+`.superpowers/sdd/2026-10-23-msa-vram-capacity-dense/final-fix-probe-{json,text}.log`.
 
 ## Timing and slowdown tables
 

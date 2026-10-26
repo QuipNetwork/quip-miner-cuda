@@ -180,10 +180,10 @@ fn print_probe(device: &CudaDevice, reads: usize, json: bool) {
         limits.sm_count, limits.free_bytes, limits.usable_bytes(),
         instances(KernelKind::Msa, limits.sm_count), msa_per_instance_budget(limits));
     println!(
-        "{:<12} | {:<48} | {:<48} | {:<48}",
-        "Connectivity", "Binary", "Int8", "Float32"
+        "{:<12} | {:<48} | {:<48} | {:<48} | {:<48}",
+        "Connectivity", "Binary", "Int8", "Int32", "Float32"
     );
-    for row in cells.chunks(3) {
+    for row in cells.chunks(4) {
         print!("{:<12}", connectivity(row[0].connectivity));
         for cell in row {
             print!(
@@ -202,19 +202,20 @@ fn print_probe(device: &CudaDevice, reads: usize, json: bool) {
     }
     println!("Bytes per instance:");
     println!(
-        "{:<12} | {:<16} | {:<16} | {:<16}",
-        "Connectivity", "Binary", "Int8", "Float32"
+        "{:<12} | {:<16} | {:<16} | {:<16} | {:<16}",
+        "Connectivity", "Binary", "Int8", "Int32", "Float32"
     );
-    for row in cells.chunks(3) {
+    for row in cells.chunks(4) {
         println!(
-            "{:<12} | {:<16} | {:<16} | {:<16}",
+            "{:<12} | {:<16} | {:<16} | {:<16} | {:<16}",
             connectivity(row[0].connectivity),
             row[0].per_instance_bytes,
             row[1].per_instance_bytes,
-            row[2].per_instance_bytes
+            row[2].per_instance_bytes,
+            row[3].per_instance_bytes
         );
     }
-    println!("Int32 has the Float32 capacity. Slowdown: RTX A4000, 128 reads, 48 nonces, per lane-update against degree-20 Binary N=5791. Unknown for other read counts or outside measured ranges.");
+    println!("Slowdown: RTX A4000, 128 reads, 48 nonces, per lane-update against degree-20 Binary N=5791. Unknown for other read counts or outside measured ranges.");
 }
 
 #[cfg(test)]

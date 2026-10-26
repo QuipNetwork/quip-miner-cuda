@@ -292,9 +292,11 @@ fn measure_dense_allocation(
         "dense {precision:?} N={nodes} instances={} measured={measured} footprint={exact}",
         footprint.instances
     );
-    // cuMemGetInfo includes allocator page rounding and pool growth.
-    // Allow the same 64 MiB driver overhead as the sparse measurement.
-    assert!(measured.abs_diff(exact) <= 64 << 20);
+    assert!(
+        measured <= exact,
+        "dense allocation underestimated: {measured} > {exact}"
+    );
+    assert!(exact <= measured + measured / 10 + (64 << 20));
     ctx.synchronize().unwrap();
 }
 
@@ -431,7 +433,16 @@ fn probe_capacity_json_parses() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["cells"].as_array().unwrap().len(), 9);
+    assert_eq!(value["cells"].as_array().unwrap().len(), 12);
+    assert_eq!(
+        value["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|cell| cell["precision"] == "Int32")
+            .count(),
+        3
+    );
     assert_eq!(value["betas"], 64);
     assert!(value["reads"] == 128 || value["reads"] == 64);
     for cell in value["cells"].as_array().unwrap() {
@@ -510,4 +521,138 @@ fn shared_spin_cap_is_counted_before_allocation() {
         ),
         Err(SampleError::ModelExceedsDeviceMemory { .. })
     ));
+}
+
+fn boundary_graph(
+    conn: quip_solver_cuda::capacity::Connectivity,
+    n: usize,
+    precision: Precision,
+) -> IsingGraph {
+    use quip_solver_cuda::capacity::Connectivity;
+    let mut g = match conn {
+        Connectivity::Degree(d) => circulant(n, d, precision),
+        Connectivity::Complete => dense_graph(n, precision),
+    };
+    for (i, h) in g.h.iter_mut().enumerate() {
+        *h = match precision {
+            Precision::Binary => 1.0,
+            Precision::Int8 if conn == Connectivity::Complete => 1.0,
+            Precision::Int8 if i % 2 == 0 => 0.016,
+            Precision::Int8 => -0.992,
+            Precision::Int32 if i % 2 == 0 => 0.001,
+            Precision::Int32 => 1.001,
+            Precision::Float32 => std::f64::consts::SQRT_2,
+        };
+    }
+    if precision != Precision::Float32 {
+        assert_eq!(
+            Precision::from_plan(coefficients::plan(KernelKind::Msa, &g, n).unwrap(), true),
+            precision
+        );
+    }
+    g
+}
+
+/// Use the real derived node cap, rather than lowering only the memory budget.
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn derived_node_boundaries_report_memory_before_node_caps() {
+    use quip_solver_cuda::capacity::{msa_max_model, Connectivity};
+    use quip_solver_cuda::streaming::{sample_one, sample_one_real};
+    let mut device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 5000).unwrap();
+    let limits = DeviceLimits {
+        free_bytes: 64 << 20,
+        ..device.limits
+    };
+    device = device.with_limits_for_test(limits);
+    let p = SampleParams {
+        num_reads: msa_device_reads(&limits),
+        num_sweeps: 256,
+        sweeps_per_beta: 4,
+        beta_range: Some((0.01, 0.1)),
+        ..SampleParams::default()
+    };
+    let ctx = CudaContext::new(device.device_index).unwrap();
+    for conn in [Connectivity::Degree(0), Connectivity::Complete] {
+        for precision in [
+            Precision::Binary,
+            Precision::Int8,
+            Precision::Int32,
+            Precision::Float32,
+        ] {
+            let shape = msa_max_model(conn, precision, p.num_reads, &limits);
+            device.max_nodes = shape.nodes;
+            let graph = |n| boundary_graph(conn, n, precision);
+            let over = graph(shape.nodes + 1);
+            ctx.synchronize().unwrap();
+            let (before, _) = ctx.mem_get_info().unwrap();
+            let error = sample_one_real(&device, &over, &p).unwrap_err();
+            assert!(
+                matches!(error, SampleError::ModelExceedsDeviceMemory { .. }),
+                "{conn:?} {precision:?}: {error:?}"
+            );
+            if precision == Precision::Float32 {
+                let error = bench_many_real(&device, &over, &p, 1).unwrap_err();
+                assert!(
+                    matches!(error, SampleError::ModelExceedsDeviceMemory { .. }),
+                    "{conn:?} {precision:?}: {error:?}"
+                );
+            }
+            if precision != Precision::Float32 {
+                assert!(matches!(
+                    sample_one(&device, &over, &p, KernelKind::Msa),
+                    Err(SampleError::ModelExceedsDeviceMemory { .. })
+                ));
+                assert!(matches!(
+                    bench_many(&device, &over, &p, KernelKind::Msa, None, 1),
+                    Err(SampleError::ModelExceedsDeviceMemory { .. })
+                ));
+            }
+            ctx.synchronize().unwrap();
+            let (after, _) = ctx.mem_get_info().unwrap();
+            assert!(before.saturating_sub(after) <= 2 << 20);
+            let fits = graph(shape.nodes);
+            assert_eq!(
+                sample_one_real(&device, &fits, &p).unwrap().len(),
+                p.num_reads
+            );
+            if precision == Precision::Float32 {
+                assert_eq!(
+                    bench_many_real(&device, &fits, &p, 1).unwrap().0.len(),
+                    p.num_reads
+                );
+            }
+            if precision != Precision::Float32 {
+                assert_eq!(
+                    sample_one(&device, &fits, &p, KernelKind::Msa)
+                        .unwrap()
+                        .len(),
+                    p.num_reads
+                );
+                assert_eq!(
+                    bench_many(&device, &fits, &p, KernelKind::Msa, None, 1)
+                        .unwrap()
+                        .0
+                        .len(),
+                    p.num_reads
+                );
+            }
+            device.max_nodes = shape.nodes - 1;
+            assert!(matches!(
+                sample_one_real(&device, &fits, &p),
+                Err(SampleError::GraphTooLarge { .. })
+            ));
+            if precision == Precision::Float32 {
+                assert!(matches!(
+                    bench_many_real(&device, &fits, &p, 1),
+                    Err(SampleError::GraphTooLarge { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    bench_many(&device, &fits, &p, KernelKind::Msa, None, 1),
+                    Err(SampleError::GraphTooLarge { .. })
+                ));
+            }
+        }
+    }
 }

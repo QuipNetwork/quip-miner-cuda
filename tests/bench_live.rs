@@ -197,3 +197,67 @@ fn bench_real_coefficients_keep_real_energies_and_timing() {
         assert!((read.energy - fields - pairs).abs() < 1e-10);
     }
 }
+
+/// The device read limit must agree with both the samples and emitted metadata.
+#[test]
+#[ignore = "requires a CUDA device"]
+#[serial]
+fn msa_bench_record_reads_match_returned_samples() {
+    use quip_solver_cuda::capacity::msa_device_reads;
+    use quip_solver_cuda::schema::BenchRecord;
+    let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 64).unwrap();
+    let num_reads = msa_device_reads(&device.limits);
+    let params = SampleParams {
+        num_reads,
+        num_sweeps: 2,
+        ..SampleParams::default()
+    };
+    let (reads, _) = bench_one(&device, &ring(64), &params, KernelKind::Msa, None).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-msa"))
+        .args([
+            "bench",
+            "run",
+            "--reads",
+            &num_reads.to_string(),
+            "--sweeps",
+            "2",
+            "--warmup",
+            "0",
+            "--repeats",
+            "1",
+            "--out",
+        ])
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries: Vec<_> = std::fs::read_dir(out.path()).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let text = std::fs::read_to_string(entries[0].as_ref().unwrap().path()).unwrap();
+    let record: BenchRecord = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(record.reads, u64::try_from(reads.len()).unwrap());
+    let scores = record
+        .parts
+        .iter()
+        .find(|p| p.part == "energy_score")
+        .unwrap();
+    assert_eq!(scores.count, record.reads);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_quip-cuda-msa"))
+        .args([
+            "bench",
+            "run",
+            "--reads",
+            &(num_reads + 1).to_string(),
+            "--out",
+        ])
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("outside"));
+}

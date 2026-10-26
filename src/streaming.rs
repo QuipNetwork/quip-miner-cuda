@@ -576,38 +576,47 @@ fn session_topology(
     kernel: KernelKind,
     graph: &IsingGraph,
     forced: Option<capacity::MsaStorage>,
+    reads: usize,
+    betas: usize,
+    arithmetic: SessionArithmetic,
 ) -> Result<SelfFeedingTopology, SampleError> {
+    let n = graph.num_nodes();
+    let mut degrees = vec![0usize; n];
+    for &(u, v) in graph.edges.iter() {
+        if let Some(degree) = degrees.get_mut(u) {
+            *degree += 1;
+        }
+        if v != u {
+            if let Some(degree) = degrees.get_mut(v) {
+                *degree += 1;
+            }
+        }
+    }
+    let max_degree = degrees.into_iter().max().unwrap_or(0);
     let storage = if kernel == KernelKind::Msa {
-        forced.unwrap_or_else(|| {
-            let mut degrees = vec![0usize; graph.num_nodes()];
-            for &(u, v) in graph.edges.iter() {
-                if let Some(degree) = degrees.get_mut(u) {
-                    *degree += 1;
-                }
-                if v != u {
-                    if let Some(degree) = degrees.get_mut(v) {
-                        *degree += 1;
-                    }
-                }
-            }
-            if degrees.into_iter().max().unwrap_or(0) > capacity::MSA_MAX_DEGREE {
-                capacity::MsaStorage::Dense
-            } else {
-                capacity::MsaStorage::Sparse
-            }
+        forced.unwrap_or(if max_degree > capacity::MSA_MAX_DEGREE {
+            capacity::MsaStorage::Dense
+        } else {
+            capacity::MsaStorage::Sparse
         })
     } else {
         capacity::MsaStorage::Sparse
     };
+    check_model_capacity(
+        device,
+        kernel,
+        capacity::ModelShape {
+            nodes: n,
+            couplers: graph.edges.len(),
+            max_degree,
+        },
+        storage,
+        reads,
+        betas,
+        arithmetic.normalized(),
+    )?;
     if storage == capacity::MsaStorage::Sparse {
         return Ok(SelfFeedingTopology::build(graph));
-    }
-    let n = graph.num_nodes();
-    if n > device.max_nodes {
-        return Err(SampleError::GraphTooLarge {
-            n,
-            limit: device.max_nodes,
-        });
     }
     let nnz = n
         .checked_mul(n)
@@ -865,16 +874,46 @@ fn build_algo_state(
 }
 
 /// Check session capacity before taking streams or allocating device buffers.
-fn check_session_capacity(
+fn check_model_capacity(
     device: &CudaDevice,
     kernel: KernelKind,
-    topology: &SelfFeedingTopology,
+    shape: capacity::ModelShape,
+    storage: capacity::MsaStorage,
     reads: usize,
     betas: usize,
     arithmetic: SessionArithmetic,
 ) -> Result<(), SampleError> {
-    let n = topology.n;
+    let n = shape.nodes;
     let plan = arithmetic.coefficients;
+    if kernel == KernelKind::Msa {
+        // The legacy f32 lane still holds i32 coefficients but omits integer tables.
+        let precision = if plan.path == CoefficientPath::Wide && arithmetic.msa_lane == MsaLane::F32
+        {
+            capacity::Precision::Float32
+        } else {
+            capacity::Precision::from_plan(plan, true)
+        };
+        let footprint = capacity::msa_footprint_with_shared_cap(
+            shape,
+            precision,
+            storage,
+            reads,
+            betas,
+            &device.limits,
+            device.msa_shared_spins_cap,
+        );
+        let required_bytes = footprint.total();
+        let available_bytes = device.limits.usable_bytes();
+        if required_bytes > available_bytes {
+            return Err(SampleError::ModelExceedsDeviceMemory {
+                nodes: shape.nodes,
+                couplers: shape.couplers,
+                required_bytes,
+                available_bytes,
+                instances: footprint.instances,
+            });
+        }
+    }
     // Defense in depth: the backend identity's `max_nodes` already rejects
     // an oversized job in `job.rs` before it reaches the sampler. This
     // catches any future drift between what the identity advertises and
@@ -895,23 +934,25 @@ fn check_session_capacity(
             limit: device.sa_wide_max_nodes,
         });
     }
-    if kernel != KernelKind::Msa {
-        return Ok(());
-    }
-    let shape = capacity::ModelShape {
-        nodes: topology.n,
-        couplers: topology.edge_pos.len(),
-        max_degree: topology.max_degree(),
-    };
-    // The legacy f32 lane still holds i32 coefficients but omits integer tables.
-    let precision = if plan.path == CoefficientPath::Wide && arithmetic.msa_lane == MsaLane::F32 {
-        capacity::Precision::Float32
-    } else {
-        capacity::Precision::from_plan(plan, true)
-    };
-    let footprint = capacity::msa_footprint_with_shared_cap(
-        shape,
-        precision,
+    Ok(())
+}
+
+fn check_session_capacity(
+    device: &CudaDevice,
+    kernel: KernelKind,
+    topology: &SelfFeedingTopology,
+    reads: usize,
+    betas: usize,
+    arithmetic: SessionArithmetic,
+) -> Result<(), SampleError> {
+    check_model_capacity(
+        device,
+        kernel,
+        capacity::ModelShape {
+            nodes: topology.n,
+            couplers: topology.edge_pos.len(),
+            max_degree: topology.max_degree(),
+        },
         if topology.row_ptr.is_empty() {
             capacity::MsaStorage::Dense
         } else {
@@ -919,21 +960,8 @@ fn check_session_capacity(
         },
         reads,
         betas,
-        &device.limits,
-        device.msa_shared_spins_cap,
-    );
-    let required_bytes = footprint.total();
-    let available_bytes = device.limits.usable_bytes();
-    if required_bytes > available_bytes {
-        return Err(SampleError::ModelExceedsDeviceMemory {
-            nodes: shape.nodes,
-            couplers: shape.couplers,
-            required_bytes,
-            available_bytes,
-            instances: footprint.instances,
-        });
-    }
-    Ok(())
+        arithmetic,
+    )
 }
 
 impl<'a> SelfFeedingSession<'a> {
@@ -1861,6 +1889,33 @@ impl SessionKey {
         })
     }
 
+    fn build_session<'a>(
+        &self,
+        device: &'a CudaDevice,
+        graph: &IsingGraph,
+        nonces: usize,
+        betas: usize,
+    ) -> Result<SelfFeedingSession<'a>, SampleError> {
+        let topology = session_topology(
+            device,
+            self.kernel,
+            graph,
+            None,
+            self.reads_per_nonce,
+            betas,
+            self.plan,
+        )?;
+        SelfFeedingSession::build(
+            device,
+            self.kernel,
+            topology,
+            nonces,
+            self.reads_per_nonce,
+            betas,
+            self.plan,
+        )
+    }
+
     fn plan_for(&self, job: &StreamJob) -> Result<JobPlan, String> {
         coefficients::plan_with_unit(self.kernel, &job.graph, self.wide_max_nodes).map(
             |(coefficients, unit_mining)| JobPlan {
@@ -2018,7 +2073,18 @@ fn sample_one_planned(
     let limits = device_algo_limits(device, kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_planned_beta_schedule(graph, params, plan)?;
-    let topology = session_topology(device, kernel, graph, forced)?;
+    let topology = session_topology(
+        device,
+        kernel,
+        graph,
+        forced,
+        reads_per_nonce,
+        beta.len(),
+        SessionArithmetic {
+            coefficients: plan,
+            msa_lane: DEFAULT_MSA_LANE,
+        },
+    )?;
 
     let mut sess = SelfFeedingSession::build(
         device,
@@ -2392,7 +2458,18 @@ fn bench_many_planned(
     let limits = device_algo_limits(device, kernel);
     let reads_per_nonce = params.num_reads.max(1).min(limits.max_reads);
     let (beta, sweeps_per_beta) = build_planned_beta_schedule(graph, params, plan)?;
-    let topology = session_topology(device, kernel, graph, None)?;
+    let topology = session_topology(
+        device,
+        kernel,
+        graph,
+        None,
+        reads_per_nonce,
+        beta.len(),
+        SessionArithmetic {
+            coefficients: plan,
+            msa_lane: msa_lane.unwrap_or(DEFAULT_MSA_LANE),
+        },
+    )?;
     let mut sess = SelfFeedingSession::build(
         device,
         kernel,
@@ -3155,13 +3232,6 @@ fn run_session(
         seed.params.schedule,
         key.plan.coefficients.beta_factor(),
     );
-    let topology = match session_topology(device, kernel, &seed.graph, None) {
-        Ok(topology) => topology,
-        Err(error) => {
-            send_reject(out, seed, error.into());
-            return jobs.blocking_recv();
-        }
-    };
     let mut feed = Feed {
         jobs,
         key: &key,
@@ -3169,15 +3239,7 @@ fn run_session(
         cancel,
     };
 
-    let mut sess = match SelfFeedingSession::build(
-        device,
-        kernel,
-        topology,
-        width,
-        reads_per_nonce,
-        beta.len(),
-        key.plan,
-    ) {
+    let mut sess = match key.build_session(device, &seed.graph, width, beta.len()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cuda streaming session build failed: {e}");
@@ -3757,6 +3819,19 @@ mod tests {
         let mut other = job(2);
         other.params.sweeps_per_beta = 1;
         assert!(key.matches(&other, key.plan_for(&other).unwrap()));
+    }
+
+    #[test]
+    fn mining_session_plans_coefficients_before_node_admission() {
+        for h in [0.25, 0.001] {
+            let mut seed = job(1);
+            seed.graph.h[0] = h;
+            let key = SessionKey::seed(&seed, 8, KernelKind::Msa, 1, DEFAULT_MSA_LANE).unwrap();
+            assert!(key.matches(&seed, key.plan_for(&seed).unwrap()));
+        }
+        let mut seed = job(1);
+        seed.graph.h[0] = 0.125_000_01;
+        assert!(SessionKey::seed(&seed, 8, KernelKind::Msa, 1, DEFAULT_MSA_LANE).is_err());
     }
 
     #[test]

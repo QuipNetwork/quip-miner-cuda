@@ -41,7 +41,7 @@
 //!     --out out/cuda-sa_n512_s1024.folded.jsonl
 //! ```
 
-use crate::capacity::{default_nodes, msa_max_nodes, MSA_MAX_READS};
+use crate::capacity::{default_nodes, msa_device_reads, msa_max_nodes};
 use crate::corpus;
 use crate::cuda_device::{CudaDevice, MsaLane};
 use crate::nsight;
@@ -128,7 +128,7 @@ pub struct RunArgs {
     /// Complete synthetic graph with N nodes and the selected precision.
     #[arg(long, conflicts_with_all = ["degree", "shuffle", "source", "model"])]
     pub complete: Option<usize>,
-    /// Reads per model, at most the kernel's cap (256 for sa and gibbs, 128 for msa).
+    /// Reads per model, at most 256 for sa and gibbs, or the MSA device limit (64 or 128).
     #[arg(long, default_value_t = 8)]
     pub reads: u64,
     /// `num_sweeps` to bench at; repeat the flag for a multi-point grid
@@ -672,10 +672,18 @@ pub fn run_bench(
 }
 
 /// Refuse a `--reads` the kernel would silently clamp. `bench_many` caps reads
-/// per nonce at `streaming::max_reads(kernel)`, and a clamped run would
+/// per nonce at the opened device's limit, and a clamped run would
 /// report the requested count against the clamped timing.
-fn check_reads(kernel: KernelKind, reads: u64) -> Result<(), BenchError> {
-    let max_reads = u64::from(crate::streaming::max_reads(kernel));
+fn check_reads(
+    kernel: KernelKind,
+    reads: u64,
+    limits: &crate::capacity::DeviceLimits,
+) -> Result<(), BenchError> {
+    let max_reads = if kernel == KernelKind::Msa {
+        u64::try_from(msa_device_reads(limits)).unwrap_or(u64::MAX)
+    } else {
+        u64::from(crate::streaming::max_reads(kernel))
+    };
     if (1..=max_reads).contains(&reads) {
         return Ok(());
     }
@@ -741,10 +749,10 @@ fn run_run(
         if kernel == KernelKind::Msa && max_nodes.is_none() {
             // MSA has no compiled node array. Use this open's memory snapshot,
             // as the miner does when no lower cap was requested.
-            device.max_nodes = msa_max_nodes(&device.limits, MSA_MAX_READS);
+            device.max_nodes = msa_max_nodes(&device.limits, msa_device_reads(&device.limits));
         }
         device.msa_shared_spins_cap = args.msa_shared_spins;
-        check_reads(kernel, args.reads)?;
+        check_reads(kernel, args.reads, &device.limits)?;
         let width = stream_width(&device, kernel);
         let nonces = usize::try_from(args.nonces).unwrap_or(usize::MAX);
         if nonces > width {
@@ -1380,20 +1388,47 @@ mod tests {
 
     #[test]
     fn check_reads_refuses_counts_the_kernel_would_clamp() {
+        let limits = crate::capacity::DeviceLimits {
+            shared_bytes_per_block: 49_152,
+            shared_bytes_per_block_optin: 101_376,
+            free_bytes: 15 << 30,
+            sm_count: 48,
+            threads_per_sm: 1536,
+        };
         for (kernel, cap) in [
             (KernelKind::Sa, 256),
             (KernelKind::Msa, 128),
             (KernelKind::Gibbs, 256),
         ] {
-            assert!(check_reads(kernel, 1).is_ok(), "{kernel:?} 1");
-            assert!(check_reads(kernel, cap).is_ok(), "{kernel:?} cap");
-            assert!(check_reads(kernel, 0).is_err(), "{kernel:?} 0");
-            assert!(check_reads(kernel, cap + 1).is_err(), "{kernel:?} cap+1");
+            assert!(check_reads(kernel, 1, &limits).is_ok(), "{kernel:?} 1");
+            assert!(check_reads(kernel, cap, &limits).is_ok(), "{kernel:?} cap");
+            assert!(check_reads(kernel, 0, &limits).is_err(), "{kernel:?} 0");
+            assert!(
+                check_reads(kernel, cap + 1, &limits).is_err(),
+                "{kernel:?} cap+1"
+            );
         }
-        let err = check_reads(KernelKind::Msa, 256).unwrap_err().to_string();
+        let err = check_reads(KernelKind::Msa, 256, &limits)
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             err,
             "bench args: --reads 256 is outside 1..=128 for the msa kernel"
         );
+    }
+    #[test]
+    fn check_reads_uses_turing_device_limit() {
+        let limits = crate::capacity::DeviceLimits {
+            shared_bytes_per_block: 49_152,
+            shared_bytes_per_block_optin: 65_536,
+            free_bytes: 15 << 30,
+            sm_count: 48,
+            threads_per_sm: 1024,
+        };
+        assert_eq!(crate::capacity::msa_device_reads(&limits), 64);
+        assert!(check_reads(KernelKind::Msa, 64, &limits).is_ok());
+        for reads in [65, 128] {
+            assert!(check_reads(KernelKind::Msa, reads, &limits).is_err());
+        }
     }
 }

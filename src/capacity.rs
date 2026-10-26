@@ -39,6 +39,9 @@ pub const MEMORY_HEADROOM_NUM: usize = 4;
 /// See [`MEMORY_HEADROOM_NUM`].
 pub const MEMORY_HEADROOM_DEN: usize = 5;
 
+/// Session allowance for CUDA pool growth and allocation overhead.
+const MSA_POOL_ALLOWANCE_BYTES: usize = 32 << 20;
+
 /// Device facts the capacity derivation needs, read once at open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceLimits {
@@ -179,7 +182,11 @@ pub(crate) fn msa_footprint_with_shared_cap(
             Precision::Binary | Precision::Int8 => 1,
             Precision::Int32 | Precision::Float32 => 4,
         };
-        let mut shared_bytes = betas.max(1).saturating_mul(4).saturating_add(8);
+        let mut shared_bytes = betas
+            .max(1)
+            .saturating_mul(4)
+            .saturating_add(8)
+            .saturating_add(MSA_POOL_ALLOWANCE_BYTES);
         if precision == Precision::Int8 || precision == Precision::Int32 {
             shared_bytes = shared_bytes
                 .saturating_add(betas.max(1).saturating_mul(12))
@@ -222,7 +229,7 @@ pub(crate) fn msa_footprint_with_shared_cap(
         .saturating_add(n.max(1)) // colour nodes
         .saturating_mul(4)
         .saturating_add(betas.saturating_mul(4)) // d_beta
-        .saturating_add(32 << 20); // CUDA pool growth and allocation overhead
+        .saturating_add(MSA_POOL_ALLOWANCE_BYTES);
     let coefficient_bytes = match precision {
         Precision::Binary | Precision::Int8 => 1,
         Precision::Int32 | Precision::Float32 => 4,
@@ -937,8 +944,8 @@ mod tests {
             64,
             &a4000_limits(),
         );
-        // Two unused CSR stand-ins and 64 f32 beta values.
-        assert_eq!(footprint.shared_bytes, 264);
+        // Pool allowance, two unused CSR stand-ins and 64 f32 beta values.
+        assert_eq!(footprint.shared_bytes, 264 + (32 << 20));
         // Three i8 matrices and fields, three output slots, control,
         // two spin words per node, and 128 transposed u32 words per 32 nodes.
         assert_eq!(footprint.per_instance_bytes, 12_167_824);
@@ -1011,7 +1018,7 @@ mod tests {
                 &a4000_limits(),
             );
             assert_eq!(footprint.per_instance_bytes, per_instance);
-            assert_eq!(footprint.shared_bytes, shared);
+            assert_eq!(footprint.shared_bytes, shared + (32 << 20));
         }
     }
 
@@ -1390,7 +1397,7 @@ mod tests {
     fn a4000_advertised_limits_match_the_documented_example() {
         let limits = a4000_limits();
         assert_eq!(msa_max_nodes(&limits, 128), 3_987_504);
-        assert_eq!(msa_max_couplers(&limits, 128), 44_599_290);
+        assert_eq!(msa_max_couplers(&limits, 128), 44_486_028);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Portfolio ground energies from SCIP, checked through both MSA storage paths.
 
-use quip_solver_cuda::capacity::MsaStorage;
+use quip_solver_cuda::capacity::{msa_device_reads, MsaStorage};
 use quip_solver_cuda::cuda_device::CudaDevice;
 use quip_solver_cuda::model_file::read_model;
 use quip_solver_cuda::streaming::{last_storage, sample_one_real, sample_one_real_forced};
@@ -87,7 +87,7 @@ fn verify_portfolio(forced: bool) {
     assert_eq!(states.len(), 108);
     let device = CudaDevice::open_with_nodes(0, KernelKind::Msa, 56).unwrap();
     let params = SampleParams {
-        num_reads: 128,
+        num_reads: msa_device_reads(&device.limits),
         num_sweeps: 8192,
         sweeps_per_beta: 128,
         seed: 42,
@@ -103,7 +103,7 @@ fn verify_portfolio(forced: bool) {
             sample_one_real(&device, &model.graph, &params)
         }
         .unwrap_or_else(|error| panic!("{}: {error}", state.file));
-        assert_eq!(reads.len(), 128, "{}", state.file);
+        assert_eq!(reads.len(), params.num_reads, "{}", state.file);
         assert_eq!(
             last_storage(&device),
             Some(if forced {

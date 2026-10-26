@@ -39,16 +39,21 @@ impl ProbeCell {
     }
 }
 
-/// Degree 20, degree 60, and complete models by Binary, Int8, and Float32.
+/// Degree 20, degree 60, and complete models by Binary, Int8, Int32, and Float32.
 #[must_use]
 pub fn probe(limits: &DeviceLimits, reads: usize) -> Vec<ProbeCell> {
-    let mut cells = Vec::with_capacity(9);
+    let mut cells = Vec::with_capacity(12);
     for connectivity in [
         Connectivity::Degree(20),
         Connectivity::Degree(60),
         Connectivity::Complete,
     ] {
-        for precision in [Precision::Binary, Precision::Int8, Precision::Float32] {
+        for precision in [
+            Precision::Binary,
+            Precision::Int8,
+            Precision::Int32,
+            Precision::Float32,
+        ] {
             let shape = msa_max_model(connectivity, precision, reads, limits);
             let storage = connectivity.storage();
             let footprint =
@@ -128,18 +133,53 @@ mod tests {
     }
 
     #[test]
-    fn probe_grid_has_nine_cells_and_lower_degree_gives_more_nodes() {
+    fn probe_grid_has_twelve_cells_and_lower_degree_gives_more_nodes() {
         let limits = a4000_limits();
         let cells = probe(&limits, 128);
-        assert_eq!(cells.len(), 9);
-        for precision in [Precision::Binary, Precision::Int8, Precision::Float32] {
+        assert_eq!(cells.len(), 12);
+        for precision in [
+            Precision::Binary,
+            Precision::Int8,
+            Precision::Int32,
+            Precision::Float32,
+        ] {
             let row: Vec<_> = cells.iter().filter(|c| c.precision == precision).collect();
             assert!(row[0].nodes > row[1].nodes && row[1].nodes > row[2].nodes);
             assert!(row[0].couplers < row[1].couplers);
         }
-        for row in cells.chunks(3) {
-            assert!(row[0].nodes >= row[1].nodes && row[1].nodes > row[2].nodes);
+        for row in cells.chunks(4) {
+            assert!(
+                row[0].nodes >= row[1].nodes
+                    && row[1].nodes > row[2].nodes
+                    && row[2].nodes <= row[3].nodes
+            );
         }
+    }
+
+    #[test]
+    fn probe_int32_boundary_includes_integer_acceptance_tables() {
+        let mut limits = a4000_limits();
+        let conn = Connectivity::Degree(20);
+        let shape = conn.shape(10_000);
+        let float = msa_footprint(shape, Precision::Float32, conn.storage(), 128, 64, &limits);
+        let integer = msa_footprint(shape, Precision::Int32, conn.storage(), 128, 64, &limits);
+        assert_eq!(integer.total() - float.total(), 525_056);
+        limits.free_bytes = (float.total() + 100).div_ceil(4) * 5;
+        assert!(float.total() <= limits.usable_bytes());
+        assert!(integer.total() > limits.usable_bytes());
+        let cells = probe(&limits, 128);
+        let cell = |precision| {
+            cells
+                .iter()
+                .find(|c| c.connectivity == conn && c.precision == precision)
+                .unwrap()
+        };
+        assert_eq!(cell(Precision::Float32).nodes, shape.nodes);
+        assert!(cell(Precision::Int32).nodes < shape.nodes);
+        assert_eq!(
+            cell(Precision::Int32).nodes,
+            msa_max_model(conn, Precision::Int32, 128, &limits).nodes
+        );
     }
 
     #[test]

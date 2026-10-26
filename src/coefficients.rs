@@ -131,8 +131,8 @@ fn max_local_field(h: &[i64], j: &[i64], edges: &[(usize, usize)]) -> i64 {
 
 /// Classify one job for `kind`.
 ///
-/// `wide_max_nodes` is the device's node budget for wide SA or weighted MSA.
-/// Zero means no wide path.
+/// `wide_max_nodes` is the device's node budget for wide SA.
+/// Zero means no wide SA path. MSA checks memory during session admission.
 ///
 /// # Errors
 ///
@@ -192,13 +192,6 @@ pub(crate) fn plan_with_unit(
             } else if field > MSA_WEIGHTED_MAX_FIELD {
                 Err(format!(
                     "msa: local field {field} times the model's {scale_milli} milli step exceeds the weighted path's limit of {MSA_WEIGHTED_MAX_FIELD}"
-                ))
-            } else if wide_max_nodes == 0 {
-                Err("msa: the model needs the weighted path, which this device does not offer".into())
-            } else if graph.h.len() > wide_max_nodes {
-                Err(format!(
-                    "msa: the weighted path holds {wide_max_nodes} nodes on this device, the model has {}",
-                    graph.h.len()
                 ))
             } else {
                 Ok(CoefficientPlan {
@@ -460,10 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn msa_weighted_needs_a_node_budget() {
+    fn msa_weighted_planning_leaves_node_admission_to_the_session() {
         let g = IsingGraph::new(vec![0.5, 0.0], vec![1.0], vec![(0, 1)]);
-        assert!(plan(KernelKind::Msa, &g, 0).is_err());
-        assert!(plan(KernelKind::Msa, &g, 1).is_err());
+        assert!(plan(KernelKind::Msa, &g, 0).is_ok());
+        assert!(plan(KernelKind::Msa, &g, 1).is_ok());
         assert!(plan(KernelKind::Msa, &g, 2).is_ok());
     }
 
