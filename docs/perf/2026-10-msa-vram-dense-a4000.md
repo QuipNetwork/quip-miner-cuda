@@ -187,6 +187,8 @@ Sweep time is in milliseconds. Throughput is in billions of lane-updates per sec
 |---|---:|---:|---|---:|---:|---:|
 | float | 98 | 48 | 64/256 | 0.1335 | 4.5088 | 46.843× |
 | float | 98 | 1 | 64/256 | 0.1331 | 0.0943 | 52.787× |
+| float | 4,794 | 48 | 8/32 | 308.3046 | 0.0955 | 2210.8× |
+| float | 4,794 | 1 | 8/32 | 205.0570 | 0.0030 | 1662.8× |
 
 ## Int32 dense cost
 
@@ -236,6 +238,8 @@ Every cell uses 128 reads, one warm-up, and four measured repeats per point.
 | complete-int32-m48-n4800 | 4,800 | 48 | 64/256 | 583.9 | pass |
 | complete-int32-m1-n2000 | 2,000 | 1 | 64/256 | 76.5 | pass |
 | complete-int32-m1-n4800 | 4,800 | 1 | 64/256 | 475.1 | pass |
+| `family-b-float-m48-n4794` | 4,794 | 48 | 8/32 | 123 | pass |
+| `family-b-float-m1-n4794` | 4,794 | 1 | 8/32 | 65 | pass |
 
 ## Real portfolio models
 
@@ -254,6 +258,16 @@ The generator writes a Q matrix. An evidence adapter converts Q with x = (s + 1)
 The adapter checks energy for four states with known values. It also checks 100 states of the real model.
 
 The data folder keeps all run logs. It also keeps the model archives and the converted `.qmodel` file.
+### Family B at the complete Float32 limit
+
+The probe at commit 3125ca4 limits complete Float32 models to N = 4,794. A Family B model at that size uses K = 32, the largest K the reference code accepts.
+The reference generator scales as O(N⁴) in `greedy_project`, the cardinality repair it runs on 64 sampled selections. At N = 800 it takes 50 minutes.
+The evidence wrapper `famb-fast/fast_generator.py` replaces only that function at run time, with incremental subset scores.
+At N = 98, 200, and 400, every array of its output archive matches the reference output exactly. The reference source files match their recorded hashes.
+The wrapper generated N = 4,794 in 1,088 seconds. The model has 11,488,821 couplers.
+It ran to completion at both concurrency settings with 8/32 sweeps. Its sweep time is 1.6× the synthetic complete Float32 cell at N = 4,800.
+The synthetic cell uses ±1 couplings. Real weights give a different acceptance pattern, which this run did not profile.
+
 The converter preserves f64 coefficients in the file. The benchmark real-model entry point evaluates them with Float32.
 Mining jobs still need exact coefficients.
 
@@ -330,5 +344,6 @@ holdCount
 ```
 
 
-The requested grid has 104 cells. Of these, 98 passed. Six failed.
-The two supplemental 98-node cells passed. The tables contain 100 timed cells.
+The grid has 104 cells: the 100 requested cells and four Int32 cells.
+Of the 100 requested cells, 94 passed. Six failed. The four Int32 cells passed.
+The two N = 98 Family B cells and the two N = 4,794 Family B cells passed. The tables contain 102 timed cells.
